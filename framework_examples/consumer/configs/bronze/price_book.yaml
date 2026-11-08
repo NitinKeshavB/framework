@@ -1,8 +1,19 @@
 pipeline_id: price_book
-project: merchandising
+domain: merchandising
+project: pricing
+data_domain: prices
+team: pricing_squad
+technical_owner: pricing.owner@jll.com
 layer: bronze
 catalog: framework_dev
 job_name: merchandising_prices
+
+notify:
+  on_failure:
+    - pricing.owner@jll.com
+
+data:
+  classification: internal
 
 source_to_raw:
   method: autoloader

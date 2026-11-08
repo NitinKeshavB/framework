@@ -1,8 +1,24 @@
 pipeline_id: payroll_timesheets
-project: people
+domain: people
+project: payroll
+data_domain: timesheets
+team: payroll_squad
+technical_owner: payroll.owner@jll.com
 layer: bronze
 catalog: framework_dev
 job_name: people_payroll
+
+notify:
+  on_failure:
+    - payroll.owner@jll.com
+  on_success:
+    - payroll.owner@jll.com
+
+data:
+  classification: highly_confidential
+  pii:
+    - pii_personal
+    - pii_basic
 
 source_to_raw:
   method: autoloader

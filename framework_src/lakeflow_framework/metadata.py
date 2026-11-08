@@ -82,7 +82,7 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 config.project,
                 f"{pipeline_name}.{layer}",
                 relation,
-                json.dumps({"layer": layer}, sort_keys=True),
+                json.dumps(_table_record(config, layer), sort_keys=True),
                 content_hash,
                 "framework",
                 recorded,
@@ -116,6 +116,19 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             )
         )
     return rows
+
+
+def _table_record(config: PipelineConfig, layer: str) -> dict[str, Any]:
+    tags = config.tags[layer]
+    return {
+        "layer": layer,
+        "domain": config.domain,
+        "data_domain": config.data_domain,
+        "team": config.team,
+        "technical_owner": config.technical_owner,
+        "classification": tags.classification,
+        "pii": ", ".join(tags.pii),
+    }
 
 
 def _securable_kind(config: PipelineConfig, layer: str) -> str:

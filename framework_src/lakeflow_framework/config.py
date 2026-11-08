@@ -28,6 +28,9 @@ IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TYPE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_(), ]*$")
 UNRESOLVED = re.compile(r"\$\{[^}]+\}")
 CLOUD_PATH = re.compile(r"^(abfss|s3)://", re.IGNORECASE)
+EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+CLASSIFICATIONS = ("internal", "confidential", "highly_confidential")
+PII_LABELS = ("pii_health", "pii_basic", "pii_finance", "pii_biometric", "pii_personal")
 
 
 class ConfigValidationError(Exception):
@@ -55,6 +58,14 @@ class Column:
 class QualityRule:
     name: str
     expression: str
+
+
+@dataclass
+class TableTags:
+    """Labels a written table carries. The same labels apply to raw, bronze, and quarantine unless a table overrides them."""
+
+    classification: str
+    pii: list[str]
 
 
 @dataclass
@@ -90,6 +101,13 @@ class PipelineConfig:
     max_files_per_trigger: int | None = None
     path_glob: str | None = None
     job_name: str | None = None
+    domain: str = ""
+    data_domain: str = ""
+    team: str = ""
+    technical_owner: str = ""
+    notify_failure: list[str] = field(default_factory=list)
+    notify_success: list[str] = field(default_factory=list)
+    tags: dict[str, TableTags] = field(default_factory=dict)
     document: dict[str, Any] = field(default_factory=dict)
 
     def layer_schema(self, layer: str) -> str:
@@ -128,15 +146,25 @@ class PipelineConfig:
         document = {
             "pipeline_id": self.pipeline_id,
             "project": self.project,
+            "domain": self.domain,
+            "data_domain": self.data_domain,
+            "team": self.team,
+            "technical_owner": self.technical_owner,
             "layer": self.layer,
             "catalog": self.catalog,
+            "notify": {
+                "on_failure": list(self.notify_failure),
+                "on_success": list(self.notify_success),
+            },
             "source_to_raw": {
                 "method": self.load_method,
                 "source": source,
-                "raw": {"schema": self.raw_schema, "table": self.raw_table},
+                "raw": _table_document(self.raw_schema, self.raw_table, self.tags["raw"]),
             },
             "raw_to_bronze": {
-                "bronze": {"schema": self.bronze_schema, "table": self.bronze_table},
+                "bronze": _table_document(
+                    self.bronze_schema, self.bronze_table, self.tags["bronze"]
+                ),
                 "dedup": self.dedup,
                 "primary_keys": list(self.primary_keys),
                 "columns": [
@@ -146,7 +174,9 @@ class PipelineConfig:
                     {"name": rule.name, "expression": rule.expression} for rule in self.rules
                 ],
             },
-            "quarantine": {"schema": self.quarantine_schema, "table": self.quarantine_table},
+            "quarantine": _table_document(
+                self.quarantine_schema, self.quarantine_table, self.tags["quarantine"]
+            ),
         }
         _put(document, "job_name", self.job_name)
         _put(document["raw_to_bronze"], "watermark_column", self.watermark_column)
@@ -184,6 +214,26 @@ def validate_configs(paths: list[Path]) -> list[PipelineConfig]:
     if errors:
         raise ConfigValidationError(errors)
     return configs
+
+
+def email_notifications(configs: list[PipelineConfig]) -> dict[str, list[str]]:
+    """Addresses a Databricks job should mail. One domain can hold many projects."""
+
+    failure: list[str] = []
+    success: list[str] = []
+    for config in configs:
+        for address in config.notify_failure:
+            if address not in failure:
+                failure.append(address)
+        for address in config.notify_success:
+            if address not in success:
+                success.append(address)
+    notes: dict[str, list[str]] = {}
+    if failure:
+        notes["on_failure"] = failure
+    if success:
+        notes["on_success"] = success
+    return notes
 
 
 def config_from_document(document: Mapping[str, Any]) -> PipelineConfig:
@@ -252,6 +302,9 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     if dedup and (not primary_keys or not watermark):
         errors.append(f"{label}: dedup requires primary_keys and watermark_column")
 
+    domain, data_domain, team, technical_owner = _ownership(document, label, errors)
+    notify_failure, notify_success = _notify(document, technical_owner, label, errors)
+    tags = _tags(document, raw_target, bronze_target, quarantine, label, errors)
     columns = _columns(raw_to_bronze.get("columns"), label, errors)
     rules = _rules(raw_to_bronze.get("rules"), label, errors)
     fixed_columns = _fixed_columns(source.get("fixed_columns"), label, errors)
@@ -292,6 +345,11 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         or not raw_schema
         or not bronze_schema
         or not quarantine_schema
+        or not domain
+        or not data_domain
+        or not team
+        or not technical_owner
+        or any(layer not in tags for layer in ("raw", "bronze", "quarantine"))
     ):
         return errors, None
 
@@ -325,9 +383,157 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         max_files_per_trigger=int(max_files) if max_files is not None else None,
         path_glob=_optional_text(source.get("path_glob")),
         job_name=_optional_text(document.get("job_name")),
+        domain=domain,
+        data_domain=data_domain,
+        team=team,
+        technical_owner=technical_owner,
+        notify_failure=notify_failure,
+        notify_success=notify_success,
+        tags=tags,
         document=document,
     )
     return errors, parsed
+
+
+def _table_document(schema: str, table: str, tags: TableTags) -> dict[str, Any]:
+    return {
+        "schema": schema,
+        "table": table,
+        "classification": tags.classification,
+        "pii": list(tags.pii),
+    }
+
+
+def _ownership(
+    document: Mapping[str, Any], label: str, errors: list[str]
+) -> tuple[str | None, str | None, str | None, str | None]:
+    return (
+        _identifier(document, "domain", label, errors),
+        _identifier(document, "data_domain", label, errors),
+        _identifier(document, "team", label, errors),
+        _email(document.get("technical_owner"), "technical_owner", label, errors),
+    )
+
+
+def _notify(
+    document: Mapping[str, Any],
+    technical_owner: str | None,
+    label: str,
+    errors: list[str],
+) -> tuple[list[str], list[str]]:
+    raw = document.get("notify", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        errors.append(f"{label}: notify must be a mapping")
+        return [], []
+    if "on_failure" in raw:
+        failure = _email_list(raw.get("on_failure"), "notify.on_failure", label, errors, True)
+    else:
+        failure = [technical_owner] if technical_owner else []
+    if "on_success" in raw:
+        success = _email_list(raw.get("on_success"), "notify.on_success", label, errors, False)
+    else:
+        success = []
+    return failure, success
+
+
+def _tags(
+    document: Mapping[str, Any],
+    raw_target: Mapping[str, Any],
+    bronze_target: Mapping[str, Any],
+    quarantine: Mapping[str, Any],
+    label: str,
+    errors: list[str],
+) -> dict[str, TableTags]:
+    shared = document.get("data", {})
+    if not isinstance(shared, dict):
+        errors.append(f"{label}: data must be a mapping")
+        shared = {}
+    found: dict[str, TableTags] = {}
+    for layer, section in (
+        ("raw", raw_target),
+        ("bronze", bronze_target),
+        ("quarantine", quarantine),
+    ):
+        tags = _layer_tags(shared, section, f"{label}: {layer}", errors)
+        if tags is not None:
+            found[layer] = tags
+    return found
+
+
+def _layer_tags(
+    shared: Mapping[str, Any],
+    section: Mapping[str, Any],
+    label: str,
+    errors: list[str],
+) -> TableTags | None:
+    classification = section.get("classification", shared.get("classification"))
+    pii_value = section["pii"] if "pii" in section else shared.get("pii")
+    kind = _classification(classification, label, errors)
+    pii = _pii(pii_value, label, errors)
+    if kind is None:
+        return None
+    return TableTags(kind, pii)
+
+
+def _classification(value: Any, label: str, errors: list[str]) -> str | None:
+    if value is None or str(value).strip() == "":
+        errors.append(
+            f"{label}: classification is required and must be one of {', '.join(CLASSIFICATIONS)}"
+        )
+        return None
+    text = str(value)
+    if text not in CLASSIFICATIONS:
+        errors.append(f"{label}: classification must be one of {', '.join(CLASSIFICATIONS)}")
+        return None
+    return text
+
+
+def _pii(value: Any, label: str, errors: list[str]) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(f"{label}: pii must be a list")
+        return []
+    names: list[str] = []
+    for item in value:
+        text = str(item)
+        if text not in PII_LABELS:
+            errors.append(f"{label}: pii value '{text}' must be one of {', '.join(PII_LABELS)}")
+        else:
+            names.append(text)
+    return names
+
+
+def _email(value: Any, key: str, label: str, errors: list[str]) -> str | None:
+    if value is None or str(value).strip() == "":
+        errors.append(f"{label}: {key} is required")
+        return None
+    text = str(value).strip()
+    if not EMAIL.match(text):
+        errors.append(f"{label}: {key} must be an email address")
+        return None
+    return text
+
+
+def _email_list(value: Any, key: str, label: str, errors: list[str], required: bool) -> list[str]:
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        errors.append(f"{label}: {key} must be a list of emails")
+        return []
+    if required and not value:
+        errors.append(f"{label}: {key} needs at least one email")
+        return []
+    emails: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if not EMAIL.match(text):
+            errors.append(f"{label}: {key} entry '{item}' must be an email address")
+        else:
+            emails.append(text)
+    return emails
 
 
 def _put(mapping: dict[str, Any], key: str, value: Any) -> None:

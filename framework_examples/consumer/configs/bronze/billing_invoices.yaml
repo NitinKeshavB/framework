@@ -1,8 +1,24 @@
 pipeline_id: billing_invoices
-project: finance
+domain: finance
+project: billing
+data_domain: invoices
+team: billing_squad
+technical_owner: billing.owner@jll.com
 layer: bronze
 catalog: framework_dev
 job_name: finance_billing
+
+notify:
+  on_failure:
+    - billing.owner@jll.com
+  on_success:
+    - billing.owner@jll.com
+
+data:
+  classification: confidential
+  pii:
+    - pii_finance
+    - pii_personal
 
 source_to_raw:
   method: autoloader
@@ -39,3 +55,4 @@ raw_to_bronze:
 quarantine:
   schema: billing_quarantine
   table: invoices
+  classification: highly_confidential

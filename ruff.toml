@@ -1,4 +1,4 @@
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 src = ["framework_src", "framework_tests", "framework_examples", "framework_bundle"]
 extend-exclude = ["venv", ".venv", "dist"]

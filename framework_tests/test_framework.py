@@ -9,8 +9,8 @@ import pytest
 
 from lakeflow_framework import ConfigValidationError, build_pipeline, validate_configs
 from lakeflow_framework.cli import main
-from lakeflow_framework.collector import await_registered
-from lakeflow_framework.config import config_from_document
+from lakeflow_framework.collector import append_definitions, await_registered
+from lakeflow_framework.config import config_from_document, email_notifications
 from lakeflow_framework.load import get_strategy
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
@@ -25,7 +25,7 @@ from lakeflow_framework.metadata import (
     step_payload,
     write_definition_files,
 )
-from lakeflow_framework.pipeline import MetadataNotFound, assemble
+from lakeflow_framework.pipeline import MetadataNotFound, UnityMetadata, assemble
 from lakeflow_framework.quality import compile_rules, fail_sql
 
 EXAMPLES = (
@@ -36,9 +36,14 @@ EXAMPLES = (
 def _billing(**overrides):
     document = {
         "pipeline_id": "billing_invoices",
-        "project": "finance",
+        "domain": "finance",
+        "project": "billing",
+        "data_domain": "invoices",
+        "team": "billing_squad",
+        "technical_owner": "billing.owner@jll.com",
         "layer": "bronze",
         "catalog": "framework_dev",
+        "data": {"classification": "confidential", "pii": ["pii_finance"]},
         "source_to_raw": {
             "method": "autoloader",
             "source": {
@@ -70,9 +75,14 @@ def _billing(**overrides):
 def _ledger():
     return {
         "pipeline_id": "ledger_entries",
-        "project": "finance",
+        "domain": "finance",
+        "project": "ledger",
+        "data_domain": "entries",
+        "team": "ledger_squad",
+        "technical_owner": "ledger.owner@jll.com",
         "layer": "bronze",
         "catalog": "framework_dev",
+        "data": {"classification": "confidential", "pii": ["pii_finance"]},
         "source_to_raw": {
             "method": "ctas",
             "source": {
@@ -143,6 +153,54 @@ def test_only_bronze_loads_are_accepted():
     assert config.table_name("bronze") == "framework_dev.billing_bronze.invoices"
     assert config.canonical()["source_to_raw"]["raw"]["schema"] == "billing_raw"
     assert config.canonical()["raw_to_bronze"]["bronze"]["schema"] == "billing_bronze"
+    reloaded = config_from_document(config.canonical())
+    assert reloaded.content_hash() == config.content_hash()
+    assert reloaded.notify_failure == ["billing.owner@jll.com"]
+
+
+def test_one_domain_holds_many_projects_and_jobs_mail_their_owners():
+    configs = validate_configs(sorted(EXAMPLES.glob("*.yaml")))
+    finance = [config for config in configs if config.domain == "finance"]
+    assert {config.project for config in finance} == {"billing", "ledger"}
+    billing = next(config for config in finance if config.project == "billing")
+    assert billing.data_domain == "invoices"
+    assert billing.tags["raw"].classification == "confidential"
+    assert billing.tags["raw"].pii == ["pii_finance", "pii_personal"]
+    assert billing.tags["quarantine"].classification == "highly_confidential"
+    assert billing.notify_success == ["billing.owner@jll.com"]
+    ledger = next(config for config in finance if config.project == "ledger")
+    assert ledger.notify_failure == ["ledger.owner@jll.com"]
+    assert ledger.notify_success == []
+    notes = email_notifications(finance)
+    assert notes["on_failure"] == ["billing.owner@jll.com", "ledger.owner@jll.com"]
+    assert notes["on_success"] == ["billing.owner@jll.com"]
+    job = (
+        Path(__file__).resolve().parents[1]
+        / "framework_examples"
+        / "consumer"
+        / "resources"
+        / "finance_ingest.job.yml"
+    ).read_text(encoding="utf-8")
+    for address in notes["on_failure"] + notes["on_success"]:
+        assert address in job
+
+
+def test_failure_mail_defaults_to_the_technical_owner():
+    document = _billing()
+    document.pop("notify", None)
+    config = config_from_document(document)
+    assert config.notify_failure == ["billing.owner@jll.com"]
+    assert config.notify_success == []
+
+
+def test_unknown_pii_and_classification_are_rejected():
+    document = _billing()
+    document["data"] = {"classification": "secret", "pii": ["ssn"]}
+    with pytest.raises(ConfigValidationError) as caught:
+        config_from_document(document)
+    text = "\n".join(caught.value.errors)
+    assert "classification must be one of" in text
+    assert "pii_health" in text
 
 
 def test_example_configs_validate():
@@ -324,6 +382,8 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "CLUSTER BY (project, event_date, full_name, run_id)" in text
     assert "${catalog}" not in text
     assert "CREATE BLOOMFILTER INDEX" in text
+    assert "v_pipelines" in text
+    assert "v_tables" in text
     assert not any(statement.upper().startswith("DELETE") for statement in statements)
     assert _column_list(text, "object_registry") == list(OBJECT_COLUMNS)
     assert _column_list(text, "run_ledger") == list(LEDGER_COLUMNS)
@@ -335,6 +395,13 @@ def test_ctas_securables_match_the_graph():
     assert kinds["framework_dev.ledger_raw.entries"] == "table"
     assert kinds["framework_dev.ledger_bronze.entries"] == "materialized_view"
     assert kinds["framework_dev.ledger_quarantine.entries"] == "materialized_view"
+    table = next(row for row in rows if row["full_name"] == "framework_dev.ledger_bronze.entries")
+    recorded = json.loads(table["config_json"])
+    assert recorded["domain"] == "finance"
+    assert recorded["data_domain"] == "entries"
+    assert recorded["classification"] == "confidential"
+    assert recorded["pii"] == "pii_finance"
+    assert recorded["technical_owner"] == "ledger.owner@jll.com"
 
 
 def test_definition_files_are_one_object_each_and_steps_stay_separate(tmp_path: Path):
@@ -433,6 +500,48 @@ def test_await_registry_fails_when_the_row_never_arrives():
             sleep=lambda _seconds: None,
             clock=lambda: 0,
         )
+
+
+def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
+    inserted: list[list[dict]] = []
+
+    def fake_insert(_spark, _table, rows, _columns, **_kwargs):
+        inserted.append(rows)
+        return len(rows)
+
+    monkeypatch.setattr("lakeflow_framework.collector._insert", fake_insert)
+    row = {
+        "object_kind": "pipeline",
+        "full_name": "billing_invoices",
+        "project": "finance",
+        "parent_full_name": None,
+        "relation": None,
+        "config_json": "{}",
+        "content_hash": "a" * 64,
+        "source": "framework",
+        "recorded_at": "2026-11-09T00:00:00Z",
+    }
+    seen: set = set()
+    assert append_definitions(None, [row, dict(row)], seen) == 1
+    assert append_definitions(None, [dict(row)], seen) == 0
+    assert len(inserted) == 1
+
+
+def test_pipeline_lookup_binds_the_id_and_rejects_sql():
+    class Frame:
+        def collect(self):
+            return []
+
+    class Spark:
+        def sql(self, statement, args=None):
+            assert ":pipeline_id" in statement
+            assert "billing_invoices" not in statement
+            assert args == {"pipeline_id": "billing_invoices"}
+            return Frame()
+
+    assert UnityMetadata(Spark()).get_pipeline("billing_invoices") is None
+    with pytest.raises(MetadataNotFound):
+        UnityMetadata(Spark()).get_pipeline("billing' OR '1'='1")
 
 
 def _column_list(text: str, table: str) -> list[str]:

@@ -73,6 +73,8 @@ Views:
 - `v_process` — every step of a run. Filter by `run_id` and `event_date`.
 - `v_recon` — success steps with the counts exploded.
 - `v_lineage` — latest link per parent, child, and relation. Intended links are written at sync. Observed links can be added later from `system.access.table_lineage`.
+- `v_pipelines` — one row per pipeline: domain, project, data domain, team, technical owner, and the failure and success mail lists.
+- `v_tables` — one row per raw, bronze, and quarantine table: the same ownership fields plus classification and PII. These labels are the ones a later ontology can read. The pipeline does not create tags in Unity Catalog.
 
 System tables are the source for job definitions, run duration, pipeline events, information-schema securables, and observed lineage. The collector copies the fields that would be lost when those tables age out or when an object is dropped: project, the flow graph, the failure text, and the source-file reconciliation. Analysts query `framework_meta` only.
 

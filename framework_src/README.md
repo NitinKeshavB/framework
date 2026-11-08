@@ -1,6 +1,6 @@
 # lakeflow_framework
 
-Config-driven Lakeflow file ingestion. Pin this wheel and supply one bronze YAML file per pipeline.
+Config-driven Lakeflow file ingestion for Python 3.11. Pin this wheel and supply one bronze YAML file per pipeline.
 
 ```python
 from lakeflow_framework import build_pipeline

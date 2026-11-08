@@ -8,14 +8,12 @@ version = "0.1.0"
 description = "Config-driven Lakeflow file ingestion. Consumers pin this wheel and supply YAML."
 authors = [{ name = "NitinKeshav", email = "nitinkeshav.bolla@jll.com" }]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.12"
 license = { text = "MIT" }
 dependencies = ["PyYAML>=6"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
 ]
 keywords = ["lakeflow", "databricks", "ingestion", "bronze"]
 

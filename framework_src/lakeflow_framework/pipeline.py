@@ -212,9 +212,12 @@ class UnityMetadata:
         self.catalog = catalog
 
     def get_pipeline(self, pipeline_id: str) -> dict[str, Any] | None:
+        if not IDENTIFIER.fullmatch(pipeline_id):
+            raise MetadataNotFound(f"{pipeline_id} is not a pipeline id")
         frame = self.spark.sql(
             "SELECT config_json FROM framework_meta.v_object_current "
-            f"WHERE object_kind = 'pipeline' AND full_name = '{pipeline_id}'"
+            "WHERE object_kind = 'pipeline' AND full_name = :pipeline_id",
+            args={"pipeline_id": pipeline_id},
         )
         rows = frame.collect() if hasattr(frame, "collect") else list(frame)
         if not rows:

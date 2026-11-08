@@ -28,8 +28,24 @@ A file is a bronze load. `layer` is `bronze`. Two hops are required.
 
 `quarantine` names the `<system>_quarantine` table that receives rows that fail those rules.
 
+A domain holds many projects. The pipeline names that domain, the project, and the data domain. `technical_owner` is an email. `team` is the squad. `data.classification` is `internal`, `confidential`, or `highly_confidential`. `data.pii` lists `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, or `pii_personal`. Omit `pii` when there is none. Put a different `classification` or `pii` on `raw`, `bronze`, or `quarantine` only when that table differs.
+
+`notify.on_failure` lists who is mailed when the job fails. When it is left out, the technical owner is mailed. `notify.on_success` is optional. Copy those addresses into the job `email_notifications` block. The pipeline does not send mail.
+
 ```yaml
+domain: finance
+project: billing
+data_domain: invoices
+team: billing_squad
+technical_owner: billing.owner@jll.com
 layer: bronze
+notify:
+  on_failure:
+    - billing.owner@jll.com
+data:
+  classification: confidential
+  pii:
+    - pii_finance
 source_to_raw:
   method: autoloader
   source:
@@ -90,6 +106,8 @@ Ask these views, with a `project` filter:
 - `v_process` for one `run_id`
 - `v_recon` for source and target counts
 - `v_lineage` for links written by the pipeline
+- `v_pipelines` for domain, project, data domain, team, owner, and mail
+- `v_tables` for classification and PII on each table
 
 The example job in [framework_examples/consumer](../framework_examples/consumer) writes the step files, waits until the collector has loaded the definitions, and then refreshes the billing and ledger pipelines. A success step can carry counts with `--recon-json '{"source_count": 10, "output_rows": 9, "rejected": 1}'`.
 

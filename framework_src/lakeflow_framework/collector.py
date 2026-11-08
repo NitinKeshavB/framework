@@ -70,7 +70,9 @@ def append_steps(spark, payloads: list[dict], seen: set | None = None, catalog: 
 
 def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog: str = "") -> int:
     held = seen if seen is not None else set()
-    fresh = new_object_rows(rows, set())
+    # Copy so new_object_rows can skip keys from earlier calls without
+    # marking this batch as seen before the insert succeeds.
+    fresh = new_object_rows(rows, set(held))
     if catalog and fresh:
         already = _existing_object_keys(spark, catalog, fresh)
         fresh = [

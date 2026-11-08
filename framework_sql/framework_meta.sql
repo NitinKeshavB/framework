@@ -155,3 +155,29 @@ QUALIFY row_number() OVER (
   PARTITION BY parent_full_name, full_name, relation
   ORDER BY recorded_at DESC
 ) = 1;
+
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_pipelines AS
+SELECT
+  full_name AS pipeline,
+  project,
+  get_json_object(config_json, '$.config.domain') AS domain,
+  get_json_object(config_json, '$.config.data_domain') AS data_domain,
+  get_json_object(config_json, '$.config.team') AS team,
+  get_json_object(config_json, '$.config.technical_owner') AS technical_owner,
+  get_json_object(config_json, '$.config.notify.on_failure') AS failure_mail,
+  get_json_object(config_json, '$.config.notify.on_success') AS success_mail
+FROM ${catalog}.framework_meta.v_object_current
+WHERE object_kind = 'pipeline';
+
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_tables AS
+SELECT
+  full_name AS table_name,
+  project,
+  get_json_object(config_json, '$.domain') AS domain,
+  get_json_object(config_json, '$.data_domain') AS data_domain,
+  get_json_object(config_json, '$.team') AS team,
+  get_json_object(config_json, '$.technical_owner') AS technical_owner,
+  get_json_object(config_json, '$.classification') AS classification,
+  get_json_object(config_json, '$.pii') AS pii
+FROM ${catalog}.framework_meta.v_object_current
+WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');

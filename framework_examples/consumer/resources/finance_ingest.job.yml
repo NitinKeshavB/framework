@@ -2,6 +2,13 @@ resources:
   jobs:
     finance_ingest:
       name: finance_ingest
+      email_notifications:
+        on_failure:
+          - billing.owner@jll.com
+          - ledger.owner@jll.com
+        on_success:
+          - billing.owner@jll.com
+        no_alert_for_skipped_runs: true
       tasks:
         - task_key: mark_running
           spark_python_task:

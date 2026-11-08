@@ -1,8 +1,19 @@
 pipeline_id: orders_events
-project: retail
+domain: retail
+project: orders
+data_domain: orders
+team: orders_squad
+technical_owner: orders.owner@jll.com
 layer: bronze
 catalog: framework_dev
 job_name: retail_orders
+
+notify:
+  on_failure:
+    - orders.owner@jll.com
+
+data:
+  classification: internal
 
 source_to_raw:
   method: copy_into

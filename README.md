@@ -27,9 +27,25 @@ build_pipeline("billing_invoices")
 
 ```yaml
 pipeline_id: billing_invoices
-project: finance
+domain: finance
+project: billing
+data_domain: invoices
+team: billing_squad
+technical_owner: billing.owner@jll.com
 layer: bronze
 catalog: framework_dev
+
+notify:
+  on_failure:
+    - billing.owner@jll.com
+  on_success:
+    - billing.owner@jll.com
+
+data:
+  classification: confidential
+  pii:
+    - pii_finance
+    - pii_personal
 
 source_to_raw:
   method: autoloader
@@ -59,6 +75,8 @@ quarantine:
 ```
 
 `source_to_raw.method` is `autoloader` (default), `copy_into`, or `ctas`. Paths are `abfss://` or `s3://`. `dedup: true` requires `primary_keys` and `watermark_column`. Excel cannot use `copy_into`. Do not put keys or passwords in the file. Render `catalog` before validation. An unresolved `${...}` is an error.
+
+One domain holds many projects. Each pipeline names its `domain`, `project`, `data_domain`, `team`, and `technical_owner`. `data.classification` is `internal`, `confidential`, or `highly_confidential`. `data.pii` is any of `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, and `pii_personal`. Leave `pii` out when the table has none. A raw, bronze, or quarantine block can override those two fields. `notify.on_failure` is who Databricks mails when the job fails. Omit it and the technical owner is used. `notify.on_success` is optional. Put the same addresses on the job `email_notifications` block.
 
 Check the file before a cluster starts:
 
@@ -94,6 +112,8 @@ Query `<catalog>.framework_meta`, with a `project` filter:
 | `v_process` | Every step of a run |
 | `v_recon` | Source and target counts on the success step |
 | `v_lineage` | Links from a pipeline to raw, bronze, and quarantine |
+| `v_pipelines` | Domain, project, data domain, team, owner, and who is mailed |
+| `v_tables` | Classification and PII on each raw, bronze, and quarantine table |
 
 History is insert-only. A daily job runs `OPTIMIZE`.
 

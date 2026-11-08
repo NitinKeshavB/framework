@@ -1,8 +1,21 @@
 pipeline_id: ledger_entries
-project: finance
+domain: finance
+project: ledger
+data_domain: entries
+team: ledger_squad
+technical_owner: ledger.owner@jll.com
 layer: bronze
 catalog: framework_dev
 job_name: finance_ledger
+
+notify:
+  on_failure:
+    - ledger.owner@jll.com
+
+data:
+  classification: confidential
+  pii:
+    - pii_finance
 
 source_to_raw:
   method: ctas

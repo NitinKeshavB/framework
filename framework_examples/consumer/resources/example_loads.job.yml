@@ -2,6 +2,14 @@ resources:
   jobs:
     example_loads:
       name: example_loads
+      email_notifications:
+        on_failure:
+          - orders.owner@jll.com
+          - payroll.owner@jll.com
+          - pricing.owner@jll.com
+        on_success:
+          - payroll.owner@jll.com
+        no_alert_for_skipped_runs: true
       tasks:
         - task_key: mark_running
           spark_python_task:
