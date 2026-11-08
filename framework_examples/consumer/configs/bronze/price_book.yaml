@@ -1,0 +1,40 @@
+pipeline_id: price_book
+project: merchandising
+layer: bronze
+catalog: framework_dev
+job_name: merchandising_prices
+
+source_to_raw:
+  method: autoloader
+  source:
+    system: catalog
+    format: parquet
+    path: s3://merch-landing/catalog/prices/
+    external_location: merch_landing
+    path_glob: "*.parquet"
+    max_files_per_trigger: 100
+  raw:
+    schema: catalog_raw
+    table: prices
+
+raw_to_bronze:
+  bronze:
+    schema: catalog_bronze
+    table: prices
+  dedup: false
+  primary_keys:
+    - sku
+  columns:
+    - name: sku
+      type: string
+    - name: list_price
+      type: decimal(18,2)
+    - name: effective_on
+      type: date
+  rules:
+    - name: list_price_positive
+      expression: list_price > 0
+
+quarantine:
+  schema: catalog_quarantine
+  table: prices

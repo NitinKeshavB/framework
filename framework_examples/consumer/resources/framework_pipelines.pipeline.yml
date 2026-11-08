@@ -1,0 +1,61 @@
+resources:
+  pipelines:
+    billing_invoices:
+      name: billing_invoices
+      catalog: ${var.catalog}
+      schema: framework_meta
+      serverless: true
+      channel: current
+      continuous: false
+      libraries:
+        - file:
+            path: ../pipelines/billing_invoices.py
+        - whl: ../../../framework_src/dist/*.whl
+
+    ledger_entries:
+      name: ledger_entries
+      catalog: ${var.catalog}
+      schema: framework_meta
+      serverless: true
+      channel: current
+      continuous: false
+      libraries:
+        - file:
+            path: ../pipelines/ledger_entries.py
+        - whl: ../../../framework_src/dist/*.whl
+
+    orders_events:
+      name: orders_events
+      catalog: ${var.catalog}
+      schema: framework_meta
+      serverless: true
+      channel: current
+      continuous: false
+      libraries:
+        - file:
+            path: ../pipelines/orders_events.py
+        - whl: ../../../framework_src/dist/*.whl
+
+    payroll_timesheets:
+      name: payroll_timesheets
+      catalog: ${var.catalog}
+      schema: framework_meta
+      serverless: true
+      channel: current
+      continuous: false
+      libraries:
+        - file:
+            path: ../pipelines/payroll_timesheets.py
+        - whl: ../../../framework_src/dist/*.whl
+
+    price_book:
+      name: price_book
+      catalog: ${var.catalog}
+      schema: framework_meta
+      serverless: true
+      channel: current
+      continuous: false
+      libraries:
+        - file:
+            path: ../pipelines/price_book.py
+        - whl: ../../../framework_src/dist/*.whl

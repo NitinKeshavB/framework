@@ -1,0 +1,37 @@
+# Framework bundle. Dev uses development mode. Prod uses production mode.
+# The catalog is a bundle variable.
+
+bundle:
+  name: framework_bundle
+
+include:
+  - resources/*.yml
+
+# bundle deploy builds this wheel and uploads it. Jobs reference dist/*.whl.
+artifacts:
+  framework_wheel:
+    type: whl
+    path: ../framework_src
+    build: python -m pip wheel --no-deps --wheel-dir dist .
+
+variables:
+  catalog:
+    description: Unity Catalog for this environment.
+    default: framework_dev
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-7405615469052932.12.azuredatabricks.net
+    variables:
+      catalog: framework_dev
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-7405615469052932.12.azuredatabricks.net
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: framework_prod

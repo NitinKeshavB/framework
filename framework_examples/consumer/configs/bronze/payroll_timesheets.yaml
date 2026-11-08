@@ -1,0 +1,44 @@
+pipeline_id: payroll_timesheets
+project: people
+layer: bronze
+catalog: framework_dev
+job_name: people_payroll
+
+source_to_raw:
+  method: autoloader
+  source:
+    system: payroll
+    format: excel
+    path: abfss://landing@storage.dfs.core.windows.net/payroll/timesheets/
+    external_location: payroll_landing
+    header_rows: 1
+    data_address: Timesheets!A1
+  raw:
+    schema: payroll_raw
+    table: timesheets
+
+raw_to_bronze:
+  bronze:
+    schema: payroll_bronze
+    table: timesheets
+  dedup: true
+  primary_keys:
+    - employee_id
+    - work_date
+  watermark_column: updated_at
+  columns:
+    - name: employee_id
+      type: string
+    - name: work_date
+      type: date
+    - name: hours
+      type: decimal(5,2)
+    - name: updated_at
+      type: timestamp
+  rules:
+    - name: hours_in_day
+      expression: hours >= 0 AND hours <= 24
+
+quarantine:
+  schema: payroll_quarantine
+  table: timesheets

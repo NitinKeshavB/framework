@@ -1,0 +1,38 @@
+pipeline_id: orders_events
+project: retail
+layer: bronze
+catalog: framework_dev
+job_name: retail_orders
+
+source_to_raw:
+  method: copy_into
+  source:
+    system: orders
+    format: json
+    path: s3://retail-landing/orders/events/
+    external_location: retail_landing
+  raw:
+    schema: orders_raw
+    table: events
+
+raw_to_bronze:
+  bronze:
+    schema: orders_bronze
+    table: events
+  dedup: false
+  primary_keys:
+    - order_id
+  columns:
+    - name: order_id
+      type: string
+    - name: status
+      type: string
+    - name: order_total
+      type: decimal(18,2)
+  rules:
+    - name: known_status
+      expression: status IN ('placed', 'paid', 'shipped', 'cancelled')
+
+quarantine:
+  schema: orders_quarantine
+  table: events

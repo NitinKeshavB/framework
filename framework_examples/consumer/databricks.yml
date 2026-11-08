@@ -1,0 +1,34 @@
+bundle:
+  name: framework_consumer
+
+include:
+  - resources/*.yml
+
+# Same artifact as the framework bundle. Deploy builds the wheel and uploads it.
+artifacts:
+  framework_wheel:
+    type: whl
+    path: ../../framework_src
+    build: python -m pip wheel --no-deps --wheel-dir dist .
+
+variables:
+  catalog:
+    description: Environment catalog. Supplied per target.
+    default: framework_dev
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-7405615469052932.12.azuredatabricks.net
+    variables:
+      catalog: framework_dev
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-7405615469052932.12.azuredatabricks.net
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: framework_prod

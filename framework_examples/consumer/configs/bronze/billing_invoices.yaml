@@ -1,0 +1,41 @@
+pipeline_id: billing_invoices
+project: finance
+layer: bronze
+catalog: framework_dev
+job_name: finance_billing
+
+source_to_raw:
+  method: autoloader
+  source:
+    system: billing
+    format: csv
+    path: abfss://landing@storage.dfs.core.windows.net/billing/invoices/
+    external_location: billing_landing
+    delimiter: ","
+    header: true
+  raw:
+    schema: billing_raw
+    table: invoices
+
+raw_to_bronze:
+  bronze:
+    schema: billing_bronze
+    table: invoices
+  dedup: true
+  primary_keys:
+    - invoice_id
+  watermark_column: updated_at
+  columns:
+    - name: invoice_id
+      type: string
+    - name: amount
+      type: decimal(18,2)
+    - name: updated_at
+      type: timestamp
+  rules:
+    - name: amount_non_negative
+      expression: amount >= 0
+
+quarantine:
+  schema: billing_quarantine
+  table: invoices

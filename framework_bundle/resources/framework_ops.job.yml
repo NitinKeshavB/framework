@@ -1,0 +1,41 @@
+resources:
+  jobs:
+    framework_ddl:
+      name: framework_ddl
+      tasks:
+        - task_key: apply_ddl
+          spark_python_task:
+            python_file: ../src/apply_ddl.py
+            parameters:
+              - ${var.catalog}
+          libraries:
+            - whl: ../../framework_src/dist/*.whl
+      queue:
+        enabled: true
+
+    framework_collector:
+      name: framework_collector
+      continuous:
+        pause_status: PAUSED
+      tasks:
+        - task_key: collect_events
+          spark_python_task:
+            python_file: ../src/collect_events.py
+            parameters:
+              - ${var.catalog}
+          libraries:
+            - whl: ../../framework_src/dist/*.whl
+
+    framework_optimize:
+      name: framework_optimize
+      schedule:
+        quartz_cron_expression: "0 0 3 * * ?"
+        timezone_id: UTC
+      tasks:
+        - task_key: optimize
+          spark_python_task:
+            python_file: ../src/optimize_registry.py
+            parameters:
+              - ${var.catalog}
+          libraries:
+            - whl: ../../framework_src/dist/*.whl

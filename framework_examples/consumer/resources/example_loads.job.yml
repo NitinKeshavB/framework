@@ -1,0 +1,138 @@
+resources:
+  jobs:
+    example_loads:
+      name: example_loads
+      tasks:
+        - task_key: mark_running
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - step
+              - --project
+              - examples
+              - --full-name
+              - example_loads
+              - --run-id
+              - "{{job.run_id}}"
+              - --step-no
+              - "10"
+              - --step-name
+              - mark_running
+              - --status
+              - RUNNING
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: sync
+          depends_on:
+            - task_key: mark_running
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - sync
+              - ../configs/bronze/orders_events.yaml
+              - ../configs/bronze/payroll_timesheets.yaml
+              - ../configs/bronze/price_book.yaml
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: await_registry
+          depends_on:
+            - task_key: sync
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - await-registry
+              - --catalog
+              - ${var.catalog}
+              - --pipeline
+              - orders_events
+              - --pipeline
+              - payroll_timesheets
+              - --pipeline
+              - price_book
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: batch_load
+          depends_on:
+            - task_key: await_registry
+          spark_python_task:
+            python_file: ../src/run_batch.py
+            parameters:
+              - ../configs/bronze/orders_events.yaml
+              - ../configs/bronze/payroll_timesheets.yaml
+              - ../configs/bronze/price_book.yaml
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: orders_pipeline
+          depends_on:
+            - task_key: batch_load
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.orders_events.id}
+        - task_key: payroll_pipeline
+          depends_on:
+            - task_key: orders_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.payroll_timesheets.id}
+        - task_key: price_pipeline
+          depends_on:
+            - task_key: payroll_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.price_book.id}
+        - task_key: record_success
+          depends_on:
+            - task_key: price_pipeline
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - step
+              - --project
+              - examples
+              - --full-name
+              - example_loads
+              - --run-id
+              - "{{job.run_id}}"
+              - --step-no
+              - "50"
+              - --step-name
+              - record_success
+              - --status
+              - SUCCEEDED
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: record_failure
+          depends_on:
+            - task_key: mark_running
+            - task_key: sync
+            - task_key: await_registry
+            - task_key: batch_load
+            - task_key: orders_pipeline
+            - task_key: payroll_pipeline
+            - task_key: price_pipeline
+          run_if: AT_LEAST_ONE_FAILED
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - step
+              - --project
+              - examples
+              - --full-name
+              - example_loads
+              - --run-id
+              - "{{job.run_id}}"
+              - --step-no
+              - "90"
+              - --step-name
+              - record_failure
+              - --status
+              - FAILED
+              - --failure-reason
+              - task failed
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl

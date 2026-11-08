@@ -1,0 +1,42 @@
+pipeline_id: ledger_entries
+project: finance
+layer: bronze
+catalog: framework_dev
+job_name: finance_ledger
+
+source_to_raw:
+  method: ctas
+  source:
+    system: ledger
+    format: fixed_width
+    path: s3://finance-landing/ledger/entries/
+    fixed_columns:
+      - name: account_id
+        start: 1
+        length: 10
+      - name: amount
+        start: 11
+        length: 12
+  raw:
+    schema: ledger_raw
+    table: entries
+
+raw_to_bronze:
+  bronze:
+    schema: ledger_bronze
+    table: entries
+  dedup: false
+  primary_keys:
+    - account_id
+  columns:
+    - name: account_id
+      type: string
+    - name: amount
+      type: string
+  rules:
+    - name: account_present
+      expression: length(trim(account_id)) > 0
+
+quarantine:
+  schema: ledger_quarantine
+  table: entries

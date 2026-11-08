@@ -1,0 +1,128 @@
+resources:
+  jobs:
+    finance_ingest:
+      name: finance_ingest
+      tasks:
+        - task_key: mark_running
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - step
+              - --project
+              - finance
+              - --full-name
+              - finance_ingest
+              - --run-id
+              - "{{job.run_id}}"
+              - --step-no
+              - "10"
+              - --step-name
+              - mark_running
+              - --status
+              - RUNNING
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: sync
+          depends_on:
+            - task_key: mark_running
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - sync
+              - ../configs/bronze/billing_invoices.yaml
+              - ../configs/bronze/ledger_entries.yaml
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: await_registry
+          depends_on:
+            - task_key: sync
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - await-registry
+              - --catalog
+              - ${var.catalog}
+              - --pipeline
+              - billing_invoices
+              - --pipeline
+              - ledger_entries
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: batch_load
+          depends_on:
+            - task_key: await_registry
+          spark_python_task:
+            python_file: ../src/run_batch.py
+            parameters:
+              - ../configs/bronze/billing_invoices.yaml
+              - ../configs/bronze/ledger_entries.yaml
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: billing_pipeline
+          depends_on:
+            - task_key: batch_load
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.billing_invoices.id}
+        - task_key: ledger_pipeline
+          depends_on:
+            - task_key: billing_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.ledger_entries.id}
+        - task_key: record_success
+          depends_on:
+            - task_key: ledger_pipeline
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - step
+              - --project
+              - finance
+              - --full-name
+              - finance_ingest
+              - --run-id
+              - "{{job.run_id}}"
+              - --step-no
+              - "50"
+              - --step-name
+              - record_success
+              - --status
+              - SUCCEEDED
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
+        - task_key: record_failure
+          depends_on:
+            - task_key: mark_running
+            - task_key: sync
+            - task_key: await_registry
+            - task_key: batch_load
+            - task_key: billing_pipeline
+            - task_key: ledger_pipeline
+          run_if: AT_LEAST_ONE_FAILED
+          spark_python_task:
+            python_file: ../src/run_cli.py
+            parameters:
+              - step
+              - --project
+              - finance
+              - --full-name
+              - finance_ingest
+              - --run-id
+              - "{{job.run_id}}"
+              - --step-no
+              - "90"
+              - --step-name
+              - record_failure
+              - --status
+              - FAILED
+              - --failure-reason
+              - task failed
+              - --out
+              - /Volumes/${var.catalog}/framework_meta/framework_events
+          libraries:
+            - whl: ../../../framework_src/dist/*.whl
