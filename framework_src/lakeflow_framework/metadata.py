@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -115,7 +116,56 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 recorded,
             )
         )
+    rows.extend(_column_rows(config, recorded))
     return rows
+
+
+def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any]]:
+    """Bronze columns. A new hash is a new SCD type 2 version of type, comment, or tags."""
+
+    table_name = config.table_name("bronze")
+    rows: list[dict[str, Any]] = []
+    for ordinal, column in enumerate(config.columns, start=1):
+        record = {
+            "name": column.name,
+            "ordinal": ordinal,
+            "data_type": column.type_name,
+            "description": column.description,
+            "classification": column.classification,
+            "pii": ", ".join(column.pii),
+        }
+        rows.append(
+            _object(
+                "column",
+                f"{table_name}.{column.name}",
+                config.project,
+                table_name,
+                "column_of",
+                json.dumps(record, sort_keys=True),
+                _column_hash(record),
+                "framework",
+                recorded_at,
+            )
+        )
+    return rows
+
+
+def _column_hash(record: Mapping[str, Any]) -> str:
+    """Identity of one column version. The column name is the registry key, not the hash.
+
+    The collector inserts a row only when this hash is new. A new data type, description,
+    sensitivity tag, or position opens a version. Other pipeline edits do not.
+    """
+
+    versioned = {
+        "ordinal": record["ordinal"],
+        "data_type": record["data_type"],
+        "description": record["description"],
+        "classification": record["classification"],
+        "pii": record["pii"],
+    }
+    payload = json.dumps(versioned, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _table_record(config: PipelineConfig, layer: str) -> dict[str, Any]:

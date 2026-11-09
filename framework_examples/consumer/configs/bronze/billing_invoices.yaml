@@ -44,10 +44,15 @@ raw_to_bronze:
   columns:
     - name: invoice_id
       type: string
+      description: Invoice identifier from the billing system
     - name: amount
       type: decimal(18,2)
+      description: Invoice amount in the source currency
+      pii:
+        - pii_finance
     - name: updated_at
       type: timestamp
+      description: When the source system last updated the invoice
   rules:
     - name: amount_non_negative
       expression: amount >= 0
