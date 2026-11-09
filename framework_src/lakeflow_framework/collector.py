@@ -8,10 +8,10 @@ from typing import Any, Callable
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
     OBJECT_COLUMNS,
+    current_objects_sql,
     ddl_statements,
     ingest_steps,
     new_object_rows,
-    object_keys_sql,
     registered_sql,
     split_payloads,
     step_key,
@@ -70,21 +70,15 @@ def append_steps(spark, payloads: list[dict], seen: set | None = None, catalog: 
 
 def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog: str = "") -> int:
     held = seen if seen is not None else set()
-    # Copy so new_object_rows can skip keys from earlier calls without
-    # marking this batch as seen before the insert succeeds.
+    # Copy so a failed insert does not mark this batch as the current version.
     fresh = new_object_rows(rows, set(held))
     if catalog and fresh:
-        already = _existing_object_keys(spark, catalog, fresh)
+        current = _current_object_hashes(spark, catalog, fresh)
         fresh = [
             row
             for row in fresh
-            if (row["object_kind"], row["full_name"], row["content_hash"]) not in already
+            if current.get((row["object_kind"], row["full_name"])) != row["content_hash"]
         ]
-    fresh = [
-        row
-        for row in fresh
-        if (row["object_kind"], row["full_name"], row["content_hash"]) not in held
-    ]
     if not fresh:
         return 0
     written = _insert(
@@ -94,7 +88,11 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
         OBJECT_COLUMNS,
         timestamp_columns=("recorded_at",),
     )
-    held.update((row["object_kind"], row["full_name"], row["content_hash"]) for row in fresh)
+    for row in fresh:
+        held.difference_update(
+            key for key in list(held) if key[0] == row["object_kind"] and key[1] == row["full_name"]
+        )
+        held.add((row["object_kind"], row["full_name"], row["content_hash"]))
     return written
 
 
@@ -134,13 +132,13 @@ def _existing_step_keys(spark, catalog: str, payloads: list[dict]) -> set[tuple[
     }
 
 
-def _existing_object_keys(spark, catalog: str, rows: list[dict]) -> set[tuple[str, str, str]]:
+def _current_object_hashes(spark, catalog: str, rows: list[dict]) -> dict[tuple[str, str], str]:
     try:
-        statement = object_keys_sql(catalog, [str(row["content_hash"]) for row in rows])
+        statement = current_objects_sql(catalog, rows)
     except ValueError:
-        return set()
+        return {}
     return {
-        (str(row["object_kind"]), str(row["full_name"]), str(row["content_hash"]))
+        (str(row["object_kind"]), str(row["full_name"])): str(row["content_hash"])
         for row in _rows(spark.sql(statement))
     }
 

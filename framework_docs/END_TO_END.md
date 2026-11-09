@@ -75,8 +75,11 @@ Views:
 - `v_lineage` — latest link per parent, child, and relation. Intended links are written at sync. Observed links can be added later from `system.access.table_lineage`.
 - `v_pipelines` — one row per pipeline: domain, project, data domain, team, technical owner, and the failure and success mail lists.
 - `v_tables` — one row per raw, bronze, and quarantine table: the same ownership fields plus classification and PII. These labels are the ones a later ontology can read. The pipeline does not create tags in Unity Catalog.
-- `v_columns` — the current bronze column: data type, description, classification, and PII. The description is the column comment from YAML. A column that omits tags stores the bronze table tags, so the row stands alone.
-- `v_column_history` — SCD type 2 for those columns. Each change to data type, description, sensitivity tags, or position inserts a new `object_kind = 'column'` row. `valid_from` is `recorded_at`. `valid_to` is the next version's `recorded_at`, and null on the open version. `is_current` is true when `valid_to` is null. The collector still only inserts. Returning to an earlier type, comment, or tag does not append another row when that exact version was already stored, which is the same rule as pipelines and tables.
+- `v_object_history` — every version of every object: pipeline, workflow, flow, table, link, and column. `valid_from` is `recorded_at`. `valid_to` is the next version's `recorded_at` for that same object, and null while that version is the latest stored. A point in time is `valid_from <= that time AND (valid_to IS NULL OR valid_to > that time)`.
+- `v_columns` — the current column on raw, bronze, and quarantine: data type, description, classification, and PII.
+- `v_column_history` — the same intervals as `v_object_history`, limited to columns and with the column fields extracted.
+
+Each object is hashed on its own document. A job rename versions the pipeline and the workflow. It does not copy a new row for a table or column whose own fields did not change. Collecting the same document again does not insert. Putting an older document back in force does insert, so the days in between still resolve to the version that was active then.
 
 System tables are the source for job definitions, run duration, pipeline events, information-schema securables, and observed lineage. The collector copies the fields that would be lost when those tables age out or when an object is dropped: project, the flow graph, the failure text, and the source-file reconciliation. Analysts query `framework_meta` only.
 
@@ -86,12 +89,12 @@ People looking at past runs are not counting bronze or quarantine, and they are 
 
 Delta has no SQL Server indexes. The tables use liquid clustering:
 
-- `object_registry`: `CLUSTER BY (project, object_kind, full_name)`
+- `object_registry`: `CLUSTER BY (project, object_kind, full_name, recorded_at)`
 - `run_ledger`: `CLUSTER BY (project, event_date, full_name, run_id)`
 
-Both set `delta.autoOptimize.optimizeWrite`. The DDL also creates bloom-filter indexes on `full_name` and `run_id`. If this runtime rejects that statement, the DDL task skips it and clustering remains. A daily job runs `OPTIMIZE` on both tables. `VACUUM` is not scheduled. Vacuum would only drop files left by compaction. It would not remove process steps.
+Both set `delta.autoOptimize.optimizeWrite` and `autoCompact`, so the collector's small inserts are compacted as they land. The DDL also creates bloom-filter indexes on `full_name` and `run_id`. If this runtime rejects that statement, the DDL task skips it and clustering remains. A daily job runs `OPTIMIZE` on both tables. `VACUUM` is not scheduled. Vacuum would only drop files left by compaction. It would not remove process steps.
 
-Query with `project` and, for past runs, `event_date`. A query without those filters is not the supported path.
+Before an insert, the collector reads only the current hash for the projects, kinds, and names in that batch. It does not scan history for other projects. A read or a join should filter `project` and `object_kind` (and `full_name` when the object is known) before the `valid_from` / `valid_to` test. A run joined to the definition that was active uses `project`, `object_kind`, and `full_name` as the equality keys, then `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`. A query without those filters is not the supported path.
 
 ## What is checked on a real workspace
 

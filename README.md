@@ -78,7 +78,7 @@ quarantine:
 
 One domain holds many projects. Each pipeline names its `domain`, `project`, `data_domain`, `team`, and `technical_owner`. `data.classification` is `internal`, `confidential`, or `highly_confidential`. `data.pii` is any of `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, and `pii_personal`. Leave `pii` out when the table has none. A raw, bronze, or quarantine block can override those two fields. `notify.on_failure` is who Databricks mails when the job fails. Omit it and the technical owner is used. `notify.on_success` is optional. Put the same addresses on the job `email_notifications` block.
 
-`raw_to_bronze.columns` is the bronze column contract. Each entry has `name`, `type`, and an optional `description` (the column comment). `classification` and `pii` on a column override the bronze table. Leave them off and the column keeps the table tags. A change to type, description, tags, or position is a new row in the registry. `v_column_history` reads that history as SCD type 2: `valid_from` is when the version was recorded, `valid_to` is when the next version was recorded, and a null `valid_to` is the current version.
+`raw_to_bronze.columns` is the column contract for raw, bronze, and quarantine. Each entry has `name`, `type`, and an optional `description`. `classification` and `pii` on a column override the bronze table. Leave them off and the column keeps the table tags. Raw also records `_source_file` and `_ingested_at`. Quarantine also records `failed_rules`.
 
 Check the file before a cluster starts:
 
@@ -116,10 +116,24 @@ Query `<catalog>.framework_meta`, with a `project` filter:
 | `v_lineage` | Links from a pipeline to raw, bronze, and quarantine |
 | `v_pipelines` | Domain, project, data domain, team, owner, and who is mailed |
 | `v_tables` | Classification and PII on each raw, bronze, and quarantine table |
+| `v_columns` | Current column type, description, classification, and PII |
+| `v_column_history` | Every column version, with `valid_from` and `valid_to` |
+| `v_object_history` | Every version of a pipeline, workflow, flow, table, link, or column |
 | `v_columns` | Current bronze columns: type, description, classification, and PII |
 | `v_column_history` | Every column version, with `valid_from`, `valid_to`, and `is_current` |
 
 History is insert-only. A daily job runs `OPTIMIZE`.
+
+To see the system as it was at a moment, filter `v_object_history`. A version was active from `valid_from` until `valid_to`. A null `valid_to` is the version still stored as current. The same filter works for pipelines (`object_kind = 'pipeline'`), workflows (`workflow`), flows (`flow`), tables (`table`, `streaming_table`, or `materialized_view`), and columns (`column`). `v_column_history` is that filter with the column fields already extracted.
+
+```sql
+SELECT object_kind, full_name, config_json, valid_from, valid_to
+FROM framework_meta.v_object_history
+WHERE valid_from <= TIMESTAMP '2026-11-08 00:00:00'
+  AND (valid_to IS NULL OR valid_to > TIMESTAMP '2026-11-08 00:00:00')
+```
+
+An unchanged table does not get a new row when only the pipeline or job name changes. A return to an older type, tag, or pipeline document does get a new row, so the dates in between stay correct. Filter `project` and `object_kind` in that query. Those are cluster columns, so the read does not scan every project. Join a run to this view on `project`, `object_kind`, and `full_name`, and keep `started_at` inside `valid_from` and `valid_to`.
 
 ## Examples
 

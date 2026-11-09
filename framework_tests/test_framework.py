@@ -16,6 +16,7 @@ from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
     OBJECT_COLUMNS,
     build_recon,
+    current_objects_sql,
     ddl_statements,
     ingest_steps,
     new_object_rows,
@@ -375,15 +376,37 @@ def test_missing_registry_row_is_an_error():
         build_pipeline("billing_invoices", metadata=Empty())
 
 
+def test_current_lookup_prunes_by_project_kind_and_name():
+    statement = current_objects_sql(
+        "framework_dev",
+        [
+            {
+                "project": "billing",
+                "object_kind": "column",
+                "full_name": "framework_dev.billing_bronze.invoices.amount",
+            }
+        ],
+    )
+    assert "FROM framework_dev.framework_meta.object_registry" in statement
+    assert "project IN ('billing')" in statement
+    assert "object_kind IN ('column')" in statement
+    assert "full_name IN ('framework_dev.billing_bronze.invoices.amount')" in statement
+    assert "QUALIFY row_number()" in statement
+    assert "v_object_current" not in statement
+
+
 def test_ddl_clusters_both_tables_and_names_the_catalog():
     statements = ddl_statements("framework_dev")
     text = "\n".join(statements)
-    assert "CLUSTER BY (project, object_kind, full_name)" in text
+    assert "CLUSTER BY (project, object_kind, full_name, recorded_at)" in text
+    assert "delta.autoOptimize.autoCompact" in text
     assert "CLUSTER BY (project, event_date, full_name, run_id)" in text
     assert "${catalog}" not in text
     assert "CREATE BLOOMFILTER INDEX" in text
     assert "v_pipelines" in text
     assert "v_tables" in text
+    assert "v_object_history" in text
+    assert "PARTITION BY object_kind, full_name" in text
     assert "v_columns" in text
     assert "v_column_history" in text
     assert "valid_from" in text
@@ -412,11 +435,29 @@ def test_ctas_securables_match_the_graph():
 
 def test_column_metadata_versions_type_comment_and_tags():
     config = config_from_document(_billing())
-    rows = [row for row in object_rows(config) if row["object_kind"] == "column"]
+    rows = [
+        row
+        for row in object_rows(config)
+        if row["object_kind"] == "column"
+        and row["parent_full_name"] == "framework_dev.billing_bronze.invoices"
+    ]
     assert [row["full_name"] for row in rows] == [
         "framework_dev.billing_bronze.invoices.invoice_id",
         "framework_dev.billing_bronze.invoices.amount",
     ]
+    raw_names = {
+        row["full_name"]
+        for row in object_rows(config)
+        if row["parent_full_name"] == "framework_dev.billing_raw.invoices"
+    }
+    assert "framework_dev.billing_raw.invoices._source_file" in raw_names
+    assert "framework_dev.billing_raw.invoices.amount" in raw_names
+    quarantine_names = {
+        row["full_name"]
+        for row in object_rows(config)
+        if row["parent_full_name"] == "framework_dev.billing_quarantine.invoices"
+    }
+    assert "framework_dev.billing_quarantine.invoices.failed_rules" in quarantine_names
     amount = json.loads(rows[1]["config_json"])
     assert amount == {
         "classification": "confidential",
@@ -458,12 +499,22 @@ def test_column_metadata_versions_type_comment_and_tags():
     )
     assert untouched["content_hash"] == rows[1]["content_hash"]
 
-    ledger_columns = [
-        row
-        for row in object_rows(config_from_document(_ledger()))
-        if row["object_kind"] == "column"
+    ledger_rows = object_rows(config_from_document(_ledger()))
+    assert [
+        row["full_name"]
+        for row in ledger_rows
+        if row["parent_full_name"] == "framework_dev.ledger_bronze.entries"
+    ] == []
+    assert [
+        row["full_name"]
+        for row in ledger_rows
+        if row["parent_full_name"] == "framework_dev.ledger_raw.entries"
+    ] == [
+        "framework_dev.ledger_raw.entries.account_id",
+        "framework_dev.ledger_raw.entries.amount",
+        "framework_dev.ledger_raw.entries._source_file",
+        "framework_dev.ledger_raw.entries._ingested_at",
     ]
-    assert ledger_columns == []
 
 
 def test_column_tags_inherit_the_bronze_table_unless_overridden():
@@ -627,6 +678,25 @@ def test_await_registry_fails_when_the_row_never_arrives():
         )
 
 
+def test_a_table_version_stays_open_when_only_the_job_name_changes():
+    original = object_rows(config_from_document(_billing(job_name="finance_billing")))
+    renamed = object_rows(config_from_document(_billing(job_name="finance_billing_retry")))
+
+    def hashes(rows, kind, name):
+        return next(
+            row["content_hash"]
+            for row in rows
+            if row["object_kind"] == kind and row["full_name"] == name
+        )
+
+    assert hashes(original, "streaming_table", "framework_dev.billing_bronze.invoices") == hashes(
+        renamed, "streaming_table", "framework_dev.billing_bronze.invoices"
+    )
+    assert hashes(original, "pipeline", "billing_invoices") != hashes(
+        renamed, "pipeline", "billing_invoices"
+    )
+
+
 def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
     inserted: list[list[dict]] = []
 
@@ -649,7 +719,12 @@ def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
     seen: set = set()
     assert append_definitions(None, [row, dict(row)], seen) == 1
     assert append_definitions(None, [dict(row)], seen) == 0
-    assert len(inserted) == 1
+    restored = dict(row)
+    changed = dict(row, content_hash="b" * 64)
+    assert append_definitions(None, [changed], seen) == 1
+    assert append_definitions(None, [restored], seen) == 1
+    assert append_definitions(None, [restored], seen) == 0
+    assert len(inserted) == 3
 
 
 def test_pipeline_lookup_binds_the_id_and_rejects_sql():

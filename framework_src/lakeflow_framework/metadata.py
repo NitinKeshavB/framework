@@ -46,7 +46,6 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
         },
         sort_keys=True,
     )
-    content_hash = config.content_hash()
     pipeline_name = config.pipeline_id
     rows = [
         _object(
@@ -56,13 +55,14 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             config.job_name,
             "owns" if config.job_name else None,
             config_json,
-            content_hash,
+            _digest(config_json),
             "framework",
             recorded,
         )
     ]
     for layer, relation in (("raw", "writes"), ("bronze", "writes"), ("quarantine", "rejects_to")):
         full_name = config.table_name(layer)
+        flow_json = json.dumps({"table": full_name, "layer": layer}, sort_keys=True)
         rows.append(
             _object(
                 "flow",
@@ -70,12 +70,13 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 config.project,
                 pipeline_name,
                 relation,
-                json.dumps({"table": full_name, "layer": layer}, sort_keys=True),
-                content_hash,
+                flow_json,
+                _digest(flow_json),
                 "framework",
                 recorded,
             )
         )
+        table_json = json.dumps(_table_record(config, layer), sort_keys=True)
         rows.append(
             _object(
                 _securable_kind(config, layer),
@@ -83,12 +84,13 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 config.project,
                 f"{pipeline_name}.{layer}",
                 relation,
-                json.dumps(_table_record(config, layer), sort_keys=True),
-                content_hash,
+                table_json,
+                _digest(table_json),
                 "framework",
                 recorded,
             )
         )
+        link_json = json.dumps({"child": full_name}, sort_keys=True)
         rows.append(
             _object(
                 "link",
@@ -96,13 +98,14 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 config.project,
                 pipeline_name,
                 relation,
-                json.dumps({"child": full_name}, sort_keys=True),
-                content_hash,
+                link_json,
+                _digest(link_json),
                 "framework",
                 recorded,
             )
         )
     if config.job_name:
+        workflow_json = json.dumps({"pipeline_id": pipeline_name}, sort_keys=True)
         rows.append(
             _object(
                 "workflow",
@@ -110,8 +113,8 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 config.project,
                 None,
                 None,
-                json.dumps({"pipeline_id": pipeline_name}, sort_keys=True),
-                content_hash,
+                workflow_json,
+                _digest(workflow_json),
                 "framework",
                 recorded,
             )
@@ -121,40 +124,75 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
 
 
 def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any]]:
-    """Bronze columns. A new hash is a new SCD type 2 version of type, comment, or tags."""
+    """One version per column of raw, bronze, and quarantine."""
 
-    table_name = config.table_name("bronze")
     rows: list[dict[str, Any]] = []
-    for ordinal, column in enumerate(config.columns, start=1):
-        record = {
-            "name": column.name,
-            "ordinal": ordinal,
-            "data_type": column.type_name,
-            "description": column.description,
-            "classification": column.classification,
-            "pii": ", ".join(column.pii),
-        }
-        rows.append(
-            _object(
-                "column",
-                f"{table_name}.{column.name}",
-                config.project,
-                table_name,
-                "column_of",
-                json.dumps(record, sort_keys=True),
-                _column_hash(record),
-                "framework",
-                recorded_at,
+    for layer in ("raw", "bronze", "quarantine"):
+        table_name = config.table_name(layer)
+        tags = config.tags[layer]
+        fields = [
+            (column.name, column.type_name, column.description, column.classification, column.pii)
+            for column in config.columns
+        ]
+        if not fields and layer == "raw":
+            fields = [
+                (column.name, "string", "", tags.classification, [])
+                for column in config.fixed_columns
+            ]
+        seen_names = {name for name, *_rest in fields}
+        if layer == "raw":
+            for extra in (
+                ("_source_file", "string", "Source file path", tags.classification, []),
+                ("_ingested_at", "timestamp", "Time the row was read", tags.classification, []),
+            ):
+                if extra[0] not in seen_names:
+                    fields.append(extra)
+        if layer == "quarantine" and "failed_rules" not in seen_names:
+            fields.append(
+                (
+                    "failed_rules",
+                    "array<string>",
+                    "Rules that failed for this row",
+                    tags.classification,
+                    [],
+                )
             )
-        )
+        for ordinal, (name, type_name, description, classification, pii) in enumerate(
+            fields, start=1
+        ):
+            record = {
+                "name": name,
+                "ordinal": ordinal,
+                "data_type": type_name,
+                "description": description,
+                "classification": classification,
+                "pii": ", ".join(pii),
+            }
+            rows.append(
+                _object(
+                    "column",
+                    f"{table_name}.{name}",
+                    config.project,
+                    table_name,
+                    "column_of",
+                    json.dumps(record, sort_keys=True),
+                    _column_hash(record),
+                    "framework",
+                    recorded_at,
+                )
+            )
     return rows
+
+
+def _digest(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _column_hash(record: Mapping[str, Any]) -> str:
     """Identity of one column version. The column name is the registry key, not the hash.
 
-    The collector inserts a row only when this hash is new. A new data type, description,
-    sensitivity tag, or position opens a version. Other pipeline edits do not.
+    A new data type, description, sensitivity tag, or position opens a version.
+    Other pipeline edits do not. Returning to an older value opens a version too.
     """
 
     versioned = {
@@ -245,6 +283,7 @@ LEDGER_COLUMNS = (
 )
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -283,13 +322,23 @@ def split_payloads(
 def new_object_rows(
     rows: list[dict[str, Any]], seen_hashes: set[tuple[str, str, str]]
 ) -> list[dict[str, Any]]:
+    """Keep a row when its hash differs from the current hash of that object.
+
+    The same payload collected again is skipped. A return to an older payload is kept,
+    because that is a new period in which the older value was active.
+    """
+
+    current = {(kind, name): digest for kind, name, digest in seen_hashes}
     fresh: list[dict[str, Any]] = []
     for row in rows:
-        key = (row["object_kind"], row["full_name"], row["content_hash"])
-        if key in seen_hashes:
+        key = (row["object_kind"], row["full_name"])
+        digest = row["content_hash"]
+        if current.get(key) == digest:
             continue
-        seen_hashes.add(key)
+        current[key] = digest
         fresh.append(row)
+    seen_hashes.clear()
+    seen_hashes.update((kind, name, digest) for (kind, name), digest in current.items())
     return fresh
 
 
@@ -435,6 +484,35 @@ def registered_sql(pipeline_ids: list[str], catalog: str) -> str:
     return (
         f"SELECT full_name FROM {catalog}.framework_meta.v_object_current "
         f"WHERE object_kind = 'pipeline' AND full_name IN ({quoted})"
+    )
+
+
+def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
+    """Latest stored hash for each object. A matching hash means that version is still active."""
+
+    if not catalog or not _SAFE_TOKEN.match(catalog):
+        raise ValueError("catalog is required")
+    names = sorted({str(row["full_name"]) for row in rows})
+    kinds = sorted({str(row["object_kind"]) for row in rows})
+    projects = sorted({str(row.get("project") or "") for row in rows})
+    if not names or any(not _SAFE_NAME.match(name) for name in names):
+        raise ValueError("object name is required")
+    if any(not _SAFE_TOKEN.match(kind) for kind in kinds):
+        raise ValueError("object kind is required")
+    if any(not _SAFE_TOKEN.match(project) for project in projects):
+        raise ValueError("project is required")
+    quoted_names = ", ".join(f"'{name}'" for name in names)
+    quoted_kinds = ", ".join(f"'{kind}'" for kind in kinds)
+    quoted_projects = ", ".join(f"'{project}'" for project in projects)
+    return (
+        "SELECT object_kind, full_name, content_hash "
+        f"FROM {catalog}.framework_meta.object_registry "
+        f"WHERE project IN ({quoted_projects}) "
+        f"AND object_kind IN ({quoted_kinds}) "
+        f"AND full_name IN ({quoted_names}) "
+        "QUALIFY row_number() OVER ("
+        "PARTITION BY object_kind, full_name ORDER BY recorded_at DESC"
+        ") = 1"
     )
 
 

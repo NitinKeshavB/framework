@@ -119,7 +119,8 @@ Ask these views, with a `project` filter:
 - `v_lineage` for links written by the pipeline
 - `v_pipelines` for domain, project, data domain, team, owner, and mail
 - `v_tables` for classification and PII on each table
-- `v_columns` for the current type, description, classification, and PII of each bronze column
+- `v_object_history` for what was active at a point in time, for pipelines, workflows, flows, tables, and columns
+- `v_columns` for the current type, description, classification, and PII of each column
 - `v_column_history` for every version of those columns (`valid_from`, `valid_to`, `is_current`)
 
 The example job in [framework_examples/consumer](../framework_examples/consumer) writes the step files, waits until the collector has loaded the definitions, and then refreshes the billing and ledger pipelines. A success step can carry counts with `--recon-json '{"source_count": 10, "output_rows": 9, "rejected": 1}'`.
