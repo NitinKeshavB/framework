@@ -1,6 +1,28 @@
 # Using the framework
 
-The repository overview is [../README.md](../README.md). This page is the YAML contract.
+The repository overview is [../README.md](../README.md). This page is the YAML contract. The physical registry is in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+One file describes one pipeline and the three tables it owns.
+
+```mermaid
+erDiagram
+  YAML ||--|| PIPELINE : pipeline_id
+  YAML ||--|| RAW_TABLE : source_to_raw
+  YAML ||--|| BRONZE_TABLE : raw_to_bronze
+  YAML ||--|| QUARANTINE_TABLE : quarantine
+  YAML ||--o{ COLUMN : "raw_to_bronze.columns"
+  YAML {
+    string domain
+    string project
+    string data_domain
+    string team
+    string technical_owner
+    string classification
+    string pii
+  }
+```
+
+`notify` is mail on the job. It is stored on the pipeline document and copied onto `email_notifications`. It is not a table.
 
 Supply one YAML file per pipeline and a one-line pipeline file. The bundle builds the wheel.
 
@@ -100,7 +122,7 @@ The command lists every error and does not start a cluster. Run it in CI.
 
 ## Tables
 
-For source system `billing` and table `invoices` the pipeline writes:
+The three names for source system `billing` and table `invoices` are the tables in the diagram above:
 
 - `<catalog>.billing_raw.invoices`
 - `<catalog>.billing_bronze.invoices`

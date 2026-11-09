@@ -1,10 +1,112 @@
 # Architecture
 
-## The repository this replaces
+## What this package does
 
-`JLLT-EDP-Ingestion-develop.zip` is about 445 entries. It has 39 `setup.py` files and 32 directories under `eif_readers/`. `plugin_discovery.py` is 864 lines and mixes entry points, a filesystem scan, and `sys.path` changes. The same dataclass template is copied in `eif_config_manager/templates/`, `eif_utils/ingestion/templates/`, and `ingestion/templates/`. There is no declarative pipeline, no bronze or quarantine layer, and no metadata tables.
+This package is the shared ingestion framework. An Allianz domain adds bronze YAML and a one-line pipeline and uses this load path. Files land in raw, valid rows are published to bronze, and failed rows go to quarantine. The registry is `object_registry` and `run_ledger` in Unity Catalog.
 
-The Auto Loader format checks and option map are kept: format allow-list, a positive `max_files_per_trigger`, a required CSV delimiter, Excel `header_rows` of 0 or 1, a required Excel `data_address`, Excel schema evolution left off, and the `cloudFiles` options for format, existing files, type inference, overwrites, file and byte limits, rescue on permissive text, header, delimiter, and path glob. Checkpoint path and `cloudFiles.schemaLocation` are not kept.
+## Data on the way in
+
+```mermaid
+erDiagram
+  SOURCE_PATH ||--|| RAW_TABLE : "source_to_raw"
+  RAW_TABLE ||--|| BRONZE_TABLE : "publishes passing rows"
+  RAW_TABLE ||--|| QUARANTINE_TABLE : "writes failing rows"
+  PIPELINE ||--|| RAW_TABLE : writes
+  PIPELINE ||--|| BRONZE_TABLE : writes
+  PIPELINE ||--|| QUARANTINE_TABLE : rejects_to
+```
+
+`source_to_raw.method` is `autoloader`, `copy_into`, or `ctas`. Raw, bronze, and quarantine are `<catalog>.<system>_<layer>.<table>`. One source row is published to bronze or written to quarantine.
+
+Auto Loader checks the format allow-list, requires a positive `max_files_per_trigger` when one is set, requires a CSV delimiter, allows Excel `header_rows` of 0 or 1, requires an Excel `data_address`, and leaves Excel schema evolution off. The `cloudFiles` options cover format, existing files, type inference, overwrites, rescue on permissive text, header, delimiter, and path glob. File pipelines do not set a checkpoint path or `cloudFiles.schemaLocation`.
+
+## Registry, physical
+
+History is insert-only. A version is `(object_kind, full_name, recorded_at)`. A run step is `(run_id, step_no, status)`. The tables do not declare those as primary keys. A run matches the definition that was active when `project`, `object_kind`, and `full_name` are equal and `started_at` is inside `[valid_from, valid_to)`.
+
+```mermaid
+erDiagram
+  object_registry ||--o{ run_ledger : "project, object_kind, full_name"
+  object_registry {
+    string object_kind
+    string full_name
+    timestamp recorded_at
+    string project
+    string parent_full_name
+    string relation
+    string config_json
+    string content_hash
+    string source
+  }
+  run_ledger {
+    string run_id
+    int step_no
+    string status
+    string parent_run_id
+    string object_kind
+    string full_name
+    string project
+    string step_name
+    timestamp started_at
+    timestamp ended_at
+    string failure_reason
+    string recon_json
+    timestamp recorded_at
+    date event_date
+  }
+```
+
+`object_registry` is clustered by `(project, object_kind, full_name, recorded_at)`. `run_ledger` is clustered by `(project, event_date, full_name, run_id)`.
+
+## Registry, logical
+
+Every box is a row in `object_registry`, except `RUN_STEP`, which is a row in `run_ledger`. `parent_full_name` and `relation` are the edges.
+
+```mermaid
+erDiagram
+  WORKFLOW |o--o{ PIPELINE : owns
+  PIPELINE ||--|{ FLOW : has
+  FLOW ||--|| SECURABLE : "writes or rejects_to"
+  PIPELINE ||--|{ LINK : "writes or rejects_to"
+  LINK }o--|| SECURABLE : names
+  SECURABLE ||--o{ COLUMN : column_of
+  PIPELINE ||--o{ RUN_STEP : "steps of a run"
+```
+
+| Kind | `full_name` | Parent | `relation` | What `config_json` holds |
+| --- | --- | --- | --- | --- |
+| `workflow` | `job_name` | none | none | `pipeline_id` |
+| `pipeline` | `pipeline_id` | `job_name` when set | `owns` | Canonical YAML and compiled rules |
+| `flow` | `<pipeline_id>.raw`, `.bronze`, `.quarantine` | pipeline | `writes` or `rejects_to` | Table name and layer |
+| `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, owner, classification, PII |
+| `link` | `<pipeline_id>-><table>` | pipeline | `writes` or `rejects_to` | Child table name |
+| `column` | `<table>.<column>` | table name | `column_of` | Ordinal, type, description, classification, PII |
+
+Raw is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Quarantine and bronze are a `materialized_view` for CTAS and a `streaming_table` otherwise. Dedup bronze stays a `streaming_table` because Auto CDC writes it.
+
+A column hash covers ordinal, data type, description, classification, and PII. The column name is the key, so a rename is a different column. A job rename versions the pipeline and the workflow. It does not version a table or column whose own document is unchanged.
+
+## Views
+
+Views do not store a second copy. Current views keep the latest row. History views add `valid_from` (`recorded_at`) and `valid_to` (the next `recorded_at` for that object, or null).
+
+```mermaid
+flowchart TD
+  object_registry[object_registry]
+  run_ledger[run_ledger]
+  object_registry --> v_object_current
+  object_registry --> v_object_history
+  object_registry --> v_lineage
+  v_object_current --> v_pipelines
+  v_object_current --> v_tables
+  v_object_current --> v_columns
+  v_object_history --> v_column_history
+  run_ledger --> v_process
+  run_ledger --> v_run_current
+  run_ledger --> v_recon
+```
+
+`v_lineage` is the latest `link` row for each parent, child, and relation. `v_pipelines`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` is the `record_success` step with `recon_json` parsed. `v_run_current` is the latest step in the last 7 days.
 
 ## Layout
 
@@ -39,19 +141,9 @@ Load methods are strategies with one contract: name, supported formats, whether 
 
 Quality rules are functions from config to SQL. The template does not know how a not-null rule was produced.
 
-The registry is two tables because the old procedures used a system, a stream, a job, an object, two attribute tables, a relationship table, and several logs. Attributes and relationships are columns. Run steps, failure text, and reconciliation are rows in `run_ledger`.
+The registry stays those two tables. Kinds, parents, and relations are columns on `object_registry`, as drawn above. `run_ledger` stores run steps, failure text, and reconciliation.
 
-Lakeflow Connect is not used for these files. S3 and ADLS use Spark Declarative Pipelines. Connect remains the place to add SQL Server, PostgreSQL, and SharePoint later, as another strategy, without moving these folders.
-
-## Migration
-
-Keep, rewritten small: the Auto Loader checks and option map above.
-
-Retire: the 39 per-handler packages, entry-point discovery, and the copied dataclass templates.
-
-Defer: PostgreSQL, Azure SQL, SQL Server, DB2, SharePoint, and SFTP. Add each as a strategy. Prefer Lakeflow Connect for the databases and SharePoint when that work starts.
-
-Do not copy into this package: the writers, the API handlers, the batchfile deploy tooling, or the `sys.path` changes.
+Lakeflow Connect is not used for these files. S3 and ADLS use Spark Declarative Pipelines. Another source can be added later as another load strategy.
 
 ## Behaviour that still needs a workspace
 

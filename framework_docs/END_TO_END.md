@@ -35,13 +35,23 @@ Step files land in `/Volumes/<catalog>/framework_meta/framework_events` as `{pro
 
 Every config in this version is a bronze load. `source_to_raw.method` chooses how files reach the raw table. `raw_to_bronze` reads that table and writes bronze. Rejected rows go to the quarantine table with the failing rule names. Nothing is dropped with `expect_or_drop`.
 
+```mermaid
+erDiagram
+  SOURCE_PATH ||--|| RAW_TABLE : lands
+  RAW_TABLE ||--|| BRONZE_TABLE : "publishes passing rows"
+  RAW_TABLE ||--|| QUARANTINE_TABLE : "writes failing rows"
+  PIPELINE ||--|| RAW_TABLE : writes
+  PIPELINE ||--|| BRONZE_TABLE : writes
+  PIPELINE ||--|| QUARANTINE_TABLE : rejects_to
+```
+
 | Method | Use it when | Raw | Bronze |
 | --- | --- | --- | --- |
 | `autoloader` (default) | Files keep arriving | Streaming table, `cloudFiles`. No checkpoint path and no `schemaLocation`. The pipeline owns that state. | Streaming table, or Auto CDC when `dedup: true` |
 | `copy_into` | A scheduled drop must be loaded once | `COPY INTO` with `force = false`, then the pipeline streams that table | Streaming table |
 | `ctas` | A small extract replaces the previous one | `CREATE OR REPLACE TABLE` | Materialized view, because a full replace is not an append |
 
-Excel is allowed for Auto Loader and CTAS. `copy_into` rejects it because COPY INTO has no Excel reader. Fixed-width is a text file plus `fixed_columns` (`name`, `start`, `length`) projected with `substring`. YAML is one `content` string in this version. CSV, delimited text, JSON, Parquet, Avro, and Excel use the option map kept from the old Auto Loader handler.
+Excel is allowed for Auto Loader and CTAS. `copy_into` rejects it because COPY INTO has no Excel reader. Fixed-width is a text file plus `fixed_columns` (`name`, `start`, `length`) projected with `substring`. YAML is one `content` string in this version. CSV, delimited text, JSON, Parquet, Avro, and Excel each have their own option map.
 
 `dedup: true` requires `primary_keys` and `watermark_column`. Bronze then uses `create_auto_cdc_flow` with `stored_as_scd_type` integer `1`, so the latest row for each key wins. Raw and quarantine are not deduplicated. Keys still generate not-null rules when dedup is off.
 
@@ -62,7 +72,19 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 Two tables in `<catalog>.framework_meta`. History is insert-only. The framework does not `UPDATE` or `DELETE` these rows.
 
-`object_registry` is the catalog of workflows (Lakeflow jobs), tasks, pipelines, flows, securables, and links. A new row is written when the definition hash changes. `config_json` holds the YAML, the compiled rules, and the attributes that used to be separate attribute tables. `parent_full_name` and `relation` (`owns`, `writes`, `reads`, `rejects_to`) replace a relationship table.
+`object_registry` is the catalog of workflows, pipelines, flows, securables, links, and columns. A new row is written when that object's own hash changes. `config_json` holds the document for that one object. `parent_full_name` and `relation` are the edges: `owns`, `writes`, `rejects_to`, and `column_of`.
+
+```mermaid
+erDiagram
+  WORKFLOW |o--o{ PIPELINE : owns
+  PIPELINE ||--|{ FLOW : has
+  FLOW ||--|| SECURABLE : "writes or rejects_to"
+  PIPELINE ||--|{ LINK : lineage
+  SECURABLE ||--o{ COLUMN : column_of
+  OBJECT_VERSION ||--o{ RUN_STEP : "started_at in valid_from, valid_to"
+```
+
+`OBJECT_VERSION` is one row of `v_object_history`, not a third table. `RUN_STEP` is one row of `run_ledger`. Join them on `project`, `object_kind`, and `full_name`, and keep `started_at` in `[valid_from, valid_to)`. Filter `project` and `object_kind` so the cluster key prunes the read. The column-level picture of the same edges is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 `run_ledger` is one row per process step: step number, step name, status (`RUNNING`, `SUCCEEDED`, `FAILED`), start, end, and failure text. The success step can carry `recon_json`: source file names and counts, inserted, updated, deleted, output rows, rejected, and `matched` or `mismatch`. Insert, update, and delete come from Delta commit metrics when the write is a merge. An append records output rows and leaves those three empty rather than inventing them. Rejected is the quarantine record count from `DESCRIBE DETAIL`, not a scan of the table.
 
@@ -87,7 +109,7 @@ People looking at past runs are not counting bronze or quarantine, and they are 
 
 ## Physical layout
 
-Delta has no SQL Server indexes. The tables use liquid clustering:
+The tables use liquid clustering:
 
 - `object_registry`: `CLUSTER BY (project, object_kind, full_name, recorded_at)`
 - `run_ledger`: `CLUSTER BY (project, event_date, full_name, run_id)`
@@ -115,4 +137,4 @@ These are assumptions in the code, not results from a run here:
 
 - [README.md](README.md) for the consumer contract.
 - [MAINTAINERS.md](MAINTAINERS.md) for versioning and publishing the wheel.
-- [ARCHITECTURE.md](ARCHITECTURE.md) for the old repository, the dependency direction, and the migration map.
+- [ARCHITECTURE.md](ARCHITECTURE.md) for the package boundaries and the dependency direction.

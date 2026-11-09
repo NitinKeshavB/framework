@@ -1,8 +1,36 @@
 # Lakeflow framework
 
-Config-driven file ingestion for Databricks Lakeflow. A team adds one bronze YAML file and a one-line pipeline. `databricks bundle deploy` builds the wheel and uploads it.
+Standalone, config-driven file ingestion for Databricks Lakeflow. An Allianz team adopts it by pinning the wheel, adding one bronze YAML file, and adding a one-line pipeline. Many domains and projects share that wheel and one registry. `databricks bundle deploy` builds the wheel and uploads it.
 
 This version loads files into raw, then publishes raw to bronze. Rows that fail quality rules go to quarantine. Silver and gold use the same `<system>_<layer>` schema name later. They are not built here.
+
+## End to end
+
+One pipeline owns three Unity Catalog tables. Files land in raw. A row that passes the rules is published to bronze. A row that fails is written to quarantine.
+
+```mermaid
+erDiagram
+  SOURCE_PATH ||--|| RAW_TABLE : source_to_raw
+  RAW_TABLE ||--|| BRONZE_TABLE : "publishes passing rows"
+  RAW_TABLE ||--|| QUARANTINE_TABLE : "writes failing rows"
+  PIPELINE ||--|| RAW_TABLE : writes
+  PIPELINE ||--|| BRONZE_TABLE : writes
+  PIPELINE ||--|| QUARANTINE_TABLE : rejects_to
+```
+
+The same YAML is recorded in `<catalog>.framework_meta`. Two physical tables hold every object and every run. The boxes below are kinds of row, not extra tables. `WORKFLOW` is stored when the YAML sets `job_name`. Each pipeline has one flow, one table, and one link for raw, for bronze, and for quarantine.
+
+```mermaid
+erDiagram
+  WORKFLOW |o--o{ PIPELINE : owns
+  PIPELINE ||--|{ FLOW : has
+  FLOW ||--|| TABLE : "writes or rejects_to"
+  PIPELINE ||--|{ LINK : lineage
+  TABLE ||--o{ COLUMN : column_of
+  PIPELINE ||--o{ RUN_STEP : recorded_on
+```
+
+`TABLE` is a `streaming_table`, a `table`, or a `materialized_view`. `COLUMN` hangs off the raw, bronze, and quarantine table names. `RUN_STEP` is a row in `run_ledger`. Every other box is a row in `object_registry`. A new row is inserted when that object's own hash changes. `v_object_history` turns those rows into `valid_from` and `valid_to`. The physical columns and the views are in [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md).
 
 ## Layout
 
@@ -117,10 +145,8 @@ Query `<catalog>.framework_meta`, with a `project` filter:
 | `v_pipelines` | Domain, project, data domain, team, owner, and who is mailed |
 | `v_tables` | Classification and PII on each raw, bronze, and quarantine table |
 | `v_columns` | Current column type, description, classification, and PII |
-| `v_column_history` | Every column version, with `valid_from` and `valid_to` |
-| `v_object_history` | Every version of a pipeline, workflow, flow, table, link, or column |
-| `v_columns` | Current bronze columns: type, description, classification, and PII |
 | `v_column_history` | Every column version, with `valid_from`, `valid_to`, and `is_current` |
+| `v_object_history` | Every version of a pipeline, workflow, flow, table, link, or column |
 
 History is insert-only. A daily job runs `OPTIMIZE`.
 

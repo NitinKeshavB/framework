@@ -18,8 +18,6 @@ Do not add a writer besides the collector for `object_registry` and `run_ledger`
 
 Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for the file pipelines. The collector is the exception: its Auto Loader checkpoint is under the events volume because it is a job, not a declarative table.
 
-Do not port the old SQL Server `tfm_*` procedures. Load methods and pipeline datasets replace them.
-
 ## Tests
 
 From the repository root:
