@@ -384,7 +384,13 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "CREATE BLOOMFILTER INDEX" in text
     assert "v_pipelines" in text
     assert "v_tables" in text
+    assert "v_columns" in text
+    assert "v_column_history" in text
+    assert "valid_from" in text
+    assert "valid_to" in text
+    assert "is_current" in text
     assert not any(statement.upper().startswith("DELETE") for statement in statements)
+    assert not any(statement.upper().startswith("UPDATE") for statement in statements)
     assert _column_list(text, "object_registry") == list(OBJECT_COLUMNS)
     assert _column_list(text, "run_ledger") == list(LEDGER_COLUMNS)
 
@@ -402,6 +408,125 @@ def test_ctas_securables_match_the_graph():
     assert recorded["classification"] == "confidential"
     assert recorded["pii"] == "pii_finance"
     assert recorded["technical_owner"] == "ledger.owner@jll.com"
+
+
+def test_column_metadata_versions_type_comment_and_tags():
+    config = config_from_document(_billing())
+    rows = [row for row in object_rows(config) if row["object_kind"] == "column"]
+    assert [row["full_name"] for row in rows] == [
+        "framework_dev.billing_bronze.invoices.invoice_id",
+        "framework_dev.billing_bronze.invoices.amount",
+    ]
+    amount = json.loads(rows[1]["config_json"])
+    assert amount == {
+        "classification": "confidential",
+        "data_type": "decimal(18,2)",
+        "description": "",
+        "name": "amount",
+        "ordinal": 2,
+        "pii": "pii_finance",
+    }
+    assert rows[1]["parent_full_name"] == "framework_dev.billing_bronze.invoices"
+    assert rows[1]["relation"] == "column_of"
+
+    changed = _billing()
+    changed["raw_to_bronze"]["columns"][1]["type"] = "decimal(20,4)"
+    changed["raw_to_bronze"]["columns"][1]["description"] = "Invoice amount"
+    changed["raw_to_bronze"]["columns"][1]["classification"] = "highly_confidential"
+    changed["raw_to_bronze"]["columns"][1]["pii"] = ["pii_finance", "pii_personal"]
+    revised = object_rows(config_from_document(changed))
+    revised_amount = next(row for row in revised if row["full_name"].endswith(".invoices.amount"))
+    assert revised_amount["content_hash"] != rows[1]["content_hash"]
+    payload = json.loads(revised_amount["config_json"])
+    assert payload["data_type"] == "decimal(20,4)"
+    assert payload["description"] == "Invoice amount"
+    assert payload["classification"] == "highly_confidential"
+    assert payload["pii"] == "pii_finance, pii_personal"
+
+    seen: set = set()
+    assert new_object_rows(rows, seen)
+    assert new_object_rows(rows, seen) == []
+    fresh = new_object_rows([revised_amount], seen)
+    assert [row["full_name"] for row in fresh] == [revised_amount["full_name"]]
+
+    renamed_job = _billing()
+    renamed_job["job_name"] = "finance_billing_retry"
+    untouched = next(
+        row
+        for row in object_rows(config_from_document(renamed_job))
+        if row["object_kind"] == "column" and row["full_name"].endswith(".amount")
+    )
+    assert untouched["content_hash"] == rows[1]["content_hash"]
+
+    ledger_columns = [
+        row
+        for row in object_rows(config_from_document(_ledger()))
+        if row["object_kind"] == "column"
+    ]
+    assert ledger_columns == []
+
+
+def test_column_tags_inherit_the_bronze_table_unless_overridden():
+    document = _billing()
+    document["raw_to_bronze"]["columns"][0]["description"] = "  Source invoice id  "
+    document["raw_to_bronze"]["columns"][0]["pii"] = []
+    config = config_from_document(document)
+    invoice_id, amount = config.columns
+    assert invoice_id.description == "Source invoice id"
+    assert invoice_id.classification == "confidential"
+    assert invoice_id.pii == []
+    assert amount.pii == ["pii_finance"]
+    reloaded = config_from_document(config.canonical())
+    assert reloaded.content_hash() == config.content_hash()
+    assert reloaded.columns[0].description == "Source invoice id"
+    assert reloaded.columns[0].pii == []
+
+
+def test_column_sensitivity_and_duplicates_are_rejected():
+    secret = _billing()
+    secret["raw_to_bronze"]["columns"][0]["classification"] = "secret"
+    with pytest.raises(ConfigValidationError) as caught:
+        config_from_document(secret)
+    assert "classification must be one of" in str(caught.value)
+
+    unknown = _billing()
+    unknown["raw_to_bronze"]["columns"][0]["pii"] = ["ssn"]
+    with pytest.raises(ConfigValidationError) as caught:
+        config_from_document(unknown)
+    assert "pii value 'ssn'" in str(caught.value)
+
+    duplicated = _billing()
+    duplicated["raw_to_bronze"]["columns"].append({"name": "invoice_id", "type": "int"})
+    with pytest.raises(ConfigValidationError) as caught:
+        config_from_document(duplicated)
+    assert "column 'invoice_id' is duplicated" in str(caught.value)
+
+    prose = _billing()
+    prose["raw_to_bronze"]["columns"][0]["description"] = {"text": "nope"}
+    with pytest.raises(ConfigValidationError) as caught:
+        config_from_document(prose)
+    assert "description must be text" in str(caught.value)
+
+
+def test_example_columns_keep_descriptions_and_sensitivity():
+    configs = validate_configs(sorted(EXAMPLES.glob("billing_invoices.yaml")))
+    billing = configs[0]
+    by_name = {column.name: column for column in billing.columns}
+    assert by_name["invoice_id"].description == "Invoice identifier from the billing system"
+    assert by_name["invoice_id"].classification == "confidential"
+    assert by_name["invoice_id"].pii == ["pii_finance", "pii_personal"]
+    assert by_name["amount"].pii == ["pii_finance"]
+    assert by_name["amount"].type_name == "decimal(18,2)"
+    recorded = json.loads(
+        next(
+            row["config_json"]
+            for row in object_rows(billing)
+            if row["full_name"] == "framework_dev.billing_bronze.invoices.amount"
+        )
+    )
+    assert recorded["description"] == "Invoice amount in the source currency"
+    assert recorded["pii"] == "pii_finance"
+    assert recorded["classification"] == "confidential"
 
 
 def test_definition_files_are_one_object_each_and_steps_stay_separate(tmp_path: Path):

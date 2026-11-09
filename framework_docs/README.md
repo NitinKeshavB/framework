@@ -26,6 +26,8 @@ A file is a bronze load. `layer` is `bronze`. Two hops are required.
 
 `raw_to_bronze` publishes the raw table to `<system>_bronze`. Quality rules and column types sit on this hop. `dedup: true` requires `primary_keys` and `watermark_column`.
 
+Each column is `name`, `type`, and an optional `description`. That description is the column comment stored in the registry. Add `classification` or `pii` on a column only when it differs from the bronze table. Omitted tags copy the bronze table tags. The allowed values are the same as `data.classification` and `data.pii`.
+
 `quarantine` names the `<system>_quarantine` table that receives rows that fail those rules.
 
 A domain holds many projects. The pipeline names that domain, the project, and the data domain. `technical_owner` is an email. `team` is the squad. `data.classification` is `internal`, `confidential`, or `highly_confidential`. `data.pii` lists `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, or `pii_personal`. Omit `pii` when there is none. Put a different `classification` or `pii` on `raw`, `bronze`, or `quarantine` only when that table differs.
@@ -63,6 +65,15 @@ raw_to_bronze:
   dedup: true
   primary_keys: [invoice_id]
   watermark_column: updated_at
+  columns:
+    - name: invoice_id
+      type: string
+      description: Invoice identifier from the source system
+    - name: amount
+      type: decimal(18,2)
+      description: Invoice amount in the source currency
+      pii:
+        - pii_finance
   rules:
     - name: amount_non_negative
       expression: amount >= 0
@@ -108,6 +119,8 @@ Ask these views, with a `project` filter:
 - `v_lineage` for links written by the pipeline
 - `v_pipelines` for domain, project, data domain, team, owner, and mail
 - `v_tables` for classification and PII on each table
+- `v_columns` for the current type, description, classification, and PII of each bronze column
+- `v_column_history` for every version of those columns (`valid_from`, `valid_to`, `is_current`)
 
 The example job in [framework_examples/consumer](../framework_examples/consumer) writes the step files, waits until the collector has loaded the definitions, and then refreshes the billing and ledger pipelines. A success step can carry counts with `--recon-json '{"source_count": 10, "output_rows": 9, "rejected": 1}'`.
 

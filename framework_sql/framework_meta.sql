@@ -181,3 +181,43 @@ SELECT
   get_json_object(config_json, '$.pii') AS pii
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
+
+-- Column history is insert-only. A changed data type, description, or sensitivity
+-- tag is a new object_registry row. valid_to is the next version's recorded_at.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_columns AS
+SELECT
+  parent_full_name AS table_name,
+  get_json_object(config_json, '$.name') AS column_name,
+  project,
+  CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
+  get_json_object(config_json, '$.data_type') AS data_type,
+  get_json_object(config_json, '$.description') AS description,
+  get_json_object(config_json, '$.classification') AS classification,
+  get_json_object(config_json, '$.pii') AS pii,
+  recorded_at
+FROM ${catalog}.framework_meta.v_object_current
+WHERE object_kind = 'column';
+
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_column_history AS
+SELECT
+  history.*,
+  valid_to IS NULL AS is_current
+FROM (
+  SELECT
+    parent_full_name AS table_name,
+    get_json_object(config_json, '$.name') AS column_name,
+    project,
+    CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
+    get_json_object(config_json, '$.data_type') AS data_type,
+    get_json_object(config_json, '$.description') AS description,
+    get_json_object(config_json, '$.classification') AS classification,
+    get_json_object(config_json, '$.pii') AS pii,
+    content_hash,
+    recorded_at AS valid_from,
+    LEAD(recorded_at) OVER (
+      PARTITION BY full_name
+      ORDER BY recorded_at, content_hash
+    ) AS valid_to
+  FROM ${catalog}.framework_meta.object_registry
+  WHERE object_kind = 'column'
+) history;

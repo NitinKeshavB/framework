@@ -78,6 +78,8 @@ quarantine:
 
 One domain holds many projects. Each pipeline names its `domain`, `project`, `data_domain`, `team`, and `technical_owner`. `data.classification` is `internal`, `confidential`, or `highly_confidential`. `data.pii` is any of `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, and `pii_personal`. Leave `pii` out when the table has none. A raw, bronze, or quarantine block can override those two fields. `notify.on_failure` is who Databricks mails when the job fails. Omit it and the technical owner is used. `notify.on_success` is optional. Put the same addresses on the job `email_notifications` block.
 
+`raw_to_bronze.columns` is the bronze column contract. Each entry has `name`, `type`, and an optional `description` (the column comment). `classification` and `pii` on a column override the bronze table. Leave them off and the column keeps the table tags. A change to type, description, tags, or position is a new row in the registry. `v_column_history` reads that history as SCD type 2: `valid_from` is when the version was recorded, `valid_to` is when the next version was recorded, and a null `valid_to` is the current version.
+
 Check the file before a cluster starts:
 
 ```bash
@@ -114,6 +116,8 @@ Query `<catalog>.framework_meta`, with a `project` filter:
 | `v_lineage` | Links from a pipeline to raw, bronze, and quarantine |
 | `v_pipelines` | Domain, project, data domain, team, owner, and who is mailed |
 | `v_tables` | Classification and PII on each raw, bronze, and quarantine table |
+| `v_columns` | Current bronze columns: type, description, classification, and PII |
+| `v_column_history` | Every column version, with `valid_from`, `valid_to`, and `is_current` |
 
 History is insert-only. A daily job runs `OPTIMIZE`.
 

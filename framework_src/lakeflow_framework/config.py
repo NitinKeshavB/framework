@@ -50,8 +50,13 @@ class FixedColumn:
 
 @dataclass
 class Column:
+    """One bronze column. Sensitivity tags fall back to the bronze table when the column omits them."""
+
     name: str
     type_name: str
+    description: str = ""
+    classification: str = ""
+    pii: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -167,9 +172,7 @@ class PipelineConfig:
                 ),
                 "dedup": self.dedup,
                 "primary_keys": list(self.primary_keys),
-                "columns": [
-                    {"name": column.name, "type": column.type_name} for column in self.columns
-                ],
+                "columns": [_column_document(column) for column in self.columns],
                 "rules": [
                     {"name": rule.name, "expression": rule.expression} for rule in self.rules
                 ],
@@ -305,7 +308,7 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     domain, data_domain, team, technical_owner = _ownership(document, label, errors)
     notify_failure, notify_success = _notify(document, technical_owner, label, errors)
     tags = _tags(document, raw_target, bronze_target, quarantine, label, errors)
-    columns = _columns(raw_to_bronze.get("columns"), label, errors)
+    columns = _columns(raw_to_bronze.get("columns"), tags.get("bronze"), label, errors)
     rules = _rules(raw_to_bronze.get("rules"), label, errors)
     fixed_columns = _fixed_columns(source.get("fixed_columns"), label, errors)
     if file_format == "fixed_width" and not fixed_columns:
@@ -401,6 +404,16 @@ def _table_document(schema: str, table: str, tags: TableTags) -> dict[str, Any]:
         "table": table,
         "classification": tags.classification,
         "pii": list(tags.pii),
+    }
+
+
+def _column_document(column: Column) -> dict[str, Any]:
+    return {
+        "name": column.name,
+        "type": column.type_name,
+        "description": column.description,
+        "classification": column.classification,
+        "pii": list(column.pii),
     }
 
 
@@ -662,13 +675,14 @@ def _name_list(value: Any, key: str, label: str, errors: list[str]) -> list[str]
     return names
 
 
-def _columns(value: Any, label: str, errors: list[str]) -> list[Column]:
+def _columns(value: Any, defaults: TableTags | None, label: str, errors: list[str]) -> list[Column]:
     if value is None:
         return []
     if not isinstance(value, list):
         errors.append(f"{label}: columns must be a list")
         return []
     columns: list[Column] = []
+    seen: set[str] = set()
     for item in value:
         if not isinstance(item, dict):
             errors.append(f"{label}: each column must be a mapping")
@@ -678,11 +692,52 @@ def _columns(value: Any, label: str, errors: list[str]) -> list[Column]:
         if not IDENTIFIER.match(name):
             errors.append(f"{label}: column name '{name}' must be an identifier")
             continue
+        if name in seen:
+            errors.append(f"{label}: column '{name}' is duplicated")
+            continue
+        seen.add(name)
         if not TYPE_NAME.match(type_name):
             errors.append(f"{label}: column type '{type_name}' is not allowed")
             continue
-        columns.append(Column(name, type_name))
+        description = _column_description(item, name, label, errors)
+        classification, pii = _column_tags(item, name, defaults, label, errors)
+        columns.append(Column(name, type_name, description, classification, pii))
     return columns
+
+
+def _column_description(item: Mapping[str, Any], name: str, label: str, errors: list[str]) -> str:
+    if "description" not in item:
+        return ""
+    raw = item.get("description")
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        errors.append(f"{label}: column '{name}' description must be text")
+        return ""
+    return raw.strip()
+
+
+def _column_tags(
+    item: Mapping[str, Any],
+    name: str,
+    defaults: TableTags | None,
+    label: str,
+    errors: list[str],
+) -> tuple[str, list[str]]:
+    column_label = f"{label}: column '{name}'"
+    if "classification" in item:
+        classification = _classification(item.get("classification"), column_label, errors) or ""
+    elif defaults is not None:
+        classification = defaults.classification
+    else:
+        classification = ""
+    if "pii" in item:
+        pii = _pii(item.get("pii"), column_label, errors)
+    elif defaults is not None:
+        pii = list(defaults.pii)
+    else:
+        pii = []
+    return classification, pii
 
 
 def _rules(value: Any, label: str, errors: list[str]) -> list[QualityRule]:

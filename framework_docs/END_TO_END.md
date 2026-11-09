@@ -75,6 +75,8 @@ Views:
 - `v_lineage` — latest link per parent, child, and relation. Intended links are written at sync. Observed links can be added later from `system.access.table_lineage`.
 - `v_pipelines` — one row per pipeline: domain, project, data domain, team, technical owner, and the failure and success mail lists.
 - `v_tables` — one row per raw, bronze, and quarantine table: the same ownership fields plus classification and PII. These labels are the ones a later ontology can read. The pipeline does not create tags in Unity Catalog.
+- `v_columns` — the current bronze column: data type, description, classification, and PII. The description is the column comment from YAML. A column that omits tags stores the bronze table tags, so the row stands alone.
+- `v_column_history` — SCD type 2 for those columns. Each change to data type, description, sensitivity tags, or position inserts a new `object_kind = 'column'` row. `valid_from` is `recorded_at`. `valid_to` is the next version's `recorded_at`, and null on the open version. `is_current` is true when `valid_to` is null. The collector still only inserts. Returning to an earlier type, comment, or tag does not append another row when that exact version was already stored, which is the same rule as pipelines and tables.
 
 System tables are the source for job definitions, run duration, pipeline events, information-schema securables, and observed lineage. The collector copies the fields that would be lost when those tables age out or when an object is dropped: project, the flow graph, the failure text, and the source-file reconciliation. Analysts query `framework_meta` only.
 
