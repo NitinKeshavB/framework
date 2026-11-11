@@ -1,0 +1,38 @@
+# Source ingestion bundle: source -> raw -> bronze. Domain-owned, shared by projects.
+# It needs the framework bundle deployed first (framework_meta must exist).
+# Catalog must match the framework bundle's catalog for the same target.
+
+bundle:
+  name: framework_ingestion
+
+include:
+  - resources/*.yml
+
+# Same artifact as the framework bundle. Deploy builds the wheel and uploads it.
+artifacts:
+  framework_wheel:
+    type: whl
+    path: ../framework_src
+    build: python -m pip wheel --no-deps --wheel-dir dist .
+
+variables:
+  catalog:
+    description: Unity Catalog for this environment. Must match the framework bundle.
+    default: aal_dev_fdh
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-7405615469052932.12.azuredatabricks.net
+    variables:
+      catalog: aal_dev_fdh
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-1864378597730899.19.azuredatabricks.net/
+      root_path: /Workspace/Shared/aztech_ingestion
+    variables:
+      catalog: aal_dev_fdh

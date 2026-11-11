@@ -1,115 +1,124 @@
 # Lakeflow framework, end to end
 
-This is the map of the framework in this repository. A consuming team does not need the sections on the collector or the package internals to land a file. Those sections are here so a maintainer can see the whole path.
+The whole path in this repository, from a spec to a registry row. A team adding a table needs only the first section. The rest is for maintainers.
 
-## What a consuming team does
+## What a team does
 
-1. Add the wheel artifact to the bundle. `databricks bundle deploy` builds `framework_src` and uploads `dist/*.whl`. Jobs and pipelines reference that file. The events volume is for run status, not for the wheel.
-2. Add one bronze YAML file per pipeline under `configs/bronze/`. See [framework_examples/consumer/configs/bronze](../framework_examples/consumer/configs/bronze). `layer: bronze` names the load. `source_to_raw` lands files in raw. `raw_to_bronze` publishes raw to bronze. `quarantine` receives the rows that fail the bronze rules.
-3. Add a one-line pipeline file:
+1. Add a table spec under `framework_ingestion/sources/<domain>/<source_system>/`. `./run.sh new-table` writes it from a template. A new source system needs its `source.yaml` first (`./run.sh new-source`).
+2. Replace every `TODO`, then run `./run.sh generate`.
+3. Open a pull request. The source system's owner reviews it, since every table in a delivery shares one pipeline.
+4. Silver and gold: add the table to a project's `project.yaml` and run `./run.sh projects:generate`.
 
-```python
-from lakeflow_framework import build_pipeline
+CI runs `./run.sh lint`, `test:quick`, `generate:check`, and `projects:check`. None of them start a cluster.
 
-build_pipeline("billing_invoices")
-```
+## What `generate` produces
 
-4. Run `lakeflow-framework validate configs/` in CI. This does not start a cluster. An unresolved `${...}`, a secret-looking key, Excel with `copy_into`, dedup without keys and a watermark, or two pipelines writing the same table fails the command and prints every error.
+For each delivery of each source system, from the specs alone:
 
-The example bundle [framework_examples/consumer](../framework_examples/consumer) has a `databricks.yml` with dev and prod targets, a `catalog` variable, and resource files under `resources/`. Dev uses development mode. Prod uses production mode and a shared workspace path. Sample tests for those bronze configs are in `framework_examples/consumer/tests`.
+- `pipelines/<source_system>_<delivery>.py` calls `build_pipeline("<id>")` once for each table.
+- `resources/<source_system>_<delivery>.pipeline.yml` is one serverless Lakeflow pipeline.
+- `resources/<source_system>_<delivery>.job.yml` is one job. A file source fires on files landing in the raw volume. A scheduled source uses its cron.
+- `SOURCE_MAP.md` shows the same model as a diagram and tables.
 
-## What happens on a run
+Generated files start with a marker line. `generate` rewrites them, deletes ones no source asks for, and never touches a file without the marker. `bundle:validate` and `bundle:deploy` run it first, so the map, the pipelines, and the jobs cannot disagree with the specs.
 
-The consumer job writes a small JSON file at each step. It does not write the registry tables.
+## What a delivery job does
 
-1. **mark_running** writes `RUNNING` before anything else, so a refresh during the load already shows the run.
-2. **sync** validates YAML and writes one definition file per pipeline, flow, securable, and link. The file name includes the document hash, so an unchanged config overwrites the same file and does not become a second history row.
-3. **await_registry** reads `v_object_current` until those pipeline rows are visible. It does not write the table. The pipeline tasks start after that.
-4. **batch_load** runs `COPY INTO` or `CREATE OR REPLACE TABLE` when the load method needs it. Auto Loader does nothing in this task.
-5. **pipeline** calls `build_pipeline`. The pipeline reads its config from `framework_meta.v_object_current`. A missing row is an error.
-6. **record_success** writes `SUCCEEDED`. Pass `--recon-json` with the source and target counts when the task has them. **record_failure** writes `FAILED` with the task error if any earlier task fails. The running step is left in place.
+The job writes small JSON files at each step. It does not write the registry tables.
 
-Step files land in `/Volumes/<catalog>/framework_meta/framework_events` as `{project}/{full_name}/{run_id}_{step_no}_{status}.json`. Definition files land under `{project}/definitions/`. One collector job is the only writer of `object_registry` and `run_ledger`. It inserts a definition only when `(object_kind, full_name, content_hash)` is new, and a step only when `(run_id, step_no, status)` is new.
+1. **mark_running** writes `RUNNING` first, so a refresh during the load already shows the run.
+2. **sync** validates every spec and writes one definition file per pipeline, flow, securable, link, and workflow. The file name carries the document hash, so an unchanged spec overwrites the same file and is not a new history row.
+3. **await_registry** waits until the collector has loaded those pipelines into `v_object_current`.
+4. **batch_load** runs only for `cloud_files` tables that use `copy_into` or `ctas`.
+5. **refresh_pipeline** runs the Lakeflow pipeline. `build_pipeline` reads each spec back from the registry. A missing row is an error.
+6. **record_success** writes `SUCCEEDED` and can carry counts (`--recon-json`). **record_failure** writes `FAILED` if any earlier task fails.
 
-## Where the rows go
+Files land in `/Volumes/<catalog>/framework_meta/framework_events` as `<owner_kind>/<owner>/<full_name>/<run_id>_<step_no>_<status>.json`, and definitions under `<owner_kind>/<owner>/definitions/`. One collector job is the only writer of `object_registry` and `run_ledger`.
 
-Every config in this version is a bronze load. `source_to_raw.method` chooses how files reach the raw table. `raw_to_bronze` reads that table and writes bronze. Rejected rows go to the quarantine table with the failing rule names. Nothing is dropped with `expect_or_drop`.
+## How each kind loads
 
-| Method | Use it when | Raw | Bronze |
+The graph depends on the kind. Quarantine and bronze are filtered by the quality rules; nothing is dropped with `expect_or_drop`.
+
+| Kind and method | Reads | Quarantine | Bronze |
 | --- | --- | --- | --- |
-| `autoloader` (default) | Files keep arriving | Streaming table, `cloudFiles`. No checkpoint path and no `schemaLocation`. The pipeline owns that state. | Streaming table, or Auto CDC when `dedup: true` |
-| `copy_into` | A scheduled drop must be loaded once | `COPY INTO` with `force = false`, then the pipeline streams that table | Streaming table |
-| `ctas` | A small extract replaces the previous one | `CREATE OR REPLACE TABLE` | Materialized view, because a full replace is not an append |
+| Files, `volume_files` | Auto Loader on the raw volume path. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table of failing rows | Streaming table of passing rows, or Auto CDC on the keys when `dedup: true` |
+| Database, `snapshot` | The foreign-catalog table, in batch | Materialized view of failing rows | Materialized view of passing rows |
+| Database, `merge` | The same, as snapshots | Materialized view | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
+| Cloud files, `autoloader` | Auto Loader into a raw streaming table | Streaming table | Streaming table, or Auto CDC with `dedup: true` |
+| Cloud files, `copy_into` | `COPY INTO` a raw table (`force = false`) before the pipeline | Streaming table | Streaming table |
+| Cloud files, `ctas` | `CREATE OR REPLACE TABLE` raw | Materialized view | Materialized view |
 
-Excel is allowed for Auto Loader and CTAS. `copy_into` rejects it because COPY INTO has no Excel reader. Fixed-width is a text file plus `fixed_columns` (`name`, `start`, `length`) projected with `substring`. YAML is one `content` string in this version. CSV, delimited text, JSON, Parquet, Avro, and Excel use the option map kept from the old Auto Loader handler.
-
-`dedup: true` requires `primary_keys` and `watermark_column`. Bronze then uses `create_auto_cdc_flow` with `stored_as_scd_type` integer `1`, so the latest row for each key wins. Raw and quarantine are not deduplicated. Keys still generate not-null rules when dedup is off.
-
-Paths must be `abfss://` or `s3://`. Name the Unity Catalog external location in `external_location`. Do not put keys or passwords in the YAML.
+Excel works with Auto Loader and CTAS but not `copy_into`. `dedup: true` needs `primary_keys` and `watermark_column`, and uses `stored_as_scd_type` integer `1`: the latest row for each key wins. Keys also generate not-null rules when dedup is off.
 
 ## Data quality
 
-Rules in YAML become SQL predicates before a cluster starts.
+Rules in the spec become SQL predicates before a cluster starts.
 
 - A declared rule is the expression you wrote.
 - Each primary key gets `column IS NOT NULL`.
 - Each declared type gets `TRY_CAST(column AS type) IS NOT NULL OR column IS NULL`, so a null is not also a cast failure.
 - Auto Loader on CSV, delimited text, JSON, and text adds `_rescued_data IS NULL`.
 
-A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `failed_rules`, the names of every predicate that failed. Rows that pass go to bronze.
+A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `_failed_rules`, the names of every predicate that failed.
 
 ## The registry
 
-Two tables in `<catalog>.framework_meta`. History is insert-only. The framework does not `UPDATE` or `DELETE` these rows.
+Two tables in `<catalog>.framework_meta`. History is insert-only: the framework never runs `UPDATE` or `DELETE` on them.
 
-`object_registry` is the catalog of workflows (Lakeflow jobs), tasks, pipelines, flows, securables, and links. A new row is written when the definition hash changes. `config_json` holds the YAML, the compiled rules, and the attributes that used to be separate attribute tables. `parent_full_name` and `relation` (`owns`, `writes`, `reads`, `rejects_to`) replace a relationship table.
+`object_registry` catalogs workflows (jobs), pipelines, flows, securables, links, and columns. A new row is written when the definition hash changes. `config_json` holds the spec, the compiled rules, and the attributes. `parent_full_name` and `relation` (`owns`, `writes`, `rejects_to`) replace a relationship table.
 
-`run_ledger` is one row per process step: step number, step name, status (`RUNNING`, `SUCCEEDED`, `FAILED`), start, end, and failure text. The success step can carry `recon_json`: source file names and counts, inserted, updated, deleted, output rows, rejected, and `matched` or `mismatch`. Insert, update, and delete come from Delta commit metrics when the write is a merge. An append records output rows and leaves those three empty rather than inventing them. Rejected is the quarantine record count from `DESCRIBE DETAIL`, not a scan of the table.
+Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `owner` is its name. Bronze rows are owned by the source system. `requested_by` is the team that asked for the table and `delivery` is how its source delivers. They are for the maps and do not affect ownership.
 
-Views:
+`run_ledger` is one row per step: number, name, status (`RUNNING`, `SUCCEEDED`, `FAILED`), start, end, and failure text. The success step can carry `recon_json`: counts, inserted, updated, deleted, output rows, rejected, and `matched` or `mismatch`.
 
-- `v_object_current` — latest definition. This is what the pipeline loads. Filter `object_kind = 'pipeline'` and `project` for how many pipelines a project has.
-- `v_run_current` — latest step in the last 7 days. This is the live screen.
-- `v_process` — every step of a run. Filter by `run_id` and `event_date`.
-- `v_recon` — success steps with the counts exploded.
-- `v_lineage` — latest link per parent, child, and relation. Intended links are written at sync. Observed links can be added later from `system.access.table_lineage`.
-- `v_pipelines` — one row per pipeline: domain, project, data domain, team, technical owner, and the failure and success mail lists.
-- `v_tables` — one row per raw, bronze, and quarantine table: the same ownership fields plus classification and PII. These labels are the ones a later ontology can read. The pipeline does not create tags in Unity Catalog.
-- `v_columns` — the current bronze column: data type, description, classification, and PII. The description is the column comment from YAML. A column that omits tags stores the bronze table tags, so the row stands alone.
-- `v_column_history` — SCD type 2 for those columns. Each change to data type, description, sensitivity tags, or position inserts a new `object_kind = 'column'` row. `valid_from` is `recorded_at`. `valid_to` is the next version's `recorded_at`, and null on the open version. `is_current` is true when `valid_to` is null. The collector still only inserts. Returning to an earlier type, comment, or tag does not append another row when that exact version was already stored, which is the same rule as pipelines and tables.
+### Ownership
 
-System tables are the source for job definitions, run duration, pipeline events, information-schema securables, and observed lineage. The collector copies the fields that would be lost when those tables age out or when an object is dropped: project, the flow graph, the failure text, and the source-file reconciliation. Analysts query `framework_meta` only.
+A pipeline or table has one owner. Before inserting, the collector looks up the current owner of each pipeline and table in the batch. If another owner holds it, the row is not inserted and the collector writes a `FAILED` `ownership_check` step to the ledger, with the holder named in `failure_reason`. The collector keeps running. Flows, links, workflows, and columns follow their pipeline or table. `v_ownership_conflicts` lists any name with two owners in its history; it should be empty. Moving a table to another owner is a deliberate manual change, not something the collector allows.
 
-People looking at past runs are not counting bronze or quarantine, and they are not scanning `system.lakeflow`. About 10,000 jobs can write status files at once because those are files, not Delta commits. The collector is the only Delta writer. A burst shows up after that collector drains the files. Running 10,000 pipelines at the same moment is still a workspace quota, separate from this registry.
+### Views
+
+- `v_object_current`: latest definition. This is what the pipeline loads.
+- `v_pipelines`, `v_tables`: owner, requester, delivery, domain, data domain, team, technical owner, mail lists, classification, and PII.
+- `v_columns`, `v_column_history`: current bronze columns, and every version as SCD type 2 (`valid_from`, `valid_to`, `is_current`).
+- `v_lineage`: latest link per parent, child, and relation, written at sync.
+- `v_run_current`: latest step in the last 7 days. `v_process`: every step of a run. `v_recon`: counts on success steps.
+- `v_ownership_conflicts`: names with more than one owner.
+
+System tables remain the source for job definitions, run duration, pipeline events, and observed lineage. The collector copies the fields that would be lost when those age out or an object is dropped: the owner, the flow graph, the failure text, and the source reconciliation. Analysts query `framework_meta` only.
+
+About 10,000 jobs can write status files at once because those are files, not Delta commits. The collector is the only Delta writer. Running that many pipelines at once is a workspace quota, separate from this registry.
 
 ## Physical layout
 
-Delta has no SQL Server indexes. The tables use liquid clustering:
+The tables use liquid clustering:
 
-- `object_registry`: `CLUSTER BY (project, object_kind, full_name)`
-- `run_ledger`: `CLUSTER BY (project, event_date, full_name, run_id)`
+- `object_registry`: `CLUSTER BY (owner, object_kind, full_name)`
+- `run_ledger`: `CLUSTER BY (owner, event_date, full_name, run_id)`
 
-Both set `delta.autoOptimize.optimizeWrite`. The DDL also creates bloom-filter indexes on `full_name` and `run_id`. If this runtime rejects that statement, the DDL task skips it and clustering remains. A daily job runs `OPTIMIZE` on both tables. `VACUUM` is not scheduled. Vacuum would only drop files left by compaction. It would not remove process steps.
+Both set `delta.autoOptimize.optimizeWrite`. The DDL also creates bloom-filter indexes on `full_name` and `run_id`; if the runtime rejects that, the DDL task skips it. A daily job runs `OPTIMIZE`. `VACUUM` is not scheduled, so process history is never removed. Query with `owner` and, for runs, `event_date`.
 
-Query with `project` and, for past runs, `event_date`. A query without those filters is not the supported path.
+## Checked on a real workspace
 
-## What is checked on a real workspace
+None of the following has run on Databricks. The code assumes them:
 
-These are assumptions in the code, not results from a run here:
-
-- `from pyspark import pipelines as dp` on the target runtime.
+- `from pyspark import pipelines` in a Lakeflow pipeline, including `create_auto_cdc_flow`, `create_auto_cdc_from_snapshot_flow`, and `expect`.
 - `stored_as_scd_type=1` as an integer.
-- COPY INTO as a job statement before the pipeline, not inside a pipeline table function.
-- A CTAS overwrite followed by a bronze materialized view.
+- A streaming view read by name from a downstream streaming table.
+- Auto Loader with `_metadata.file_path` on a volume path.
+- A file-arrival trigger on a Unity Catalog volume path, and `${workspace.file_path}` spec paths on serverless.
+- Serverless `environment_version` 2 with the wheel as a dependency.
+- Federated tables as a pipeline source, and `merge` as a snapshot flow.
+- COPY INTO as a job statement before the pipeline.
 - Excel `headerRows` and `dataAddress` without `schemaLocation`.
 - `DESCRIBE DETAIL` `numRecords` on streaming tables and materialized views.
-- Bloom-filter index syntax.
-- The collector checkpoint under the events volume.
-- Whether an `abfss` or `s3` path shows up as `PATH` in `system.access.table_lineage`.
+- Bloom-filter index syntax, and the collector checkpoint under the events volume.
 - Workspace concurrency if many pipelines run together.
 
-## Where to read next
+If one fails, record the observed syntax here and change the single strategy or DDL statement. Do not spread a workaround across the bundles.
 
-- [README.md](README.md) for the consumer contract.
-- [MAINTAINERS.md](MAINTAINERS.md) for versioning and publishing the wheel.
-- [ARCHITECTURE.md](ARCHITECTURE.md) for the old repository, the dependency direction, and the migration map.
+## Read next
+
+- [README.md](README.md) for every YAML contract
+- [MAINTAINERS.md](MAINTAINERS.md) for versioning and deploy
+- [ARCHITECTURE.md](ARCHITECTURE.md) for the package boundaries
+- [ROADMAP.md](ROADMAP.md) for what is next

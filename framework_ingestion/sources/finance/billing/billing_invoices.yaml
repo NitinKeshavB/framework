@@ -1,0 +1,57 @@
+pipeline_id: billing_invoices
+domain: finance
+data_domain: invoices
+team: billing_squad
+technical_owner: billing.owner@jll.com
+layer: bronze
+job_name: billing_daily
+delivery: daily
+requested_by: billing
+
+notify:
+  on_failure:
+    - billing.owner@jll.com
+  on_success:
+    - billing.owner@jll.com
+
+data:
+  classification: confidential
+  pii:
+    - pii_finance
+    - pii_personal
+
+# The files for this table, in the source system's raw volume.
+source:
+  raw_path: invoices/
+  format: csv
+  delimiter: ","
+  header: true
+
+raw_to_bronze:
+  bronze:
+    schema: billing_bronze
+    table: invoices
+  dedup: true
+  primary_keys:
+    - invoice_id
+  watermark_column: updated_at
+  columns:
+    - name: invoice_id
+      type: string
+      description: Invoice identifier from the billing system
+    - name: amount
+      type: decimal(18,2)
+      description: Invoice amount in the source currency
+      pii:
+        - pii_finance
+    - name: updated_at
+      type: timestamp
+      description: When the source system last updated the invoice
+  rules:
+    - name: amount_non_negative
+      expression: amount >= 0
+
+quarantine:
+  schema: billing_quarantine
+  table: invoices
+  classification: highly_confidential

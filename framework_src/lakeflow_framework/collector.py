@@ -12,10 +12,13 @@ from lakeflow_framework.metadata import (
     ingest_steps,
     new_object_rows,
     object_keys_sql,
+    owners_sql,
+    ownership_conflicts,
     registered_sql,
     split_payloads,
     step_key,
     step_keys_sql,
+    step_payload,
 )
 from lakeflow_framework.pipeline import MetadataNotFound
 
@@ -85,6 +88,8 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
         for row in fresh
         if (row["object_kind"], row["full_name"], row["content_hash"]) not in held
     ]
+    if catalog and fresh:
+        fresh = _refuse_other_owners(spark, catalog, fresh)
     if not fresh:
         return 0
     written = _insert(
@@ -117,6 +122,49 @@ def await_registered(
         if clock() >= deadline:
             raise MetadataNotFound("registry is missing " + ", ".join(pending))
         sleep(pause_seconds)
+
+
+def _refuse_other_owners(spark, catalog: str, rows: list[dict]) -> list[dict]:
+    """Drop definitions for a table or pipeline another owner already holds.
+
+    A refused definition is not inserted. It is recorded as a FAILED ownership_check step in the
+    run ledger, so it shows in the run views and the collector keeps running.
+    """
+
+    try:
+        statement = owners_sql(catalog, [str(row["full_name"]) for row in rows])
+    except ValueError:
+        return rows
+    current = {
+        (str(row["object_kind"]), str(row["full_name"])): (
+            str(row["owner_kind"]),
+            str(row["owner"]),
+        )
+        for row in _rows(spark.sql(statement))
+    }
+    accepted, refused = ownership_conflicts(rows, current)
+    if refused:
+        steps = []
+        for row in refused:
+            holder = current[(str(row["object_kind"]), str(row["full_name"]))]
+            steps.append(
+                step_payload(
+                    owner_kind=str(row["owner_kind"]),
+                    owner=str(row["owner"]),
+                    full_name=str(row["full_name"]),
+                    object_kind=str(row["object_kind"]),
+                    run_id=f"ownership-{str(row['content_hash'])[:16]}",
+                    step_no=1,
+                    step_name="ownership_check",
+                    status="FAILED",
+                    failure_reason=(
+                        f"{row['full_name']} is owned by {holder[0]} {holder[1]}; "
+                        f"{row['owner_kind']} {row['owner']} cannot register it"
+                    ),
+                )
+            )
+        append_steps(spark, steps, None, catalog)
+    return accepted
 
 
 def _table(catalog: str, name: str) -> str:

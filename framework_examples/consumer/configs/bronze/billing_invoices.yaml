@@ -1,6 +1,6 @@
 pipeline_id: billing_invoices
 domain: finance
-project: billing
+requested_by: billing
 data_domain: invoices
 team: billing_squad
 technical_owner: billing.owner@jll.com

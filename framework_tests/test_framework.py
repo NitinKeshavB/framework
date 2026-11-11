@@ -20,6 +20,8 @@ from lakeflow_framework.metadata import (
     ingest_steps,
     new_object_rows,
     object_rows,
+    owners_sql,
+    ownership_conflicts,
     split_payloads,
     step_file_name,
     step_payload,
@@ -161,14 +163,14 @@ def test_only_bronze_loads_are_accepted():
 def test_one_domain_holds_many_projects_and_jobs_mail_their_owners():
     configs = validate_configs(sorted(EXAMPLES.glob("*.yaml")))
     finance = [config for config in configs if config.domain == "finance"]
-    assert {config.project for config in finance} == {"billing", "ledger"}
-    billing = next(config for config in finance if config.project == "billing")
+    assert {config.requested_by for config in finance} == {"billing", "ledger"}
+    billing = next(config for config in finance if config.requested_by == "billing")
     assert billing.data_domain == "invoices"
     assert billing.tags["raw"].classification == "confidential"
     assert billing.tags["raw"].pii == ["pii_finance", "pii_personal"]
     assert billing.tags["quarantine"].classification == "highly_confidential"
     assert billing.notify_success == ["billing.owner@jll.com"]
-    ledger = next(config for config in finance if config.project == "ledger")
+    ledger = next(config for config in finance if config.requested_by == "ledger")
     assert ledger.notify_failure == ["ledger.owner@jll.com"]
     assert ledger.notify_success == []
     notes = email_notifications(finance)
@@ -241,7 +243,7 @@ def test_validation_reports_every_error():
             }
         )
     text = "\n".join(caught.value.errors)
-    assert "project is required" in text
+    assert "requested_by is required" in text
     assert "excel cannot use copy_into" in text
     assert "abfss:// or s3://" in text
     assert "dedup requires" in text
@@ -320,7 +322,7 @@ def test_registry_hash_is_stable_and_steps_do_not_duplicate():
     assert any(row["object_kind"] == "link" for row in first)
 
     running = step_payload(
-        project="finance",
+        owner="billing",
         full_name="billing_invoices",
         run_id="100",
         step_no=10,
@@ -328,7 +330,7 @@ def test_registry_hash_is_stable_and_steps_do_not_duplicate():
         status="RUNNING",
     )
     success = step_payload(
-        project="finance",
+        owner="billing",
         full_name="billing_invoices",
         run_id="100",
         step_no=50,
@@ -375,11 +377,39 @@ def test_missing_registry_row_is_an_error():
         build_pipeline("billing_invoices", metadata=Empty())
 
 
+def test_one_line_pipeline_file_uses_the_running_session(monkeypatch: pytest.MonkeyPatch):
+    """build_pipeline("<id>") with nothing else reads the registry and registers the datasets."""
+
+    spark = _FakeSpark()
+    pipelines = _FakePipelines()
+
+    class Registry:
+        def __init__(self, _spark):
+            assert _spark is spark
+
+        def get_pipeline(self, pipeline_id):
+            return _billing()
+
+    monkeypatch.setattr("lakeflow_framework.pipeline._cluster_session", lambda: spark)
+    monkeypatch.setattr("lakeflow_framework.pipeline._cluster_pipelines", lambda: pipelines)
+    monkeypatch.setattr("lakeflow_framework.pipeline.UnityMetadata", Registry)
+    build_pipeline("billing_invoices")
+    assert pipelines.names
+    assert pipelines.cdc[0]["keys"] == ["invoice_id"]
+
+
+def test_one_line_pipeline_file_off_cluster_says_why():
+    with pytest.raises(MetadataNotFound):
+        build_pipeline("billing_invoices")
+
+
 def test_ddl_clusters_both_tables_and_names_the_catalog():
     statements = ddl_statements("framework_dev")
     text = "\n".join(statements)
-    assert "CLUSTER BY (project, object_kind, full_name)" in text
-    assert "CLUSTER BY (project, event_date, full_name, run_id)" in text
+    assert "CLUSTER BY (owner, object_kind, full_name)" in text
+    assert "CLUSTER BY (owner, event_date, full_name, run_id)" in text
+    assert "v_ownership_conflicts" in text
+    assert "project" not in text.replace("project for silver", "")
     assert "${catalog}" not in text
     assert "CREATE BLOOMFILTER INDEX" in text
     assert "v_pipelines" in text
@@ -547,8 +577,8 @@ def test_cli_writes_a_step_file_with_recon(tmp_path: Path, capsys: pytest.Captur
     code = main(
         [
             "step",
-            "--project",
-            "finance",
+            "--owner",
+            "billing",
             "--full-name",
             "billing_invoices",
             "--run-id",
@@ -638,7 +668,10 @@ def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
     row = {
         "object_kind": "pipeline",
         "full_name": "billing_invoices",
-        "project": "finance",
+        "owner_kind": "source_system",
+        "owner": "billing",
+        "requested_by": "billing",
+        "delivery": "daily",
         "parent_full_name": None,
         "relation": None,
         "config_json": "{}",
@@ -650,6 +683,126 @@ def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
     assert append_definitions(None, [row, dict(row)], seen) == 1
     assert append_definitions(None, [dict(row)], seen) == 0
     assert len(inserted) == 1
+
+
+def _owned_row(**changes):
+    row = {
+        "object_kind": "streaming_table",
+        "full_name": "framework_dev.billing_bronze.invoices",
+        "owner_kind": "source_system",
+        "owner": "billing",
+        "requested_by": "billing",
+        "delivery": "daily",
+        "parent_full_name": None,
+        "relation": None,
+        "config_json": "{}",
+        "content_hash": "b" * 64,
+        "source": "framework",
+        "recorded_at": "2026-11-09T00:00:00Z",
+    }
+    row.update(changes)
+    return row
+
+
+def test_bronze_is_owned_by_its_source_system_not_the_requesting_team():
+    document = _billing(project="collections")
+    document["requested_by"] = "collections"
+    config = config_from_document(document)
+    assert (config.owner_kind, config.owner) == ("source_system", "billing")
+    assert config.requested_by == "collections"
+    for row in object_rows(config):
+        assert (row["owner_kind"], row["owner"]) == ("source_system", "billing")
+        assert row["requested_by"] == "collections"
+    assert object_rows(config)[0]["delivery"] is None
+    assert config_from_document(config.canonical()).requested_by == "collections"
+
+
+def test_registry_rows_carry_the_delivery_and_older_specs_still_load():
+    older = config_from_document(_billing())
+    assert older.requested_by == "billing"
+    document = _billing()
+    document["delivery"] = "daily"
+    assert {row["delivery"] for row in object_rows(config_from_document(document))} == {"daily"}
+
+
+def test_a_name_held_by_another_owner_is_refused_and_the_same_owner_may_update():
+    mine = _owned_row()
+    other = _owned_row(owner="erp", content_hash="c" * 64)
+    current = {("streaming_table", mine["full_name"]): ("source_system", "billing")}
+    accepted, refused = ownership_conflicts([mine, other], current)
+    assert accepted == [mine] and refused == [other]
+    column = _owned_row(object_kind="column", owner="erp")
+    assert ownership_conflicts([column], current) == ([column], [])
+    free = _owned_row(full_name="framework_dev.billing_bronze.free")
+    assert ownership_conflicts([free], current) == ([free], [])
+
+
+def test_owner_lookup_is_limited_to_owned_kinds_and_safe_names():
+    sql = owners_sql("framework_dev", ["framework_dev.billing_bronze.invoices", "x' OR '1'='1"])
+    assert "framework_dev.framework_meta.v_object_current" in sql
+    assert "x' OR" not in sql
+    assert "'column'" not in sql
+    with pytest.raises(ValueError):
+        owners_sql("framework_dev", ["x' OR '1'='1"])
+
+
+def test_collector_records_a_failed_check_instead_of_writing_another_owners_table(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    written: dict[str, list[dict]] = {}
+
+    def fake_insert(_spark, table, rows, _columns, **_kwargs):
+        written.setdefault(table, []).extend(rows)
+        return len(rows)
+
+    class Frame:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def collect(self):
+            return self.rows
+
+    class Spark:
+        def sql(self, statement):
+            if "v_object_current" in statement and "owner_kind" in statement.split("FROM")[0]:
+                return Frame(
+                    [
+                        {
+                            "object_kind": "streaming_table",
+                            "full_name": "framework_dev.billing_bronze.invoices",
+                            "owner_kind": "source_system",
+                            "owner": "billing",
+                        }
+                    ]
+                )
+            return Frame([])
+
+    monkeypatch.setattr("lakeflow_framework.collector._insert", fake_insert)
+    taken = _owned_row(owner="erp", content_hash="d" * 64)
+    fine = _owned_row(
+        full_name="framework_dev.erp_bronze.orders", owner="erp", content_hash="e" * 64
+    )
+    assert append_definitions(Spark(), [taken, fine], set(), "framework_dev") == 1
+    registry = written["framework_dev.framework_meta.object_registry"]
+    assert [row["full_name"] for row in registry] == ["framework_dev.erp_bronze.orders"]
+    (step,) = written["framework_dev.framework_meta.run_ledger"]
+    assert step["step_name"] == "ownership_check" and step["status"] == "FAILED"
+    assert (step["owner_kind"], step["owner"]) == ("source_system", "erp")
+    assert "owned by source_system billing" in step["failure_reason"]
+
+
+def test_definition_and_step_files_are_filed_under_their_owner(tmp_path: Path):
+    rows = object_rows(config_from_document(_billing()))
+    written = write_definition_files(tmp_path, rows)
+    assert all(
+        path.relative_to(tmp_path).parts[:2] == ("source_system", "billing") for path in written
+    )
+    step = step_payload(owner="finance", owner_kind="project", full_name="x", run_id="1",
+                        step_no=1, step_name="a", status="RUNNING")  # fmt: skip
+    assert step_file_name(step).startswith("project/finance/x/")
+    with pytest.raises(ValueError):
+        step_payload(owner="x", owner_kind="team", full_name="x", run_id="1", step_no=1,
+                     step_name="a", status="RUNNING")  # fmt: skip
 
 
 def test_pipeline_lookup_binds_the_id_and_rejects_sql():

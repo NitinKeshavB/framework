@@ -1,6 +1,6 @@
 pipeline_id: orders_events
 domain: retail
-project: orders
+requested_by: orders
 data_domain: orders
 team: orders_squad
 technical_owner: orders.owner@jll.com

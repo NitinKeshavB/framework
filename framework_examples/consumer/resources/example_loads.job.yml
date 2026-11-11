@@ -16,7 +16,9 @@ resources:
             python_file: ../src/run_cli.py
             parameters:
               - step
-              - --project
+              - --owner-kind
+              - project
+              - --owner
               - examples
               - --full-name
               - example_loads
@@ -96,7 +98,9 @@ resources:
             python_file: ../src/run_cli.py
             parameters:
               - step
-              - --project
+              - --owner-kind
+              - project
+              - --owner
               - examples
               - --full-name
               - example_loads
@@ -126,7 +130,9 @@ resources:
             python_file: ../src/run_cli.py
             parameters:
               - step
-              - --project
+              - --owner-kind
+              - project
+              - --owner
               - examples
               - --full-name
               - example_loads

@@ -1,0 +1,13 @@
+project: headcount_reporting
+domain: people
+owner: hr.owner@jll.com
+
+# Reference bronze as <source_system>.<table> (see SOURCE_MAP.md in framework_ingestion),
+# your own tables as silver.<name>, and another project's as <project>.silver.<name>.
+silver:
+  headcount_clean:
+    triggered_by: [hr_docs.headcount]
+
+gold:
+  headcount_by_department:
+    triggered_by: [silver.headcount_clean]

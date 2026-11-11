@@ -2,36 +2,57 @@
 
 ## Versioning
 
-The version in [framework_src/pyproject.toml](../framework_src/pyproject.toml) is the wheel version. A minor version may add an optional YAML field. A major version may rename or remove a required field. Deploy the bundle again after a version change. The bundle uploads the wheel it just built.
+The version in [framework_src/pyproject.toml](../framework_src/pyproject.toml) is the wheel version. A minor version may add an optional field to a spec. A major version may rename or remove a required one. Deploy the bundles again after a version change. Each bundle uploads the wheel it just built.
 
-The registry `content_hash` is the config version. It is independent of the wheel version. The same document does not append a new `object_registry` row.
+The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `object_registry` row.
+
+The registry tables are created with `CREATE TABLE IF NOT EXISTS`, so a change to their columns does not alter a table that already exists. The owner columns replaced `project` before any deployment. Once a catalog holds data, a column change is a migration with a plan for existing rows.
 
 ## Deploy
 
-`databricks bundle deploy` on [framework_bundle](../framework_bundle) builds the wheel from `framework_src` and uploads it. The jobs use `framework_src/dist/*.whl`, which the bundle rewrites to that uploaded file. Run the `framework_ddl` job, then start `framework_collector`. `framework_optimize` runs daily. It compacts files. It does not delete process history. Do not add a `VACUUM` schedule that shortens retention.
+Order: `framework_bundle`, run `framework_ddl`, start `framework_collector`, then `framework_ingestion`, then each project.
 
-A consumer bundle in this repo declares the same artifact. PyPI and a wheel volume are not part of this phase.
+```bash
+./run.sh bundle:deploy framework_bundle <target> <profile>
+./run.sh bundle:deploy framework_ingestion <target> <profile>
+./run.sh bundle:deploy framework_projects/<domain>/<project> <target> <profile>
+```
+
+`bundle:validate` and `bundle:deploy` regenerate first: an ingestion deploy rewrites the pipelines, jobs, and map, then checks that every project still finds the bronze tables it reads. A project deploy regenerates the project maps. A removed or renamed bronze table that a project reads stops the ingestion deploy. That is intended.
+
+All bundles must use the same catalog for a given target, because the ingestion jobs read the registry in the platform bundle's catalog. Check the `catalog` variable in each `databricks.yml` when you add a target.
+
+PyPI and a wheel volume are not part of this phase. Every bundle builds `framework_src` with the same artifact block.
+
+## Generated files
+
+`SOURCE_MAP.md`, `pipelines/`, and `resources/` in `framework_ingestion`, and `PROJECT_MAP.md` and `PROJECTS_INDEX.md` in `framework_projects`, are generated and committed. CI should run `./run.sh generate:check` and `./run.sh projects:check`. Do not edit them by hand; the next `generate` overwrites them. A hand-written resource file must not start with the generated marker line.
 
 ## What not to change
 
-Do not add a writer besides the collector for `object_registry` and `run_ledger`. Consumer jobs write JSON files only. The collector inserts definition files and step files, and it skips a row whose `(object_kind, full_name, content_hash)` or `(run_id, step_no, status)` is already stored.
+- Do not add a writer besides the collector for `object_registry` and `run_ledger`. Jobs write JSON files only. The collector inserts a definition only when `(object_kind, full_name, content_hash)` is new, and a step only when `(run_id, step_no, status)` is new.
+- Do not weaken the ownership check. The collector must keep refusing a pipeline or table another owner holds.
+- Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines. The collector is the exception: its checkpoint is under the events volume because it is a job.
+- Do not schedule a `VACUUM` that shortens retention.
+- Do not port the old SQL Server `tfm_*` procedures. Load strategies and pipeline datasets replace them.
+- Do not create a table or schema in a spec's name from a pipeline. Schemas and volumes are prepared outside the framework.
 
-Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for the file pipelines. The collector is the exception: its Auto Loader checkpoint is under the events volume because it is a job, not a declarative table.
+## Adding a source kind
 
-Do not port the old SQL Server `tfm_*` procedures. Load methods and pipeline datasets replace them.
+A kind is a `source.yaml` rule set plus one load strategy. Add the strategy in `load.py`, name it in `LOAD_METHODS_BY_KIND` in `ingestion.py`, add a template to the scaffold, and add the graph shape in `pipeline.py` if it differs. Keep strategies free of `pyspark`: they return option dictionaries and SQL strings. Cover it with a sample source and a test that needs no Spark.
 
-## Tests
-
-From the repository root:
+## Tests and checks
 
 ```bash
 ./run.sh install
-./run.sh test:quick
-./run.sh lint
+./run.sh test:quick        # framework_tests and the sample consumer tests; no Spark
+./run.sh lint              # pre-commit: ruff, formatting, YAML/TOML, whitespace, private keys
+./run.sh generate:check
+./run.sh projects:check
 ```
 
-`test:quick` runs `framework_tests` and the sample bronze tests under `framework_examples/consumer/tests`. Neither starts Spark. Ruff formats and lints. The pre-commit config runs the same Ruff checks plus YAML, TOML, whitespace, and private-key checks. Coverage is a later phase. The wheel is built by the bundle artifact on deploy.
+Coverage reporting is a later phase.
 
 ## Runtime checks
 
-[END_TO_END.md](END_TO_END.md) lists the Spark and Lakeflow behaviors that still need a pass on a workspace. If one of those fails, record the observed syntax in that list and adjust the single strategy or DDL statement. Do not spread a workaround through the consumer bundles.
+[END_TO_END.md](END_TO_END.md) lists the Spark and Lakeflow behaviors that still need a pass on a workspace.

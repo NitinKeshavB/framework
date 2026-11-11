@@ -11,7 +11,16 @@ from typing import Any, Mapping
 
 import yaml
 
-LOAD_METHODS = ("autoloader", "copy_into", "ctas")
+# autoloader, copy_into, and ctas land files in a raw table first. volume_files reads files that
+# are already in a raw Unity Catalog volume, and database_table reads a database table through a
+# foreign catalog. Both go straight to bronze, so they have no raw table.
+LOAD_METHODS = ("autoloader", "copy_into", "ctas", "volume_files", "database_table")
+RAWLESS_METHODS = ("volume_files", "database_table")
+FILE_KINDS = ("sftp_files", "sharepoint_files")
+DATABASE_KIND = "database"
+DATABASE_MODES = ("snapshot", "merge")
+VOLUME_PATH = re.compile(r"^/Volumes/[\w\-]+/[\w\-]+/[\w\-]+(/.*)?$")
+SOURCE_TABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
 FORMATS = (
     "csv",
     "delimited",
@@ -78,7 +87,7 @@ class PipelineConfig:
     """A bronze load: files land in raw, then raw is published to bronze."""
 
     pipeline_id: str
-    project: str
+    requested_by: str
     source_system: str
     table: str
     load_method: str
@@ -114,6 +123,41 @@ class PipelineConfig:
     notify_success: list[str] = field(default_factory=list)
     tags: dict[str, TableTags] = field(default_factory=dict)
     document: dict[str, Any] = field(default_factory=dict)
+    source_catalog: str = ""
+    source_table: str = ""
+    source_mode: str = ""
+    delivery: str = ""
+
+    @property
+    def owner_kind(self) -> str:
+        """Bronze is owned by its source system. Silver and gold are owned by projects."""
+
+        return "source_system"
+
+    @property
+    def owner(self) -> str:
+        return self.source_system
+
+    @property
+    def has_raw(self) -> bool:
+        return self.load_method not in RAWLESS_METHODS
+
+    @property
+    def is_batch(self) -> bool:
+        return self.load_method in {"ctas", "database_table"}
+
+    @property
+    def uses_auto_cdc(self) -> bool:
+        return self.dedup or (self.load_method == "database_table" and self.source_mode == "merge")
+
+    def source_reference(self) -> str:
+        """The database table a ``database_table`` load reads, as catalog.schema.table."""
+
+        return f"{self.source_catalog}.{self.source_table}"
+
+    @property
+    def layers(self) -> tuple[str, ...]:
+        return ("raw", "bronze", "quarantine") if self.has_raw else ("bronze", "quarantine")
 
     def layer_schema(self, layer: str) -> str:
         return {
@@ -123,6 +167,8 @@ class PipelineConfig:
         }[layer]
 
     def table_name(self, layer: str) -> str:
+        if layer == "raw" and not self.has_raw:
+            raise ValueError(f"{self.pipeline_id} has no raw table; its raw layer is the source")
         table = {
             "raw": self.raw_table,
             "bronze": self.bronze_table,
@@ -131,26 +177,39 @@ class PipelineConfig:
         return f"{self.catalog}.{self.layer_schema(layer)}.{table}"
 
     def canonical(self) -> dict[str, Any]:
-        source = {
-            "system": self.source_system,
-            "format": self.file_format,
-            "path": self.path,
-            "header": self.header,
-        }
-        _put(source, "external_location", self.external_location)
-        _put(source, "delimiter", self.delimiter)
-        _put(source, "header_rows", self.header_rows)
-        _put(source, "data_address", self.data_address)
-        _put(source, "max_files_per_trigger", self.max_files_per_trigger)
-        _put(source, "path_glob", self.path_glob)
-        if self.fixed_columns:
-            source["fixed_columns"] = [
-                {"name": column.name, "start": column.start, "length": column.length}
-                for column in self.fixed_columns
-            ]
+        if self.load_method == "database_table":
+            source: dict[str, Any] = {
+                "system": self.source_system,
+                "catalog": self.source_catalog,
+                "table": self.source_table,
+                "mode": self.source_mode,
+            }
+        else:
+            source = {
+                "system": self.source_system,
+                "format": self.file_format,
+                "path": self.path,
+                "header": self.header,
+            }
+            _put(source, "external_location", self.external_location)
+            _put(source, "delimiter", self.delimiter)
+            _put(source, "header_rows", self.header_rows)
+            _put(source, "data_address", self.data_address)
+            _put(source, "max_files_per_trigger", self.max_files_per_trigger)
+            _put(source, "path_glob", self.path_glob)
+            if self.fixed_columns:
+                source["fixed_columns"] = [
+                    {"name": column.name, "start": column.start, "length": column.length}
+                    for column in self.fixed_columns
+                ]
+        source_to_raw: dict[str, Any] = {"method": self.load_method, "source": source}
+        if self.has_raw:
+            source_to_raw["raw"] = _table_document(
+                self.raw_schema, self.raw_table, self.tags["raw"]
+            )
         document = {
             "pipeline_id": self.pipeline_id,
-            "project": self.project,
+            "requested_by": self.requested_by,
             "domain": self.domain,
             "data_domain": self.data_domain,
             "team": self.team,
@@ -161,11 +220,7 @@ class PipelineConfig:
                 "on_failure": list(self.notify_failure),
                 "on_success": list(self.notify_success),
             },
-            "source_to_raw": {
-                "method": self.load_method,
-                "source": source,
-                "raw": _table_document(self.raw_schema, self.raw_table, self.tags["raw"]),
-            },
+            "source_to_raw": source_to_raw,
             "raw_to_bronze": {
                 "bronze": _table_document(
                     self.bronze_schema, self.bronze_table, self.tags["bronze"]
@@ -182,6 +237,7 @@ class PipelineConfig:
             ),
         }
         _put(document, "job_name", self.job_name)
+        _put(document, "delivery", self.delivery or None)
         _put(document["raw_to_bronze"], "watermark_column", self.watermark_column)
         return document
 
@@ -197,7 +253,10 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return document
 
 
-def validate_configs(paths: list[Path]) -> list[PipelineConfig]:
+def validate_configs(paths: list[Path], catalog: str | None = None) -> list[PipelineConfig]:
+    """Validate spec files. ``catalog`` sets the environment's catalog for every spec, so a
+    spec does not hard-code dev or prod. Without it each spec must name its own catalog."""
+
     errors: list[str] = []
     configs: list[PipelineConfig] = []
     for path in paths:
@@ -209,6 +268,13 @@ def validate_configs(paths: list[Path]) -> list[PipelineConfig]:
         except yaml.YAMLError as exc:
             errors.append(f"{path}: {exc}")
             continue
+        if catalog:
+            document = {**document, "catalog": catalog}
+        if "source" in document and "source_to_raw" not in document:
+            document, composed = compose_document(document, path.parent / "source.yaml", str(path))
+            if composed:
+                errors.extend(composed)
+                continue
         found, parsed = _validate_one(document, str(path))
         errors.extend(found)
         if parsed is not None:
@@ -217,6 +283,62 @@ def validate_configs(paths: list[Path]) -> list[PipelineConfig]:
     if errors:
         raise ConfigValidationError(errors)
     return configs
+
+
+def compose_document(
+    spec: dict[str, Any], source_file: Path, label: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Join a table spec with its source system's ``source.yaml`` into one pipeline document.
+
+    The spec holds only what is true of the table (``source.raw_path`` or ``source.table``). The
+    kind, raw volume, and foreign catalog are facts of the source system, so they live once in
+    ``source.yaml`` and every table in that source inherits them.
+    """
+
+    if not source_file.exists():
+        return spec, [f"{label}: {source_file} is missing; a spec with a source section needs it"]
+    try:
+        source = yaml.safe_load(source_file.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        return spec, [f"{label}: {source_file}: {exc}"]
+    authored = spec.get("source")
+    if not isinstance(authored, dict) or not isinstance(source, dict):
+        return spec, [f"{label}: source must be a mapping"]
+    kind = str(source.get("kind") or "")
+    system = str(source.get("source_system") or "")
+    catalog = str(spec.get("catalog") or "")
+    document = {key: value for key, value in spec.items() if key != "source"}
+    authored = dict(authored)
+    if kind in FILE_KINDS:
+        volume = source.get("raw_volume") if isinstance(source.get("raw_volume"), dict) else {}
+        schema, name = str(volume.get("schema") or ""), str(volume.get("volume") or "")
+        raw_path = str(authored.pop("raw_path", "") or "").strip("/")
+        problems = []
+        if not (IDENTIFIER.match(schema) and IDENTIFIER.match(name)):
+            problems.append(f"{label}: {source_file} needs raw_volume with a schema and a volume")
+        if not raw_path:
+            problems.append(f"{label}: source.raw_path is required (the folder in the raw volume)")
+        if not catalog:
+            problems.append(f"{label}: catalog is required")
+        if problems:
+            return spec, problems
+        path = f"/Volumes/{catalog}/{schema}/{name}/{raw_path}/"
+        source_section = {"system": system, "path": path, **authored}
+        document["source_to_raw"] = {"method": "volume_files", "source": source_section}
+    elif kind == DATABASE_KIND:
+        document["source_to_raw"] = {
+            "method": "database_table",
+            "source": {
+                "system": system,
+                "catalog": source.get("foreign_catalog"),
+                "table": authored.get("table"),
+                "mode": authored.get("mode", "snapshot"),
+            },
+        }
+    else:
+        kinds = ", ".join([*FILE_KINDS, DATABASE_KIND])
+        return spec, [f"{label}: {source_file} kind must be one of {kinds} for a source section"]
+    return document, []
 
 
 def email_notifications(configs: list[PipelineConfig]) -> dict[str, list[str]]:
@@ -252,7 +374,15 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     _reject_unresolved(document, label, errors)
 
     pipeline_id = _identifier(document, "pipeline_id", label, errors)
-    project = _required_text(document, "project", label, errors)
+    # requested_by is the team that asked for the table. Older specs call it project.
+    requested_by = _optional_text(document.get("requested_by")) or _optional_text(
+        document.get("project")
+    )
+    if not requested_by:
+        errors.append(f"{label}: requested_by is required")
+    elif not IDENTIFIER.match(requested_by):
+        errors.append(f"{label}: requested_by must be an identifier")
+        requested_by = None
     catalog = str(document.get("catalog") or "")
     if not catalog:
         errors.append(f"{label}: catalog is required")
@@ -267,33 +397,52 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     raw_to_bronze = _section(document, "raw_to_bronze", label, errors)
     quarantine = _section(document, "quarantine", label, errors)
     source = _section(source_to_raw, "source", f"{label}: source_to_raw", errors)
-    raw_target = _section(source_to_raw, "raw", f"{label}: source_to_raw", errors)
+    load_method = str(source_to_raw.get("method") or "autoloader")
+    has_raw = load_method not in RAWLESS_METHODS
+    raw_target = (
+        _section(source_to_raw, "raw", f"{label}: source_to_raw", errors) if has_raw else {}
+    )
     bronze_target = _section(raw_to_bronze, "bronze", f"{label}: raw_to_bronze", errors)
 
-    load_method = str(source_to_raw.get("method") or "autoloader")
     if source_to_raw and load_method not in LOAD_METHODS:
         errors.append(f"{label}: source_to_raw.method must be one of {', '.join(LOAD_METHODS)}")
-    file_format = str(source.get("format") or "")
-    if source and file_format not in FORMATS:
+    is_database = load_method == "database_table"
+    file_format = "" if is_database else str(source.get("format") or "")
+    if source and not is_database and file_format not in FORMATS:
         errors.append(f"{label}: format must be one of {', '.join(FORMATS)}")
     if file_format == "excel" and load_method == "copy_into":
         errors.append(f"{label}: excel cannot use copy_into")
+    if load_method == "volume_files" and file_format in {"fixed_width", "yaml"}:
+        errors.append(f"{label}: {file_format} is not supported from a raw volume yet")
 
     source_system = (
         _identifier(source, "system", f"{label}: source_to_raw.source", errors) if source else None
     )
-    path = str(source.get("path") or "")
-    if source and not path:
+    path = "" if is_database else str(source.get("path") or "")
+    if source and not is_database and not path:
         errors.append(f"{label}: path is required")
-    elif path and not CLOUD_PATH.match(path):
+    elif path and load_method == "volume_files" and not VOLUME_PATH.match(path):
+        errors.append(f"{label}: path must be a /Volumes/<catalog>/<schema>/<volume> path")
+    elif path and load_method != "volume_files" and not CLOUD_PATH.match(path):
         errors.append(f"{label}: path must start with abfss:// or s3://")
 
-    raw_table = _target_table(raw_target, "raw", pipeline_id, label, errors)
+    source_catalog = str(source.get("catalog") or "") if is_database else ""
+    source_table = str(source.get("table") or "") if is_database else ""
+    source_mode = str(source.get("mode") or "snapshot") if is_database else ""
+    if is_database:
+        if not IDENTIFIER.match(source_catalog):
+            errors.append(f"{label}: the source system needs a foreign_catalog identifier")
+        if not SOURCE_TABLE.match(source_table):
+            errors.append(f"{label}: source.table must be <schema>.<table> in the database")
+        if source_mode not in DATABASE_MODES:
+            errors.append(f"{label}: source.mode must be one of {', '.join(DATABASE_MODES)}")
+
+    raw_table = _target_table(raw_target, "raw", pipeline_id, label, errors) if has_raw else ""
     bronze_table = _target_table(bronze_target, "bronze", raw_table or pipeline_id, label, errors)
     quarantine_table = _target_table(
         quarantine, "quarantine", bronze_table or pipeline_id, label, errors
     )
-    raw_schema = _target_schema(raw_target, "raw", source_system, label, errors)
+    raw_schema = _target_schema(raw_target, "raw", source_system, label, errors) if has_raw else ""
     bronze_schema = _target_schema(bronze_target, "bronze", source_system, label, errors)
     quarantine_schema = _target_schema(quarantine, "quarantine", source_system, label, errors)
 
@@ -304,10 +453,14 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         errors.append(f"{label}: watermark_column must be an identifier")
     if dedup and (not primary_keys or not watermark):
         errors.append(f"{label}: dedup requires primary_keys and watermark_column")
+    if is_database and dedup:
+        errors.append(f"{label}: a database table uses source.mode merge, not dedup")
+    if is_database and source_mode == "merge" and not primary_keys:
+        errors.append(f"{label}: source.mode merge requires primary_keys")
 
     domain, data_domain, team, technical_owner = _ownership(document, label, errors)
     notify_failure, notify_success = _notify(document, technical_owner, label, errors)
-    tags = _tags(document, raw_target, bronze_target, quarantine, label, errors)
+    tags = _tags(document, raw_target, bronze_target, quarantine, has_raw, label, errors)
     columns = _columns(raw_to_bronze.get("columns"), tags.get("bronze"), label, errors)
     rules = _rules(raw_to_bronze.get("rules"), label, errors)
     fixed_columns = _fixed_columns(source.get("fixed_columns"), label, errors)
@@ -340,25 +493,24 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     if (
         errors
         or not pipeline_id
-        or not project
+        or not requested_by
         or not source_system
-        or not raw_table
+        or (has_raw and not (raw_table and raw_schema))
         or not bronze_table
         or not quarantine_table
-        or not raw_schema
         or not bronze_schema
         or not quarantine_schema
         or not domain
         or not data_domain
         or not team
         or not technical_owner
-        or any(layer not in tags for layer in ("raw", "bronze", "quarantine"))
+        or any(name not in tags for name in (["raw"] if has_raw else []) + ["bronze", "quarantine"])
     ):
         return errors, None
 
     parsed = PipelineConfig(
         pipeline_id=pipeline_id,
-        project=project,
+        requested_by=requested_by,
         source_system=source_system,
         table=bronze_table,
         load_method=load_method,
@@ -394,6 +546,10 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         notify_success=notify_success,
         tags=tags,
         document=document,
+        source_catalog=source_catalog,
+        source_table=source_table,
+        source_mode=source_mode,
+        delivery=_optional_text(document.get("delivery")) or "",
     )
     return errors, parsed
 
@@ -456,6 +612,7 @@ def _tags(
     raw_target: Mapping[str, Any],
     bronze_target: Mapping[str, Any],
     quarantine: Mapping[str, Any],
+    has_raw: bool,
     label: str,
     errors: list[str],
 ) -> dict[str, TableTags]:
@@ -464,11 +621,10 @@ def _tags(
         errors.append(f"{label}: data must be a mapping")
         shared = {}
     found: dict[str, TableTags] = {}
-    for layer, section in (
-        ("raw", raw_target),
-        ("bronze", bronze_target),
-        ("quarantine", quarantine),
-    ):
+    layers = [("bronze", bronze_target), ("quarantine", quarantine)]
+    if has_raw:
+        layers.insert(0, ("raw", raw_target))
+    for layer, section in layers:
         tags = _layer_tags(shared, section, f"{label}: {layer}", errors)
         if tags is not None:
             found[layer] = tags
@@ -602,7 +758,7 @@ def _target_conflicts(configs: list[PipelineConfig]) -> list[str]:
     seen: dict[str, str] = {}
     errors: list[str] = []
     for config in configs:
-        for layer in ("raw", "bronze", "quarantine"):
+        for layer in config.layers:
             target = config.table_name(layer)
             owner = seen.get(target)
             if owner and owner != config.pipeline_id:

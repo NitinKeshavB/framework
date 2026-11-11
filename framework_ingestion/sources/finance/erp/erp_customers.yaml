@@ -1,0 +1,39 @@
+pipeline_id: erp_customers
+domain: finance
+data_domain: customers
+team: erp_squad
+technical_owner: erp.owner@jll.com
+layer: bronze
+job_name: erp_nightly
+delivery: nightly
+requested_by: erp
+
+data:
+  classification: confidential
+  pii:
+    - pii_basic
+
+# The table in the source database. merge keeps bronze in step with the source.
+source:
+  table: dbo.customers
+  mode: merge
+
+raw_to_bronze:
+  bronze:
+    schema: erp_bronze
+    table: customers
+  primary_keys:
+    - customer_id
+  columns:
+    - name: customer_id
+      type: string
+      description: Customer identifier in the ERP
+    - name: customer_name
+      type: string
+      description: Registered customer name
+      pii:
+        - pii_basic
+
+quarantine:
+  schema: erp_quarantine
+  table: customers

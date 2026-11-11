@@ -1,0 +1,28 @@
+# Silver and gold bundle for the billing_reporting project.
+# Pipelines and jobs for silver and gold are generated into resources/ once the silver and gold
+# builders exist. Until then this bundle only declares its targets.
+
+bundle:
+  name: billing_reporting
+
+variables:
+  catalog:
+    description: Unity Catalog for this environment. Must match the framework bundle.
+    default: aal_dev_fdh
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-7405615469052932.12.azuredatabricks.net
+    variables:
+      catalog: aal_dev_fdh
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-1864378597730899.19.azuredatabricks.net/
+      root_path: /Workspace/Shared/aztech_billing_reporting
+    variables:
+      catalog: aal_dev_fdh

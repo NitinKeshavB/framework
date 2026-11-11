@@ -78,6 +78,20 @@ class AutoLoader(LoadStrategy):
         return options
 
 
+class VolumeFiles(AutoLoader):
+    """Auto Loader straight from the raw volume into bronze. There is no raw table."""
+
+    def __init__(self) -> None:
+        LoadStrategy.__init__(self, "volume_files", frozenset(FORMATS), "none")
+
+
+class DatabaseTable(LoadStrategy):
+    """A table read through a foreign catalog straight into bronze. There is no raw table."""
+
+    def __init__(self) -> None:
+        super().__init__("database_table", frozenset(), "none")
+
+
 class CopyInto(LoadStrategy):
     def __init__(self) -> None:
         super().__init__("copy_into", frozenset(FORMATS) - {"excel"}, "streaming")
@@ -145,6 +159,8 @@ _STRATEGIES = {
     "autoloader": AutoLoader(),
     "copy_into": CopyInto(),
     "ctas": Ctas(),
+    "volume_files": VolumeFiles(),
+    "database_table": DatabaseTable(),
 }
 
 

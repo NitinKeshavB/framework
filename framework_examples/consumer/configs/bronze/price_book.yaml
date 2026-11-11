@@ -1,6 +1,6 @@
 pipeline_id: price_book
 domain: merchandising
-project: pricing
+requested_by: pricing
 data_domain: prices
 team: pricing_squad
 technical_owner: pricing.owner@jll.com

@@ -15,7 +15,9 @@ resources:
             python_file: ../src/run_cli.py
             parameters:
               - step
-              - --project
+              - --owner-kind
+              - project
+              - --owner
               - finance
               - --full-name
               - finance_ingest
@@ -86,7 +88,9 @@ resources:
             python_file: ../src/run_cli.py
             parameters:
               - step
-              - --project
+              - --owner-kind
+              - project
+              - --owner
               - finance
               - --full-name
               - finance_ingest
@@ -115,7 +119,9 @@ resources:
             python_file: ../src/run_cli.py
             parameters:
               - step
-              - --project
+              - --owner-kind
+              - project
+              - --owner
               - finance
               - --full-name
               - finance_ingest

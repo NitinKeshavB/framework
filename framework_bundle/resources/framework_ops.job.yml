@@ -4,12 +4,17 @@ resources:
       name: framework_ddl
       tasks:
         - task_key: apply_ddl
+          environment_key: framework_env
           spark_python_task:
             python_file: ../src/apply_ddl.py
             parameters:
               - ${var.catalog}
-          libraries:
-            - whl: ../../framework_src/dist/*.whl
+      environments:
+        - environment_key: framework_env
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../../framework_src/dist/*.whl
       queue:
         enabled: true
 
@@ -19,12 +24,17 @@ resources:
         pause_status: PAUSED
       tasks:
         - task_key: collect_events
+          environment_key: framework_env
           spark_python_task:
             python_file: ../src/collect_events.py
             parameters:
               - ${var.catalog}
-          libraries:
-            - whl: ../../framework_src/dist/*.whl
+      environments:
+        - environment_key: framework_env
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../../framework_src/dist/*.whl
 
     framework_optimize:
       name: framework_optimize
@@ -33,9 +43,14 @@ resources:
         timezone_id: UTC
       tasks:
         - task_key: optimize
+          environment_key: framework_env
           spark_python_task:
             python_file: ../src/optimize_registry.py
             parameters:
               - ${var.catalog}
-          libraries:
-            - whl: ../../framework_src/dist/*.whl
+      environments:
+        - environment_key: framework_env
+          spec:
+            environment_version: "2"
+            dependencies:
+              - ../../framework_src/dist/*.whl

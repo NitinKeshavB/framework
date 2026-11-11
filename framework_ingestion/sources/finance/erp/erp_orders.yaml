@@ -1,0 +1,36 @@
+pipeline_id: erp_orders
+domain: finance
+data_domain: orders
+team: erp_squad
+technical_owner: erp.owner@jll.com
+layer: bronze
+job_name: erp_nightly
+delivery: nightly
+requested_by: billing
+
+data:
+  classification: internal
+
+# snapshot replaces bronze with the source table on every run.
+source:
+  table: dbo.orders
+  mode: snapshot
+
+raw_to_bronze:
+  bronze:
+    schema: erp_bronze
+    table: orders
+  columns:
+    - name: order_id
+      type: string
+      description: Order identifier in the ERP
+    - name: total
+      type: decimal(18,2)
+      description: Order total
+  rules:
+    - name: total_non_negative
+      expression: total >= 0
+
+quarantine:
+  schema: erp_quarantine
+  table: orders

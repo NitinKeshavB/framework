@@ -1,0 +1,37 @@
+pipeline_id: hr_docs_headcount
+domain: people
+data_domain: headcount
+team: hr_squad
+technical_owner: hr.owner@jll.com
+layer: bronze
+job_name: hr_docs_daily
+delivery: daily
+requested_by: hr
+
+data:
+  classification: confidential
+  pii:
+    - pii_basic
+
+# The files for this table, in the source system's raw volume.
+source:
+  raw_path: headcount/
+  format: excel
+  header_rows: 1
+  data_address: "'Sheet1'!A1"
+
+raw_to_bronze:
+  bronze:
+    schema: hr_docs_bronze
+    table: headcount
+  columns:
+    - name: employee_id
+      type: string
+      description: Employee identifier
+    - name: department
+      type: string
+      description: Department name
+
+quarantine:
+  schema: hr_docs_quarantine
+  table: headcount

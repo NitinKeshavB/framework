@@ -1,0 +1,21 @@
+project: billing_reporting
+domain: finance
+owner: reporting.owner@jll.com
+
+# Reference bronze as <source_system>.<table> (see SOURCE_MAP.md in framework_ingestion),
+# your own tables as silver.<name>, and another project's as <project>.silver.<name>.
+# triggered_by fires the job once every listed table has refreshed. reads never waits.
+silver:
+  invoices_clean:
+    triggered_by: [billing.invoices]
+  customer_orders:
+    triggered_by: [erp.customers, erp.orders]
+    deadline: { at: "07:00", on_miss: alert }
+
+gold:
+  revenue_daily:
+    triggered_by: [silver.invoices_clean, silver.customer_orders]
+    deadline: { at: "08:00", on_miss: alert }
+  people_cost:
+    triggered_by: [silver.invoices_clean]
+    reads: [headcount_reporting.silver.headcount_clean]

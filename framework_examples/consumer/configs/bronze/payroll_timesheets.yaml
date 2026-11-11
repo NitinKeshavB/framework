@@ -1,6 +1,6 @@
 pipeline_id: payroll_timesheets
 domain: people
-project: payroll
+requested_by: payroll
 data_domain: timesheets
 team: payroll_squad
 technical_owner: payroll.owner@jll.com

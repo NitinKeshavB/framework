@@ -16,8 +16,9 @@ artifacts:
 
 variables:
   catalog:
-    description: Unity Catalog for this environment.
-    default: framework_dev
+    default: aal_dev_fdh
+  dev_flag:
+    default: true
 
 targets:
   dev:
@@ -26,12 +27,19 @@ targets:
     workspace:
       host: https://adb-7405615469052932.12.azuredatabricks.net
     variables:
-      catalog: framework_dev
+      catalog: aal_dev_fdh
 
   prod:
     mode: production
     workspace:
-      host: https://adb-7405615469052932.12.azuredatabricks.net
-      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+      host: https://adb-1864378597730899.19.azuredatabricks.net/
+      root_path: /Workspace/Shared/aztech_framework
     variables:
-      catalog: framework_prod
+      catalog: aal_dev_fdh
+      dev_flag:
+        default: false
+    permissions:
+      - user_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
+        level: CAN_MANAGE
+      - user_name: nitinkeshav.bolla@allianz.com.au
+        level: CAN_MANAGE

@@ -1,0 +1,15 @@
+source_system: billing
+domain: finance
+owner: billing.owner@jll.com
+kind: sftp_files
+
+# Files land in this volume as delivered. Bronze reads them from here.
+raw_volume:
+  schema: billing_raw
+  volume: landing
+
+# A delivery fires when files arrive in the volume, or on a schedule instead:
+#   schedule: "<quartz cron>"
+deliveries:
+  daily:
+    trigger: file_arrival

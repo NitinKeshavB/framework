@@ -28,7 +28,10 @@ def compile_rules(config: PipelineConfig) -> list[CompiledRule]:
             f"TRY_CAST({column.name} AS {column.type_name}) IS NOT NULL OR {column.name} IS NULL"
         )
         rules.append(CompiledRule(f"cast_{column.name}", expression, "type"))
-    if config.load_method == "autoloader" and config.file_format in RESCUE_FORMATS:
+    if (
+        config.load_method in {"autoloader", "volume_files"}
+        and config.file_format in RESCUE_FORMATS
+    ):
         rules.append(CompiledRule("schema_conformance", "_rescued_data IS NULL", "schema"))
     return rules
 

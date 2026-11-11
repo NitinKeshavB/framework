@@ -1,0 +1,13 @@
+source_system: hr_docs
+domain: people
+owner: hr.owner@jll.com
+kind: sharepoint_files
+
+# Files land in this volume as delivered. Bronze reads them from here.
+raw_volume:
+  schema: hr_docs_raw
+  volume: landing
+
+deliveries:
+  daily:
+    trigger: file_arrival

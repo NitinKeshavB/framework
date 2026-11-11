@@ -1,5 +1,10 @@
 -- Registry for Lakeflow workflows, pipelines, flows, securables, runs, and reconciliation.
 -- ${catalog} is replaced by the DDL task. These statements do not delete rows.
+--
+-- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
+-- project for silver and gold) and owner is its name. A table has one owner. Bronze tables are
+-- owned by their source system. requested_by is the team that asked for a bronze table, and
+-- delivery is how its source delivers.
 
 CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_meta;
 
@@ -8,7 +13,10 @@ CREATE VOLUME IF NOT EXISTS ${catalog}.framework_meta.framework_events;
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
   object_kind STRING,
   full_name STRING,
-  project STRING,
+  owner_kind STRING,
+  owner STRING,
+  requested_by STRING,
+  delivery STRING,
   parent_full_name STRING,
   relation STRING,
   config_json STRING,
@@ -16,7 +24,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
   source STRING,
   recorded_at TIMESTAMP
 )
-CLUSTER BY (project, object_kind, full_name)
+CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true'
 );
@@ -26,7 +34,8 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
   parent_run_id STRING,
   object_kind STRING,
   full_name STRING,
-  project STRING,
+  owner_kind STRING,
+  owner STRING,
   step_no INT,
   step_name STRING,
   status STRING,
@@ -37,7 +46,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
   recorded_at TIMESTAMP,
   event_date DATE
 )
-CLUSTER BY (project, event_date, full_name, run_id)
+CLUSTER BY (owner, event_date, full_name, run_id)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true'
 );
@@ -55,7 +64,10 @@ CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_current AS
 SELECT
   object_kind,
   full_name,
-  project,
+  owner_kind,
+  owner,
+  requested_by,
+  delivery,
   parent_full_name,
   relation,
   config_json,
@@ -74,7 +86,8 @@ SELECT
   parent_run_id,
   object_kind,
   full_name,
-  project,
+  owner_kind,
+  owner,
   step_no,
   step_name,
   status,
@@ -87,7 +100,7 @@ SELECT
 FROM ${catalog}.framework_meta.run_ledger
 WHERE event_date >= date_sub(current_date(), 7)
 QUALIFY row_number() OVER (
-  PARTITION BY project, object_kind, full_name
+  PARTITION BY owner_kind, owner, object_kind, full_name
   ORDER BY recorded_at DESC
 ) = 1;
 
@@ -97,7 +110,8 @@ SELECT
   parent_run_id,
   object_kind,
   full_name,
-  project,
+  owner_kind,
+  owner,
   step_no,
   step_name,
   status,
@@ -112,7 +126,8 @@ FROM ${catalog}.framework_meta.run_ledger;
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_recon AS
 SELECT
   run_id,
-  project,
+  owner_kind,
+  owner,
   full_name,
   event_date,
   recorded_at,
@@ -127,7 +142,8 @@ SELECT
 FROM (
   SELECT
     run_id,
-    project,
+    owner_kind,
+    owner,
     full_name,
     event_date,
     recorded_at,
@@ -142,7 +158,8 @@ FROM (
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_lineage AS
 SELECT
   full_name,
-  project,
+  owner_kind,
+  owner,
   parent_full_name,
   relation,
   config_json,
@@ -159,7 +176,10 @@ QUALIFY row_number() OVER (
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_pipelines AS
 SELECT
   full_name AS pipeline,
-  project,
+  owner_kind,
+  owner,
+  requested_by,
+  delivery,
   get_json_object(config_json, '$.config.domain') AS domain,
   get_json_object(config_json, '$.config.data_domain') AS data_domain,
   get_json_object(config_json, '$.config.team') AS team,
@@ -172,7 +192,9 @@ WHERE object_kind = 'pipeline';
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_tables AS
 SELECT
   full_name AS table_name,
-  project,
+  owner_kind,
+  owner,
+  requested_by,
   get_json_object(config_json, '$.domain') AS domain,
   get_json_object(config_json, '$.data_domain') AS data_domain,
   get_json_object(config_json, '$.team') AS team,
@@ -182,13 +204,26 @@ SELECT
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
 
+-- A table has one owner. This view is empty when that holds. The collector refuses a definition
+-- whose owner differs from the current one, so a row here means a registry written by hand.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_conflicts AS
+SELECT
+  object_kind,
+  full_name,
+  collect_set(concat(owner_kind, ':', owner)) AS owners
+FROM ${catalog}.framework_meta.object_registry
+WHERE object_kind IN ('pipeline', 'table', 'streaming_table', 'materialized_view')
+GROUP BY object_kind, full_name
+HAVING count(DISTINCT concat(owner_kind, ':', owner)) > 1;
+
 -- Column history is insert-only. A changed data type, description, or sensitivity
 -- tag is a new object_registry row. valid_to is the next version's recorded_at.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_columns AS
 SELECT
   parent_full_name AS table_name,
   get_json_object(config_json, '$.name') AS column_name,
-  project,
+  owner_kind,
+  owner,
   CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
   get_json_object(config_json, '$.data_type') AS data_type,
   get_json_object(config_json, '$.description') AS description,
@@ -206,7 +241,8 @@ FROM (
   SELECT
     parent_full_name AS table_name,
     get_json_object(config_json, '$.name') AS column_name,
-    project,
+    owner_kind,
+    owner,
     CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
     get_json_object(config_json, '$.data_type') AS data_type,
     get_json_object(config_json, '$.description') AS description,

@@ -1,151 +1,115 @@
 # Lakeflow framework
 
-Config-driven file ingestion for Databricks Lakeflow. A team adds one bronze YAML file and a one-line pipeline. `databricks bundle deploy` builds the wheel and uploads it.
+Config-driven ingestion and a metadata registry for Databricks Lakeflow. Teams add YAML, run one command, and the framework produces the pipelines, jobs, and a map. Source ingestion is shared by a domain. Silver and gold belong to projects.
 
-This version loads files into raw, then publishes raw to bronze. Rows that fail quality rules go to quarantine. Silver and gold use the same `<system>_<layer>` schema name later. They are not built here.
+## How it fits together
 
-## Layout
-
-| Path | Role |
-| --- | --- |
-| `framework_src` | The wheel. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. |
-| `framework_sql` | Registry DDL for `framework_meta`. |
-| `framework_bundle` | Bundle that builds the wheel and runs DDL, the collector, and daily `OPTIMIZE`. |
-| `framework_examples/consumer` | A second bundle: bronze YAML, pipeline files, and jobs. |
-| `framework_tests` | Package tests. They do not start Spark. |
-| `framework_docs` | Consumer guide, maintainer notes, and the end-to-end path. |
-
-## Add a pipeline
-
-```python
-from lakeflow_framework import build_pipeline
-
-build_pipeline("billing_invoices")
+```
+source system ──delivery──▶ bronze ──▶ silver ──▶ gold
+ (framework_ingestion)                 (framework_projects)
+        every definition and run is recorded in framework_meta (framework_bundle)
 ```
 
-`build_pipeline` reads the current row from `<catalog>.framework_meta.v_object_current`. The id must match `pipeline_id` in the YAML.
+| Folder | Role | Owner |
+| --- | --- | --- |
+| `framework_src` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
+| `framework_bundle` | Bundle for the registry: `framework_ddl`, `framework_collector`, and daily `OPTIMIZE` | Platform team |
+| `framework_sql` | Registry DDL for `framework_meta` | Platform team |
+| `framework_ingestion` | Bundle for source to bronze. A domain owns each source system. Any team can request a table. | Domain, per source system |
+| `framework_projects` | One bundle per project for silver and gold, with ownership checks and maps | One project each |
+| `framework_examples/consumer` | The original single-bundle example. Reference only. | None |
+| `framework_tests` | Package tests. They do not start Spark. | Platform team |
+| `framework_docs` | Contract, end-to-end path, architecture, maintainers, roadmap | Platform team |
 
-```yaml
-pipeline_id: billing_invoices
-domain: finance
-project: billing
-data_domain: invoices
-team: billing_squad
-technical_owner: billing.owner@jll.com
-layer: bronze
-catalog: framework_dev
+## What each source kind does
 
-notify:
-  on_failure:
-    - billing.owner@jll.com
-  on_success:
-    - billing.owner@jll.com
+| Kind | Data arrives as | Raw layer | Bronze load |
+| --- | --- | --- | --- |
+| `sftp_files`, `sharepoint_files` | Many files | A Unity Catalog volume of files as delivered | Auto Loader reads the volume into bronze |
+| `database` | Tables in PostgreSQL, Azure SQL, SQL Server, or DB2 | None. A foreign catalog exposes the database | Each table loads into bronze: `snapshot` or `merge` |
+| `cloud_files` | Files on ADLS or S3 | A raw table | Auto Loader, COPY INTO, or CTAS, then bronze |
 
-data:
-  classification: confidential
-  pii:
-    - pii_finance
-    - pii_personal
+Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePoint files into the raw volume is not built; it is the first phase 1 item ([ROADMAP](framework_docs/ROADMAP.md)).
 
-source_to_raw:
-  method: autoloader
-  source:
-    system: billing
-    format: csv
-    path: abfss://landing@storage.dfs.core.windows.net/billing/invoices/
-    delimiter: ","
-  raw:
-    schema: billing_raw
-    table: invoices
+## Who owns what
 
-raw_to_bronze:
-  bronze:
-    schema: billing_bronze
-    table: invoices
-  dedup: true
-  primary_keys: [invoice_id]
-  watermark_column: updated_at
-  rules:
-    - name: amount_non_negative
-      expression: amount >= 0
+- A **source system** belongs to a domain. Its bronze tables are owned by the source system, never by the team that asked for them. The registry records `requested_by` beside the owner.
+- A **project** owns its silver and gold tables. A table name is owned once; another project reads it as `<project>.silver.<name>`.
+- The collector refuses a definition for a table another owner holds and records a failed `ownership_check` step. `v_ownership_conflicts` stays empty.
 
-quarantine:
-  schema: billing_quarantine
-  table: invoices
-```
-
-`source_to_raw.method` is `autoloader` (default), `copy_into`, or `ctas`. Paths are `abfss://` or `s3://`. `dedup: true` requires `primary_keys` and `watermark_column`. Excel cannot use `copy_into`. Do not put keys or passwords in the file. Render `catalog` before validation. An unresolved `${...}` is an error.
-
-One domain holds many projects. Each pipeline names its `domain`, `project`, `data_domain`, `team`, and `technical_owner`. `data.classification` is `internal`, `confidential`, or `highly_confidential`. `data.pii` is any of `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, and `pii_personal`. Leave `pii` out when the table has none. A raw, bronze, or quarantine block can override those two fields. `notify.on_failure` is who Databricks mails when the job fails. Omit it and the technical owner is used. `notify.on_success` is optional. Put the same addresses on the job `email_notifications` block.
-
-`raw_to_bronze.columns` is the bronze column contract. Each entry has `name`, `type`, and an optional `description` (the column comment). `classification` and `pii` on a column override the bronze table. Leave them off and the column keeps the table tags. A change to type, description, tags, or position is a new row in the registry. `v_column_history` reads that history as SCD type 2: `valid_from` is when the version was recorded, `valid_to` is when the next version was recorded, and a null `valid_to` is the current version.
-
-Check the file before a cluster starts:
+## Add a table to a source system
 
 ```bash
-lakeflow-framework validate configs/bronze
+./run.sh new-source finance erp erp.owner@jll.com database nightly   # new source system only
+./run.sh new-table finance erp customers billing                      # the requesting team is last
+# edit sources/finance/erp/erp_customers.yaml and replace every TODO
+./run.sh generate
 ```
 
-The command prints every error in one pass.
+`generate` validates every source and spec, then writes the pipelines, jobs, and `SOURCE_MAP.md`. Details are in [framework_ingestion/README.md](framework_ingestion/README.md).
 
-## Deploy
-
-The bundle is the build. Both `framework_bundle` and `framework_examples/consumer` declare a wheel artifact on `framework_src`. Deploy builds `framework_src/dist/*.whl` and uploads it. Jobs and pipelines reference that file.
+## Add a project, silver, or gold table
 
 ```bash
-cd framework_bundle
-databricks bundle deploy --target dev
+./run.sh new-project finance billing_reporting reporting.owner@jll.com
+# edit framework_projects/finance/billing_reporting/project.yaml
+./run.sh projects:generate
 ```
 
-Then run the `framework_ddl` job, and start `framework_collector`. The collector is the only writer of the registry tables. Pipeline jobs write small JSON files to `/Volumes/<catalog>/framework_meta/framework_events`.
+`projects:generate` checks every reference against the ingestion bundle and the other projects, then writes `PROJECT_MAP.md` and `PROJECTS_INDEX.md`. Details are in [framework_projects/README.md](framework_projects/README.md). The silver and gold transforms themselves are phase 1.
 
-`framework_examples/consumer` is the shape another team copies: YAML under `configs/bronze`, a one-line file under `pipelines`, and a job that syncs definitions, waits until they are visible, then refreshes the pipelines.
+## Prerequisites before a deploy
 
-Dev uses development mode and catalog `framework_dev`. Prod uses production mode and catalog `framework_prod`.
+- The catalog exists, and you can create objects in it.
+- The schemas the specs name exist, for every source system: its raw, bronze, and quarantine schemas.
+- For `sftp_files` and `sharepoint_files`, the raw volume exists. The file-arrival trigger needs it when the job is created.
+- For `database`, the foreign catalog exists and can read the source tables.
+- Something delivers the files into the raw volume.
+- You are logged in: `databricks auth login --host <host> --profile <name>`.
 
-## See a run
+## Deploy order
 
-Query `<catalog>.framework_meta`, with a `project` filter:
+1. `./run.sh bundle:deploy framework_bundle <target> <profile>`
+2. Run the `framework_ddl` job, then start `framework_collector`. The collector is the only writer of the registry tables.
+3. `./run.sh bundle:deploy framework_ingestion <target> <profile>`
+4. `./run.sh bundle:deploy framework_projects/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
+
+`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog.
+
+## See what is running
+
+Query `<catalog>.framework_meta`:
 
 | View | What it answers |
 | --- | --- |
-| `v_object_current` | Current pipeline, flow, and table definitions |
-| `v_run_current` | Latest step in the last 7 days |
-| `v_process` | Every step of a run |
+| `v_object_current` | Current pipeline, flow, and table definitions, with owner |
+| `v_pipelines` | Source system, requesting team, delivery, domain, data domain, team, owner, and who is mailed |
+| `v_tables` | Owner, requester, classification, and PII on each table |
+| `v_columns`, `v_column_history` | Bronze columns: type, description, tags, and every past version |
+| `v_lineage` | Links from a pipeline to its tables |
+| `v_run_current`, `v_process` | Latest step in the last 7 days, and every step of a run |
 | `v_recon` | Source and target counts on the success step |
-| `v_lineage` | Links from a pipeline to raw, bronze, and quarantine |
-| `v_pipelines` | Domain, project, data domain, team, owner, and who is mailed |
-| `v_tables` | Classification and PII on each raw, bronze, and quarantine table |
-| `v_columns` | Current bronze columns: type, description, classification, and PII |
-| `v_column_history` | Every column version, with `valid_from`, `valid_to`, and `is_current` |
+| `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 
-History is insert-only. A daily job runs `OPTIMIZE`.
-
-## Examples
-
-| Config | Into raw | Bronze |
-| --- | --- | --- |
-| `billing_invoices.yaml` | Auto Loader, CSV | Dedup on `invoice_id` |
-| `ledger_entries.yaml` | CTAS, fixed-width | Keys only |
-| `orders_events.yaml` | COPY INTO, JSON | Status rule |
-| `payroll_timesheets.yaml` | Auto Loader, Excel | Dedup on employee and work date |
-| `price_book.yaml` | Auto Loader, Parquet | Positive price rule |
-
-Sample tests for those files are in `framework_examples/consumer/tests/test_bronze_loads.py`. Copy that file beside a new config. It checks table names and load SQL. It does not start a cluster.
+Filter by `owner` and, for runs, `event_date`. History is insert-only.
 
 ## Work in this repo
 
 ```bash
-./run.sh install
-./run.sh test:quick
-./run.sh lint
+source venv/bin/activate        # or set PYTHON to a venv's python
+./run.sh install                # editable install with the dev tools
+./run.sh test:quick             # package tests; no Spark
+./run.sh lint                   # pre-commit: ruff, formatting, file hygiene
+./run.sh generate:check         # fail if generated ingestion files are stale
+./run.sh projects:check         # fail if project maps are stale
+./run.sh clean                  # remove wheels, build output, and caches
+./run.sh help                   # every task
 ```
-
-`install` puts the package and Ruff into the active environment. `test:quick` runs `framework_tests` and the sample bronze tests. `lint` runs Ruff. The pre-commit config runs Ruff plus YAML, TOML, whitespace, and private-key checks.
 
 ## Read next
 
-- [framework_docs/README.md](framework_docs/README.md) for the YAML contract
-- [framework_docs/END_TO_END.md](framework_docs/END_TO_END.md) for the collector, quality rules, and registry
-- [framework_docs/MAINTAINERS.md](framework_docs/MAINTAINERS.md) for versioning and deploy
-- [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the package boundaries
+- [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, `project.yaml`
+- [framework_docs/END_TO_END.md](framework_docs/END_TO_END.md) for the run path, quality rules, and the registry
+- [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the package boundaries and design choices
+- [framework_docs/MAINTAINERS.md](framework_docs/MAINTAINERS.md) for versioning, deploy, and what not to change
+- [framework_docs/ROADMAP.md](framework_docs/ROADMAP.md) for what is built, phase 1, and what is not verified

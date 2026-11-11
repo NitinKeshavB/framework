@@ -1,0 +1,13 @@
+source_system: erp
+domain: finance
+owner: erp.owner@jll.com
+kind: database
+
+# The catalog that exposes the database (Lakehouse Federation).
+foreign_catalog: erp_federated
+engine: sql_server  # one of postgresql, azure_sql, sql_server, db2
+
+# A database delivery runs on a schedule. Every table in it loads in the same run.
+deliveries:
+  nightly:
+    schedule: "0 0 2 * * ?"

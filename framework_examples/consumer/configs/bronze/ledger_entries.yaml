@@ -1,6 +1,6 @@
 pipeline_id: ledger_entries
 domain: finance
-project: ledger
+requested_by: ledger
 data_domain: entries
 team: ledger_squad
 technical_owner: ledger.owner@jll.com

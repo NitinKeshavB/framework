@@ -6,11 +6,15 @@
 name = "lakeflow_framework"
 version = "0.1.0"
 description = "Config-driven Lakeflow file ingestion. Consumers pin this wheel and supply YAML."
-authors = [{ name = "NitinKeshav", email = "nitinkeshav.bolla@jll.com" }]
+authors = [{ name = "NitinKeshav", email = "nitinkeshav.bolla@allianz.com" }]
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
-license = { text = "MIT" }
-dependencies = ["PyYAML>=6"]
+license = "MIT"
+dependencies = [
+    "PyYAML>=6",
+    "databricks-dlt",
+    "databricks-connect>=15.4,<15.5",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -21,13 +25,13 @@ keywords = ["lakeflow", "databricks", "ingestion", "bronze"]
 lakeflow-framework = "lakeflow_framework.cli:main"
 
 # pip install -e "framework_src[dev]"
-# dev is the local tool set. test is pytest only. The wheel itself stays PyYAML.
+# dev is the local tool set. test is pytest only.
 [project.optional-dependencies]
 test = ["pytest>=8"]
 dev = ["lakeflow_framework[test]", "ruff==0.17.4", "pre-commit"]
 
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

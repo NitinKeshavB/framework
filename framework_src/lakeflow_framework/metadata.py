@@ -48,11 +48,12 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
     )
     content_hash = config.content_hash()
     pipeline_name = config.pipeline_id
+    scope = _scope(config)
     rows = [
         _object(
             "pipeline",
             pipeline_name,
-            config.project,
+            scope,
             config.job_name,
             "owns" if config.job_name else None,
             config_json,
@@ -62,12 +63,14 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
         )
     ]
     for layer, relation in (("raw", "writes"), ("bronze", "writes"), ("quarantine", "rejects_to")):
+        if layer not in config.layers:
+            continue
         full_name = config.table_name(layer)
         rows.append(
             _object(
                 "flow",
                 f"{pipeline_name}.{layer}",
-                config.project,
+                scope,
                 pipeline_name,
                 relation,
                 json.dumps({"table": full_name, "layer": layer}, sort_keys=True),
@@ -80,7 +83,7 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             _object(
                 _securable_kind(config, layer),
                 full_name,
-                config.project,
+                scope,
                 f"{pipeline_name}.{layer}",
                 relation,
                 json.dumps(_table_record(config, layer), sort_keys=True),
@@ -93,7 +96,7 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             _object(
                 "link",
                 f"{pipeline_name}->{full_name}",
-                config.project,
+                scope,
                 pipeline_name,
                 relation,
                 json.dumps({"child": full_name}, sort_keys=True),
@@ -107,7 +110,7 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             _object(
                 "workflow",
                 config.job_name,
-                config.project,
+                scope,
                 None,
                 None,
                 json.dumps({"pipeline_id": pipeline_name}, sort_keys=True),
@@ -124,6 +127,7 @@ def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any
     """Bronze columns. A new hash is a new SCD type 2 version of type, comment, or tags."""
 
     table_name = config.table_name("bronze")
+    scope = _scope(config)
     rows: list[dict[str, Any]] = []
     for ordinal, column in enumerate(config.columns, start=1):
         record = {
@@ -138,7 +142,7 @@ def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any
             _object(
                 "column",
                 f"{table_name}.{column.name}",
-                config.project,
+                scope,
                 table_name,
                 "column_of",
                 json.dumps(record, sort_keys=True),
@@ -185,16 +189,28 @@ def _securable_kind(config: PipelineConfig, layer: str) -> str:
     if layer == "raw":
         return "streaming_table" if config.load_method == "autoloader" else "table"
     if layer == "quarantine":
-        return "materialized_view" if config.load_method == "ctas" else "streaming_table"
-    if config.dedup or config.load_method != "ctas":
+        return "materialized_view" if config.is_batch else "streaming_table"
+    if config.uses_auto_cdc or not config.is_batch:
         return "streaming_table"
     return "materialized_view"
+
+
+def _scope(config: PipelineConfig) -> dict[str, str | None]:
+    """Who owns a definition. Bronze is owned by its source system, never by the team that
+    asked for it. ``requested_by`` and ``delivery`` ride along for the maps."""
+
+    return {
+        "owner_kind": config.owner_kind,
+        "owner": config.owner,
+        "requested_by": config.requested_by,
+        "delivery": config.delivery or None,
+    }
 
 
 def _object(
     kind: str,
     full_name: str,
-    project: str,
+    scope: Mapping[str, str | None],
     parent: str | None,
     relation: str | None,
     config_json: str,
@@ -205,7 +221,10 @@ def _object(
     return {
         "object_kind": kind,
         "full_name": full_name,
-        "project": project,
+        "owner_kind": scope["owner_kind"],
+        "owner": scope["owner"],
+        "requested_by": scope["requested_by"],
+        "delivery": scope["delivery"],
         "parent_full_name": parent,
         "relation": relation,
         "config_json": config_json,
@@ -218,7 +237,10 @@ def _object(
 OBJECT_COLUMNS = (
     "object_kind",
     "full_name",
-    "project",
+    "owner_kind",
+    "owner",
+    "requested_by",
+    "delivery",
     "parent_full_name",
     "relation",
     "config_json",
@@ -232,7 +254,8 @@ LEDGER_COLUMNS = (
     "parent_run_id",
     "object_kind",
     "full_name",
-    "project",
+    "owner_kind",
+    "owner",
     "step_no",
     "step_name",
     "status",
@@ -244,14 +267,20 @@ LEDGER_COLUMNS = (
     "event_date",
 )
 
+OWNER_KINDS = ("source_system", "project")
+# Definitions the collector refuses to hand to a second owner. Flows, links, workflows, and
+# columns follow their pipeline or table.
+OWNED_KINDS = ("pipeline", "table", "streaming_table", "materialized_view")
+
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_HASH = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
 
 def definition_file_name(row: Mapping[str, Any]) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", str(row["full_name"])).strip("_")
     return (
-        f"{row['project']}/definitions/"
+        f"{row['owner_kind']}/{row['owner']}/definitions/"
         f"{row['object_kind']}_{safe_name}_{str(row['content_hash'])[:16]}.json"
     )
 
@@ -295,9 +324,10 @@ def new_object_rows(
 
 def step_payload(
     *,
-    project: str,
+    owner: str,
     full_name: str,
     run_id: str,
+    owner_kind: str = "source_system",
     step_no: int,
     step_name: str,
     status: str,
@@ -310,9 +340,12 @@ def step_payload(
 ) -> dict[str, Any]:
     if status not in {"RUNNING", "SUCCEEDED", "FAILED"}:
         raise ValueError("status must be RUNNING, SUCCEEDED, or FAILED")
+    if owner_kind not in OWNER_KINDS:
+        raise ValueError(f"owner_kind must be one of {', '.join(OWNER_KINDS)}")
     return {
         "kind": "step",
-        "project": project,
+        "owner_kind": owner_kind,
+        "owner": owner,
         "full_name": full_name,
         "object_kind": object_kind,
         "run_id": run_id,
@@ -330,7 +363,7 @@ def step_payload(
 
 def step_file_name(payload: Mapping[str, Any]) -> str:
     return (
-        f"{payload['project']}/{payload['full_name']}/"
+        f"{payload['owner_kind']}/{payload['owner']}/{payload['full_name']}/"
         f"{payload['run_id']}_{payload['step_no']}_{payload['status']}.json"
     )
 
@@ -349,7 +382,8 @@ def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
         "parent_run_id": payload.get("parent_run_id"),
         "object_kind": payload.get("object_kind", "pipeline"),
         "full_name": payload["full_name"],
-        "project": payload["project"],
+        "owner_kind": payload["owner_kind"],
+        "owner": payload["owner"],
         "step_no": int(payload["step_no"]),
         "step_name": payload["step_name"],
         "status": payload["status"],
@@ -449,6 +483,43 @@ def object_keys_sql(catalog: str, content_hashes: list[str]) -> str:
         f"SELECT object_kind, full_name, content_hash FROM {catalog}.framework_meta.object_registry "
         f"WHERE content_hash IN ({quoted})"
     )
+
+
+def owners_sql(catalog: str, full_names: list[str]) -> str:
+    """Current owner of each named table or pipeline, from the registry."""
+
+    if not catalog or not _SAFE_TOKEN.match(catalog):
+        raise ValueError("catalog is required")
+    names = [value for value in full_names if _SAFE_NAME.match(value)]
+    if not names:
+        raise ValueError("full name is required")
+    quoted = ", ".join(f"'{value}'" for value in names)
+    return (
+        f"SELECT object_kind, full_name, owner_kind, owner "
+        f"FROM {catalog}.framework_meta.v_object_current "
+        f"WHERE object_kind IN ({', '.join(repr(kind) for kind in OWNED_KINDS)}) "
+        f"AND full_name IN ({quoted})"
+    )
+
+
+def ownership_conflicts(
+    rows: list[dict[str, Any]], current: Mapping[tuple[str, str], tuple[str, str]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split definition rows into those that may be inserted and those another owner holds.
+
+    A name that has no current owner is free. A name held by the same owner is an update.
+    """
+
+    accepted: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+    for row in rows:
+        holder = current.get((str(row["object_kind"]), str(row["full_name"])))
+        mine = (str(row["owner_kind"]), str(row["owner"]))
+        if row["object_kind"] in OWNED_KINDS and holder is not None and holder != mine:
+            refused.append(row)
+        else:
+            accepted.append(row)
+    return accepted, refused
 
 
 def step_keys_sql(catalog: str, run_ids: list[str]) -> str:
