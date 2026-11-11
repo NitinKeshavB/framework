@@ -2,7 +2,7 @@
 -- ${catalog} is replaced by the DDL task. These statements do not delete rows.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
--- project for silver and gold) and owner is its name. A table has one owner. Bronze tables are
+-- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
 -- owned by their source system. requested_by is the team that asked for a bronze table, and
 -- delivery is how its source delivers.
 

@@ -92,6 +92,7 @@ class _Reader:
         return self
 
     def load(self, path):
+        self.loads = getattr(self, "loads", 0) + 1
         return {"format": self.format_name, "path": path, "options": dict(self.options)}
 
     def table(self, name):
@@ -197,6 +198,7 @@ def test_volume_files_register_streaming_tables_without_a_raw_table(tmp_path: Pa
     assert not pipelines.expectations
     assert spark.readStream.format_name == "cloudFiles"
     assert spark.readStream.options["cloudFiles.format"] == "csv"
+    assert spark.readStream.loads == 1
 
 
 def test_registry_rows_skip_the_raw_layer_and_round_trip(tmp_path: Path) -> None:
@@ -210,10 +212,11 @@ def test_registry_rows_skip_the_raw_layer_and_round_trip(tmp_path: Path) -> None
             row["full_name"] for row in rows if row["object_kind"].endswith(("table", "view"))
         ]
         assert len(tables) == 2 and not any("_raw." in table for table in tables)
-        assert {row["full_name"] for row in rows if row["object_kind"] == "flow"} == {
-            f"{config.pipeline_id}.bronze",
-            f"{config.pipeline_id}.quarantine",
-        }
+        flows = {row["full_name"] for row in rows if row["object_kind"] == "flow"}
+        expected = {f"{config.pipeline_id}.bronze", f"{config.pipeline_id}.quarantine"}
+        if config.load_method == "volume_files":
+            expected.add(f"{config.pipeline_id}.raw")
+        assert flows == expected
         again = config_from_document(config.canonical())
         assert again.load_method == config.load_method
         assert again.content_hash() == config.content_hash()

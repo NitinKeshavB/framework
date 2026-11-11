@@ -1,0 +1,12 @@
+source_system: claims_db
+domain: claims
+owner: claims.owner@jll.com
+kind: database
+
+# The catalog that exposes the database (Lakehouse Federation). There is no raw layer.
+foreign_catalog: claims_federated
+engine: postgresql
+
+deliveries:
+  nightly:
+    schedule: "0 0 2 * * ?"

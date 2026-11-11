@@ -12,6 +12,7 @@ from lakeflow_framework.metadata import (
     new_object_rows,
     object_rows,
     step_payload,
+    workflow_rows,
     write_definition_files,
     write_step_file,
 )
@@ -44,7 +45,10 @@ def main(argv: list[str] | None = None) -> int:
     new_table.add_argument("domain")
     new_table.add_argument("source_system")
     new_table.add_argument("table")
-    new_table.add_argument("--requested-by", required=True, help="team or project asking for it")
+    new_table.add_argument(
+        "--requested-by",
+        help="project bringing the table in; omit to put the spec next to source.yaml",
+    )
     new_table.add_argument("--delivery", help="needed when the source has several deliveries")
 
     generate = commands.add_parser("generate")
@@ -55,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
 
     projects = commands.add_parser("projects")
     projects.add_argument("action", choices=["generate", "new"])
-    projects.add_argument("root", type=Path, help="the projects folder, framework_projects")
+    projects.add_argument("root", type=Path, help="the curation folder, framework_curation")
     projects.add_argument("--sources", type=Path, help="the ingestion bundle folder")
     projects.add_argument("--check", action="store_true", help="change nothing; fail if stale")
     projects.add_argument("--domain")
@@ -154,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             seen: set[tuple[str, str, str]] = set()
             for config in configs:
                 rows.extend(new_object_rows(object_rows(config), seen))
+            rows.extend(new_object_rows(workflow_rows(configs), seen))
             written = write_definition_files(args.out, rows)
             print(f"wrote {len(written)} definition file(s) to {args.out}")
             return 0

@@ -1,6 +1,6 @@
-# Silver and gold bundle for the headcount_reporting project.
-# Pipelines and jobs for silver and gold are generated into resources/ once the silver and gold
-# builders exist. Until then this bundle only declares its targets.
+# Curation bundle for the headcount_reporting project: silver, gold, and data products.
+# Pipelines and jobs are generated into resources/ once those builders exist. Until then this
+# bundle only declares its targets.
 
 bundle:
   name: headcount_reporting

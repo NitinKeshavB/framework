@@ -13,10 +13,10 @@ source system ──delivery──▶ bronze ──▶ silver ──▶ gold
 | Folder | Role | Owner |
 | --- | --- | --- |
 | `framework_src` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
-| `framework_bundle` | Bundle for the registry: `framework_ddl`, `framework_collector`, and daily `OPTIMIZE` | Platform team |
-| `framework_sql` | Registry DDL for `framework_meta` | Platform team |
-| `framework_ingestion` | Bundle for source to bronze. A domain owns each source system. Any team can request a table. | Domain, per source system |
+| `framework_bundle` | The deployed framework: the wheel, the `framework_meta` registry DDL, the collector, and daily `OPTIMIZE` | Platform team |
+| `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
 | `framework_projects` | One bundle per project for silver and gold, with ownership checks and maps | One project each |
+| `framework_examples/ingestion` | Specs for each ingestion kind: a raw volume, SharePoint, a database, and cloud files | None |
 | `framework_examples/consumer` | The original single-bundle example. Reference only. | None |
 | `framework_tests` | Package tests. They do not start Spark. | Platform team |
 | `framework_docs` | Contract, end-to-end path, architecture, maintainers, roadmap | Platform team |
@@ -41,8 +41,8 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 ```bash
 ./run.sh new-source finance erp erp.owner@jll.com database nightly   # new source system only
-./run.sh new-table finance erp customers billing                      # the requesting team is last
-# edit sources/finance/erp/erp_customers.yaml and replace every TODO
+./run.sh new-table finance erp customers billing                      # the project is last; omit it to put the spec next to source.yaml
+# edit sources/erp/billing/erp_customers.yaml and replace every TODO
 ./run.sh generate
 ```
 

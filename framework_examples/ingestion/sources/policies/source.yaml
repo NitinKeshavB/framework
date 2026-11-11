@@ -1,0 +1,12 @@
+source_system: policies
+domain: insurance
+owner: policies.owner@jll.com
+kind: sharepoint_files
+
+raw_volume:
+  schema: policies_raw
+  volume: landing
+
+deliveries:
+  daily:
+    trigger: file_arrival

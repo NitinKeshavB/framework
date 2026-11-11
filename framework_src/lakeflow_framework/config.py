@@ -130,7 +130,7 @@ class PipelineConfig:
 
     @property
     def owner_kind(self) -> str:
-        """Bronze is owned by its source system. Silver and gold are owned by projects."""
+        """A bronze load is owned by its source system. Silver, gold, and data products are owned by a project."""
 
         return "source_system"
 
@@ -271,7 +271,10 @@ def validate_configs(paths: list[Path], catalog: str | None = None) -> list[Pipe
         if catalog:
             document = {**document, "catalog": catalog}
         if "source" in document and "source_to_raw" not in document:
-            document, composed = compose_document(document, path.parent / "source.yaml", str(path))
+            source_file = path.parent / "source.yaml"
+            if not source_file.is_file():
+                source_file = path.parent.parent / "source.yaml"
+            document, composed = compose_document(document, source_file, str(path))
             if composed:
                 errors.extend(composed)
                 continue
@@ -374,21 +377,22 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     _reject_unresolved(document, label, errors)
 
     pipeline_id = _identifier(document, "pipeline_id", label, errors)
-    # requested_by is the team that asked for the table. Older specs call it project.
+    # requested_by is the project that brought the table in. Older specs call it project.
+    # Omitted when the spec sits directly under the source system.
     requested_by = _optional_text(document.get("requested_by")) or _optional_text(
         document.get("project")
     )
-    if not requested_by:
-        errors.append(f"{label}: requested_by is required")
-    elif not IDENTIFIER.match(requested_by):
+    if requested_by and not IDENTIFIER.match(requested_by):
         errors.append(f"{label}: requested_by must be an identifier")
         requested_by = None
+    elif not requested_by:
+        requested_by = ""
     catalog = str(document.get("catalog") or "")
     if not catalog:
         errors.append(f"{label}: catalog is required")
     layer = document.get("layer")
     if layer != "bronze":
-        if layer in {"silver", "gold"}:
+        if layer in {"silver", "gold", "product"}:
             errors.append(f"{label}: {layer} loads are not implemented; layer must be bronze")
         else:
             errors.append(f"{label}: layer must be bronze")
@@ -493,7 +497,7 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     if (
         errors
         or not pipeline_id
-        or not requested_by
+        or requested_by is None
         or not source_system
         or (has_raw and not (raw_table and raw_schema))
         or not bronze_table

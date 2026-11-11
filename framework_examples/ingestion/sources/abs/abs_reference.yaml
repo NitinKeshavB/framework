@@ -1,0 +1,34 @@
+pipeline_id: abs_reference
+domain: property
+data_domain: reference
+team: abs
+technical_owner: abs.owner@jll.com
+layer: bronze
+job_name: abs_daily
+delivery: daily
+
+data:
+  classification: internal
+
+# No project: this file sits next to source.yaml, so requested_by is omitted.
+source:
+  raw_path: reference/
+  format: csv
+  delimiter: ","
+  header: true
+
+raw_to_bronze:
+  bronze:
+    schema: abs_bronze
+    table: reference
+  columns:
+    - name: code
+      type: string
+      description: Reference code
+    - name: label
+      type: string
+      description: Reference label
+
+quarantine:
+  schema: abs_quarantine
+  table: reference

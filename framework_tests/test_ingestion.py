@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -11,6 +12,8 @@ import yaml
 from lakeflow_framework.cli import main
 from lakeflow_framework.config import ConfigValidationError
 from lakeflow_framework.ingestion import MAP_NAME, generate, load_sources, new_source, new_table
+from lakeflow_framework.metadata import object_rows, workflow_rows
+from lakeflow_framework.pipeline import build_pipeline
 
 SAMPLE = Path(__file__).resolve().parents[1] / "framework_ingestion"
 
@@ -65,17 +68,18 @@ quarantine:
 def bundle(tmp_path: Path) -> Path:
     """The billing source only: one SFTP source with one table."""
 
-    shutil.copytree(
-        SAMPLE / "sources" / "finance" / "billing", tmp_path / "sources" / "finance" / "billing"
-    )
+    shutil.copytree(SAMPLE / "sources" / "billing", tmp_path / "sources" / "billing")
     return tmp_path
 
 
 def _add_table(bundle: Path, name: str, requested_by: str, **changes: str) -> Path:
     """A second table in the billing source, as another team would add it."""
 
-    folder = bundle / "sources" / "finance" / "billing"
-    text = (folder / "billing_invoices.yaml").read_text(encoding="utf-8")
+    folder = bundle / "sources" / "billing" / requested_by
+    folder.mkdir(parents=True, exist_ok=True)
+    text = (bundle / "sources" / "billing" / "billing" / "billing_invoices.yaml").read_text(
+        encoding="utf-8"
+    )
     text = text.replace("billing_invoices", f"billing_{name}")
     text = text.replace("requested_by: billing", f"requested_by: {requested_by}")
     text = text.replace("table: invoices", f"table: {name}")
@@ -178,7 +182,7 @@ def test_file_sources_fire_when_files_land_in_the_raw_volume(bundle: Path) -> No
 
 
 def test_database_job_has_a_schedule_and_syncs_both_tables(tmp_path: Path) -> None:
-    shutil.copytree(SAMPLE / "sources" / "finance" / "erp", tmp_path / "sources/finance/erp")
+    shutil.copytree(SAMPLE / "sources" / "erp", tmp_path / "sources" / "erp")
     generate(tmp_path)
     job = _job(tmp_path, "erp_nightly")
     assert job["schedule"]["quartz_cron_expression"] == "0 0 2 * * ?"
@@ -190,7 +194,7 @@ def test_database_job_has_a_schedule_and_syncs_both_tables(tmp_path: Path) -> No
 
 
 def test_scheduled_delivery_gets_a_schedule_not_a_file_trigger(bundle: Path) -> None:
-    folder = bundle / "sources" / "finance" / "billing"
+    folder = bundle / "sources" / "billing"
     text = (folder / "source.yaml").read_text("utf-8")
     text = text.replace("trigger: file_arrival", 'schedule: "0 0 2 * * ?"')
     (folder / "source.yaml").write_text(text, "utf-8")
@@ -201,23 +205,23 @@ def test_scheduled_delivery_gets_a_schedule_not_a_file_trigger(bundle: Path) -> 
 
 
 def test_cloud_files_source_keeps_its_raw_table_and_adds_a_batch_load_step(bundle: Path) -> None:
-    folder = bundle / "sources" / "finance" / "legacy"
-    folder.mkdir()
-    (folder / "source.yaml").write_text(LEGACY_SOURCE, "utf-8")
+    folder = bundle / "sources" / "legacy" / "legacy"
+    folder.mkdir(parents=True)
+    (folder.parent / "source.yaml").write_text(LEGACY_SOURCE, "utf-8")
     (folder / "legacy_credits.yaml").write_text(LEGACY_SPEC, "utf-8")
     generate(bundle)
     tasks = _tasks(bundle, "legacy_daily")
     assert list(tasks["batch_load"]["spark_python_task"]["parameters"]) == [
         "--catalog",
         "${var.catalog}",
-        "${workspace.file_path}/sources/finance/legacy/legacy_credits.yaml",
+        "${workspace.file_path}/sources/legacy/legacy/legacy_credits.yaml",
     ]
     assert tasks["refresh_pipeline"]["depends_on"] == [{"task_key": "batch_load"}]
     assert _job(bundle, "legacy_daily")["trigger"]["file_arrival"]["url"].startswith("abfss://")
 
 
 def test_specs_do_not_name_a_catalog_and_jobs_pass_the_environment_catalog(bundle: Path) -> None:
-    spec = bundle / "sources/finance/billing/billing_invoices.yaml"
+    spec = bundle / "sources/billing/billing/billing_invoices.yaml"
     assert "catalog:" not in spec.read_text("utf-8")
     generate(bundle)
     parameters = _tasks(bundle)["sync"]["spark_python_task"]["parameters"]
@@ -229,11 +233,12 @@ def test_specs_do_not_name_a_catalog_and_jobs_pass_the_environment_catalog(bundl
 def test_removed_table_removes_its_generated_files_and_leaves_others(bundle: Path) -> None:
     generate(bundle)
     (bundle / "resources" / "hand_written.job.yml").write_text("resources: {}\n", "utf-8")
-    folder = bundle / "sources" / "finance" / "billing"
+    folder = bundle / "sources" / "billing"
     text = (folder / "source.yaml").read_text("utf-8").replace("daily:", "nightly:")
     (folder / "source.yaml").write_text(text, "utf-8")
-    spec = (folder / "billing_invoices.yaml").read_text("utf-8")
-    (folder / "billing_invoices.yaml").write_text(
+    spec_path = folder / "billing" / "billing_invoices.yaml"
+    spec = spec_path.read_text("utf-8")
+    spec_path.write_text(
         spec.replace("delivery: daily", "delivery: nightly").replace(
             "billing_daily", "billing_nightly"
         ),
@@ -252,9 +257,9 @@ def test_scaffolds_work_for_every_kind_and_are_refused_until_finished(
     source = new_source(
         tmp_path, "retail", "orders", owner="orders.owner@jll.com", kind=kind, delivery="hourly"
     )
-    assert source == tmp_path / "sources/retail/orders/source.yaml"
+    assert source == tmp_path / "sources/orders/source.yaml"
     table = new_table(tmp_path, "retail", "orders", "events", requested_by="sales", delivery=None)
-    assert table == tmp_path / "sources/retail/orders/orders_events.yaml"
+    assert table == tmp_path / "sources/orders/sales/orders_events.yaml"
     text = table.read_text("utf-8")
     assert "delivery: hourly" in text and "requested_by: sales" in text
     with pytest.raises(ConfigValidationError) as caught:
@@ -268,8 +273,8 @@ def test_a_finished_scaffold_generates(tmp_path: Path) -> None:
         delivery="hourly",
     )  # fmt: skip
     new_table(tmp_path, "retail", "orders", "events", requested_by="sales", delivery=None)
-    folder = tmp_path / "sources/retail/orders"
-    for path in folder.glob("*.yaml"):
+    folder = tmp_path / "sources/orders"
+    for path in folder.rglob("*.yaml"):
         text = path.read_text("utf-8").replace("TODO_column_name", "event_id")
         path.write_text(text.replace("TODO describe the column", "Event identifier"), "utf-8")
     assert "resources/orders_hourly.job.yml" in generate(tmp_path)
@@ -286,7 +291,7 @@ def test_scaffold_refuses_to_overwrite_and_to_guess_a_delivery(tmp_path: Path) -
         new_table(tmp_path, "retail", "missing", "events", requested_by="sales", delivery=None)
     with pytest.raises(ConfigValidationError):
         new_table(tmp_path, "retail", "orders", "bad name", requested_by="sales", delivery=None)
-    source = tmp_path / "sources/retail/orders/source.yaml"
+    source = tmp_path / "sources/orders/source.yaml"
     source.write_text(
         source.read_text("utf-8") + "  weekly:\n    schedule: '0 0 3 ? * MON'\n", "utf-8"
     )
@@ -296,7 +301,7 @@ def test_scaffold_refuses_to_overwrite_and_to_guess_a_delivery(tmp_path: Path) -
 
 
 def test_duplicate_pipeline_id_is_rejected(bundle: Path) -> None:
-    folder = bundle / "sources" / "finance" / "billing"
+    folder = bundle / "sources" / "billing" / "billing"
     shutil.copy(folder / "billing_invoices.yaml", folder / "billing_invoices_copy.yaml")
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
@@ -311,7 +316,7 @@ def test_same_target_table_in_two_pipelines_is_rejected(bundle: Path) -> None:
 
 
 def test_source_folder_without_source_yaml_is_rejected(bundle: Path) -> None:
-    (bundle / "sources" / "finance" / "billing" / "source.yaml").unlink()
+    (bundle / "sources" / "billing" / "source.yaml").unlink()
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
     assert any("source.yaml is missing" in error for error in caught.value.errors)
@@ -330,7 +335,7 @@ def test_table_must_say_who_requested_it(bundle: Path) -> None:
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
-    assert "requested_by is required" in " ".join(caught.value.errors)
+    assert "requested_by must be collections" in " ".join(caught.value.errors)
 
 
 def test_specs_under_sources_use_requested_by_not_project(bundle: Path) -> None:
@@ -352,7 +357,7 @@ def test_job_name_must_match_the_generated_job(bundle: Path) -> None:
 
 
 def _source_problems(bundle: Path, find: str, replace: str) -> str:
-    path = bundle / "sources" / "finance" / "billing" / "source.yaml"
+    path = bundle / "sources" / "billing" / "source.yaml"
     path.write_text(path.read_text("utf-8").replace(find, replace), "utf-8")
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
@@ -374,14 +379,14 @@ def test_fetch_is_refused_until_it_is_built(bundle: Path) -> None:
 
 
 def test_database_source_needs_a_foreign_catalog_and_a_schedule() -> None:
-    folder = SAMPLE / "sources" / "finance" / "erp"
+    folder = SAMPLE / "sources" / "erp"
     document = yaml.safe_load((folder / "source.yaml").read_text("utf-8"))
     assert document["foreign_catalog"] and "schedule" in document["deliveries"]["nightly"]
 
 
 def test_database_delivery_cannot_wait_for_a_file(tmp_path: Path) -> None:
-    folder = tmp_path / "sources" / "finance" / "erp"
-    shutil.copytree(SAMPLE / "sources" / "finance" / "erp", folder)
+    folder = tmp_path / "sources" / "erp"
+    shutil.copytree(SAMPLE / "sources" / "erp", folder)
     path = folder / "source.yaml"
     text = path.read_text("utf-8").replace('schedule: "0 0 2 * * ?"', "trigger: file_arrival")
     path.write_text(text, "utf-8")
@@ -391,7 +396,7 @@ def test_database_delivery_cannot_wait_for_a_file(tmp_path: Path) -> None:
 
 
 def test_spec_shape_must_match_the_source_kind(bundle: Path) -> None:
-    folder = bundle / "sources" / "finance" / "legacy"
+    folder = bundle / "sources" / "legacy"
     folder.mkdir()
     (folder / "source.yaml").write_text(
         LEGACY_SOURCE.replace("cloud_files", "sftp_files").replace(
@@ -400,19 +405,166 @@ def test_spec_shape_must_match_the_source_kind(bundle: Path) -> None:
         + "raw_volume: {schema: legacy_raw, volume: landing}\n",
         "utf-8",
     )
-    (folder / "legacy_credits.yaml").write_text(LEGACY_SPEC, "utf-8")
+    project = folder / "legacy"
+    project.mkdir()
+    (project / "legacy_credits.yaml").write_text(LEGACY_SPEC, "utf-8")
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
     assert any("a sftp_files source loads with volume_files" in e for e in caught.value.errors)
 
 
 def test_table_in_the_wrong_source_folder_is_rejected(bundle: Path) -> None:
-    folder = bundle / "sources" / "finance" / "billing"
-    other = bundle / "sources" / "finance" / "ledger"
+    folder = bundle / "sources" / "billing"
+    other = bundle / "sources" / "ledger"
     other.mkdir()
     text = (folder / "source.yaml").read_text(encoding="utf-8").replace("billing", "ledger")
     (other / "source.yaml").write_text(text, encoding="utf-8")
-    shutil.copy(folder / "billing_invoices.yaml", other / "ledger_invoices.yaml")
+    project = other / "billing"
+    project.mkdir()
+    shutil.copy(folder / "billing" / "billing_invoices.yaml", project / "ledger_invoices.yaml")
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
     assert any("pipeline_id must start with ledger_" in error for error in caught.value.errors)
+
+
+class _Frame:
+    def __init__(self, reader: "_Reader") -> None:
+        self.reader = reader
+
+    def filter(self, where: str) -> "_Frame":
+        self.reader.wheres.append(where)
+        return self
+
+    def selectExpr(self, *_parts: str) -> "_Frame":
+        return self
+
+
+class _Reader:
+    def __init__(self) -> None:
+        self.options: dict[str, str] = {}
+        self.loads = 0
+        self.wheres: list[str] = []
+
+    def format(self, name: str) -> "_Reader":
+        self.format_name = name
+        return self
+
+    def option(self, key: str, value: str) -> "_Reader":
+        self.options[key] = value
+        return self
+
+    def load(self, path: str) -> _Frame:
+        self.loads += 1
+        self.path = path
+        return _Frame(self)
+
+    def table(self, name: str) -> _Frame:
+        return _Frame(self)
+
+
+class _Spark:
+    def __init__(self) -> None:
+        self.readStream = _Reader()
+        self.read = _Reader()
+
+
+class _Pipelines:
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    def _decorate(self, name: str):
+        self.names.append(name)
+
+        def decorate(func):
+            func()
+            return func
+
+        return decorate
+
+    def table(self, **kwargs):
+        return self._decorate(kwargs["name"])
+
+    def temporary_view(self, **kwargs):
+        return self._decorate(kwargs["name"])
+
+    def materialized_view(self, **kwargs):
+        return self._decorate(kwargs["name"])
+
+    def create_streaming_table(self, **kwargs):
+        self.names.append(kwargs["name"])
+
+    def create_auto_cdc_flow(self, **kwargs):
+        self.cdc = kwargs
+
+    def create_auto_cdc_from_snapshot_flow(self, **kwargs):
+        self.snapshot = kwargs
+
+
+def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) -> None:
+    generate(bundle)
+    assert 'build_pipeline("billing_invoices")' in (
+        bundle / "pipelines" / "billing_daily.py"
+    ).read_text("utf-8")
+    refresh = _tasks(bundle)["refresh_pipeline"]["pipeline_task"]["pipeline_id"]
+    assert refresh == "${resources.pipelines.billing_daily_pipeline.id}"
+
+    (system,) = load_sources(bundle)
+    config = system.tables[0].config
+    rows = object_rows(config)
+    flows = {row["full_name"]: row for row in rows if row["object_kind"] == "flow"}
+    assert set(flows) == {
+        "billing_invoices.raw",
+        "billing_invoices.bronze",
+        "billing_invoices.quarantine",
+    }
+    assert flows["billing_invoices.raw"]["relation"] == "reads"
+    assert json.loads(flows["billing_invoices.raw"]["config_json"])["path"].endswith(
+        "/billing_raw/landing/invoices/"
+    )
+    assert any(
+        row["object_kind"] == "dataflow" and row["full_name"] == "billing_invoices" for row in rows
+    )
+    securables = {
+        row["full_name"]
+        for row in rows
+        if row["object_kind"] in {"table", "streaming_table", "materialized_view"}
+    }
+    assert not any("billing_raw" in name for name in securables)
+    assert any(name.endswith("billing_bronze.invoices") for name in securables)
+    assert any(name.endswith("billing_quarantine.invoices") for name in securables)
+    (job,) = workflow_rows([config])
+    assert job["object_kind"] == "workflow" and job["full_name"] == "billing_daily"
+    assert json.loads(job["config_json"])["pipeline_ids"] == ["billing_invoices"]
+
+    spark, pipelines = _Spark(), _Pipelines()
+    build_pipeline("billing_invoices", spark=spark, pipelines=pipelines, config=config)
+    assert spark.readStream.loads == 1
+    assert spark.readStream.format_name == "cloudFiles"
+    assert "billing_invoices_landing" in pipelines.names
+    assert any("amount >= 0" in where for where in spark.readStream.wheres)
+    assert any(where.startswith("NOT (") for where in spark.readStream.wheres)
+
+    _add_table(bundle, "credits", "billing")
+    configs = [table.config for table in load_sources(bundle)[0].tables]
+    (job,) = workflow_rows(configs)
+    assert json.loads(job["config_json"])["pipeline_ids"] == ["billing_credits", "billing_invoices"]
+
+
+def test_a_spec_with_no_project_sits_next_to_source_yaml(bundle: Path) -> None:
+    source = bundle / "sources" / "billing"
+    text = (source / "billing" / "billing_invoices.yaml").read_text("utf-8")
+    text = text.replace("requested_by: billing\n", "")
+    text = text.replace("billing_invoices", "billing_reference")
+    text = text.replace("table: invoices", "table: reference")
+    text = text.replace("raw_path: invoices/", "raw_path: reference/")
+    (source / "billing_reference.yaml").write_text(text, "utf-8")
+    (system,) = load_sources(bundle)
+    plain = next(
+        table for table in system.tables if table.config.pipeline_id == "billing_reference"
+    )
+    assert plain.requested_by == ""
+    text = text.replace("data:", "requested_by: billing\ndata:")
+    (source / "billing_reference.yaml").write_text(text, "utf-8")
+    with pytest.raises(ConfigValidationError) as caught:
+        load_sources(bundle)
+    assert "belongs in billing/billing/" in " ".join(caught.value.errors)

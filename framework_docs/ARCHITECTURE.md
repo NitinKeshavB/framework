@@ -1,20 +1,13 @@
 # Architecture
 
-## The repository this replaces
-
-`JLLT-EDP-Ingestion-develop.zip` is about 445 entries. It has 39 `setup.py` files and 32 directories under `eif_readers/`. `plugin_discovery.py` is 864 lines and mixes entry points, a filesystem scan, and `sys.path` changes. The same dataclass template is copied in `eif_config_manager/templates/`, `eif_utils/ingestion/templates/`, and `ingestion/templates/`. There is no declarative pipeline, no bronze or quarantine layer, and no metadata tables.
-
-The Auto Loader format checks and option map are kept: format allow-list, a positive `max_files_per_trigger`, a required CSV delimiter, Excel `header_rows` of 0 or 1, a required Excel `data_address`, Excel schema evolution left off, and the `cloudFiles` options for format, existing files, type inference, overwrites, file and byte limits, rescue on permissive text, header, delimiter, and path glob. Checkpoint path and `cloudFiles.schemaLocation` are not kept.
-
 ## Layout
 
-Folders at the repository root start with `framework_`. Four are bundles or hold bundles.
+Folders at the repository root start with `framework_`.
 
 - `framework_src` is the wheel. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`.
-- `framework_sql` is the registry DDL.
-- `framework_bundle` is the platform bundle: the DDL job, the collector, and daily `OPTIMIZE`.
-- `framework_ingestion` is the ingestion bundle: source systems, their table specs, and the pipelines and jobs generated from them.
-- `framework_projects/<domain>/<project>` is one bundle per project for silver and gold.
+- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql`, the DDL job, the collector, and daily `OPTIMIZE`.
+- `framework_ingestion` is source to bronze: source systems, table specs, and the pipelines and jobs generated from them.
+- `framework_curation/<domain>/<project>` is one bundle per project for silver, gold, and data products.
 - `framework_examples/consumer` is the original single-bundle example. It uses the `cloud_files` shape and is reference only.
 - `framework_tests` runs without Spark.
 - `framework_docs` is this documentation.
@@ -107,14 +100,15 @@ erDiagram
 
 | Kind | `full_name` | Parent | `relation` | What `config_json` holds |
 | --- | --- | --- | --- | --- |
-| `workflow` | `job_name` | none | none | `pipeline_id` |
+| `workflow` | `job_name` | none | none | Every `pipeline_id` in that job |
 | `pipeline` | `pipeline_id` | `job_name` when set | `owns` | Canonical spec and compiled rules |
-| `flow` | `<pipeline_id>.raw`, `.bronze`, `.quarantine` (no `.raw` without a raw table) | pipeline | `writes` or `rejects_to` | Table name and layer |
+| `dataflow` | `pipeline_id` | the pipeline | `contains` | Raw layer, bronze table, and quarantine table |
+| `flow` | `<pipeline_id>.raw`, `.bronze`, `.quarantine` | the dataflow | `reads`, `writes`, or `rejects_to` | Volume path, or table name and layer |
 | `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, domain, classification, PII |
 | `link` | `<pipeline_id>-><table>` | pipeline | `writes` or `rejects_to` | Child table name |
 | `column` | `<table>.<column>` | table name | `column_of` | Ordinal, type, description, classification, PII |
 
-Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
+A file source whose raw layer is a volume still has a `raw` flow. That flow records the volume path and has no securable. A `cloud_files` raw flow has a securable, because its raw layer is a Delta table. A database load has no raw flow. Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
 
 Each object is hashed on its own document, so a job rename versions the pipeline and the workflow but not a table or column whose own fields did not change. A column hash covers ordinal, data type, description, classification, and PII. The column name is the key, so a rename is a different column. Columns are recorded for every table the pipeline writes: raw (with `_source_file` and `_ingested_at`), bronze, and quarantine (with `failed_rules`). Without a raw table, bronze and quarantine carry the lineage columns the pipeline adds.
 
@@ -157,17 +151,11 @@ flowchart TD
 
 **Quality rules are functions from config to SQL.** The template does not know how a not-null rule was produced.
 
-**The registry is two tables** because the old procedures used a system, a stream, a job, an object, two attribute tables, a relationship table, and several logs. Attributes and relationships are columns. Run steps, failure text, and reconciliation are rows in `run_ledger`.
+**The registry is two tables.** Attributes and relationships are columns on `object_registry`. Run steps, failure text, and reconciliation are rows in `run_ledger`.
+
+**Auto Loader options are a fixed map.** A format allow-list, a positive `max_files_per_trigger`, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`.
 
 Lakeflow Connect is how SharePoint, and later other managed sources, will reach the raw volume or bronze. See the [roadmap](ROADMAP.md).
-
-## Migration
-
-Keep, rewritten small: the Auto Loader checks and option map above.
-
-Retire: the 39 per-handler packages, entry-point discovery, and the copied dataclass templates.
-
-Do not copy into this package: the writers, the API handlers, the batchfile deploy tooling, or the `sys.path` changes.
 
 ## Behaviour that still needs a workspace
 

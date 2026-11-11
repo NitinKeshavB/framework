@@ -13,7 +13,7 @@ from lakeflow_framework.projects import INDEX_NAME, MAP_NAME, generate, load_pro
 
 REPO = Path(__file__).resolve().parents[1]
 INGESTION = REPO / "framework_ingestion"
-PROJECTS = REPO / "framework_projects"
+PROJECTS = REPO / "framework_curation"
 
 
 @pytest.fixture()
@@ -57,6 +57,8 @@ def test_map_shows_upstream_bronze_with_who_requested_it(root: Path) -> None:
     text = (root / "finance/billing_reporting" / MAP_NAME).read_text("utf-8")
     assert "`erp.orders` (bronze, nightly delivery, requested by billing)" in text
     assert "`headcount_reporting.silver.headcount_clean` (project headcount_reporting)" in text
+    assert "## Data products" in text
+    assert "| revenue |" in text
     other = (root / "people/headcount_reporting" / MAP_NAME).read_text("utf-8")
     assert "billing_reporting.gold.people_cost" not in other
     assert "`headcount_reporting.silver.headcount_clean` is used by billing_reporting" in other

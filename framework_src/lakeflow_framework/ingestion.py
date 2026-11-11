@@ -2,12 +2,13 @@
 
 Layout under ``<bundle>/sources``::
 
-    <domain>/<source_system>/source.yaml     source kind, owner, deliveries
-    <domain>/<source_system>/<table>.yaml    one spec per table, from any team
+    <source_system>/source.yaml                 kind, owner, deliveries
+    <source_system>/<table>.yaml                a spec with no project
+    <source_system>/<project>/<table>.yaml      a spec that project is bringing in
 
-A spec names its ``delivery`` (optional when the source has one) and ``requested_by``
-(the team or project that asked for the file). The map is derived only from these files, so it
-cannot disagree with what is deployed. No cluster is used.
+``requested_by`` matches the project folder. A spec directly under the source system omits it.
+The map is derived only from these files, so it cannot disagree with what is deployed. No
+cluster is used.
 """
 
 from __future__ import annotations
@@ -81,20 +82,23 @@ def load_sources(bundle: Path) -> list[SourceSystem]:
         raise ConfigValidationError([f"{root} does not exist"])
     systems: list[SourceSystem] = []
     spec_files: list[tuple[SourceSystem, Path]] = []
-    for source_file in sorted(root.glob(f"*/*/{SOURCE_FILE}")):
-        folder = source_file.parent
-        system = _read_source(source_file, folder.parent.name, folder.name, errors)
+    system_dirs = sorted(path for path in root.iterdir() if path.is_dir())
+    for folder in system_dirs:
+        source_file = folder / SOURCE_FILE
+        if not source_file.is_file():
+            errors.append(f"{folder}: {SOURCE_FILE} is missing; add it before adding tables")
+            continue
+        system = _read_source(source_file, folder.name, errors)
         if system is None:
             continue
         systems.append(system)
         spec_files.extend((system, path) for path in _spec_files(folder))
-    for folder in sorted(path for path in root.glob("*/*") if path.is_dir()):
-        if not (folder / SOURCE_FILE).exists():
-            errors.append(f"{folder}: {SOURCE_FILE} is missing; add it before adding tables")
+        for project in sorted(path for path in folder.iterdir() if path.is_dir()):
+            spec_files.extend((system, path) for path in _spec_files(project))
 
-    for path in [item.parent / SOURCE_FILE for item in root.glob(f"*/*/{SOURCE_FILE}")] + [
-        path for _, path in spec_files
-    ]:
+    for path in [
+        folder / SOURCE_FILE for folder in system_dirs if (folder / SOURCE_FILE).is_file()
+    ] + [path for _, path in spec_files]:
         if "TODO" in path.read_text(encoding="utf-8"):
             errors.append(f"{path}: replace every TODO before generating")
     if spec_files:
@@ -137,7 +141,8 @@ def render_map(systems: list[SourceSystem]) -> str:
     for name in sorted(requesters):
         tables = requesters[name]
         sources = sorted({table.config.source_system for table in tables})
-        lines.append(f"| {name} | {len(tables)} | {', '.join(sources)} |")
+        label = name or "—"
+        lines.append(f"| {label} | {len(tables)} | {', '.join(sources)} |")
     for system in sorted(systems, key=lambda item: (item.domain, item.name)):
         lines += _system_section(system)
     return "\n".join(lines) + "\n"
@@ -226,10 +231,7 @@ def _pipeline_resource(name: str) -> dict[str, Any]:
 def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]) -> dict[str, Any]:
     name = f"{system.name}_{delivery}"
     configs = [table.config for table in tables]
-    spec_paths = [
-        f"${{workspace.file_path}}/sources/{system.domain}/{system.name}/{table.path.name}"
-        for table in tables
-    ]
+    spec_paths = ["${workspace.file_path}/" + _spec_rel(table.path) for table in tables]
     batch_paths = [
         path
         for path, config in zip(spec_paths, configs)
@@ -329,7 +331,7 @@ def _yaml(document: dict[str, Any]) -> str:
     return f"{GENERATED}\n{body}"
 
 
-def _read_source(path: Path, domain: str, name: str, errors: list[str]) -> SourceSystem | None:
+def _read_source(path: Path, name: str, errors: list[str]) -> SourceSystem | None:
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
@@ -341,8 +343,9 @@ def _read_source(path: Path, domain: str, name: str, errors: list[str]) -> Sourc
         return None
     if document.get("source_system") != name:
         found.append(f"{path}: source_system must be {name}, the folder name")
-    if document.get("domain") != domain:
-        found.append(f"{path}: domain must be {domain}, the folder name")
+    domain = str(document.get("domain") or "")
+    if not IDENTIFIER.match(domain):
+        found.append(f"{path}: domain must be an identifier")
     owner = str(document.get("owner") or "")
     if not EMAIL.match(owner):
         found.append(f"{path}: owner must be an email address")
@@ -409,6 +412,19 @@ def _read_source(path: Path, domain: str, name: str, errors: list[str]) -> Sourc
     )
 
 
+def _project_folder(path: Path) -> str | None:
+    """The project directory a spec is in, or none when it sits next to source.yaml."""
+
+    if (path.parent / SOURCE_FILE).is_file():
+        return None
+    return path.parent.name
+
+
+def _spec_rel(path: Path) -> str:
+    parts = path.parts
+    return "/".join(parts[parts.index("sources") :])
+
+
 def _spec_files(folder: Path) -> list[Path]:
     return sorted(
         path for path in [*folder.glob("*.yaml"), *folder.glob("*.yml")] if path.name != SOURCE_FILE
@@ -430,10 +446,16 @@ def _attach(
                 f"this folder holds {system.name}"
             )
         requested_by = str(document.get("requested_by") or "")
-        if not IDENTIFIER.match(requested_by):
-            errors.append(f"{path}: requested_by must name the team or project that asked for it")
+        project = _project_folder(path)
         if document.get("project") and not document.get("requested_by"):
             errors.append(f"{path}: project is replaced by requested_by in specs under sources/")
+        elif project is None and requested_by:
+            errors.append(
+                f"{path}: requested_by belongs in {system.name}/{requested_by}/, "
+                "not next to source.yaml"
+            )
+        elif project is not None and requested_by != project:
+            errors.append(f"{path}: requested_by must be {project}, the folder the spec is in")
         delivery = str(document.get("delivery") or "")
         if not delivery and len(system.deliveries) == 1:
             delivery = next(iter(system.deliveries))
@@ -500,7 +522,7 @@ def _system_section(system: SourceSystem) -> list[str]:
     for table in sorted(system.tables, key=lambda item: item.config.pipeline_id):
         config = table.config
         lines.append(
-            f"| {config.pipeline_id} | {table.delivery} | {table.requested_by} | "
+            f"| {config.pipeline_id} | {table.delivery} | {table.requested_by or '—'} | "
             f"{_reads(config)} | {config.load_method} | "
             f"{config.bronze_schema}.{config.bronze_table} | "
             f"{config.technical_owner} |"
@@ -511,7 +533,7 @@ def _system_section(system: SourceSystem) -> list[str]:
     for table in sorted(system.tables, key=lambda item: item.config.pipeline_id):
         config = table.config
         lines.append(
-            f"  {_node(system.name, table.delivery)} -->|{table.requested_by}| "
+            f"  {_node(system.name, table.delivery)} -->|{table.requested_by or system.name}| "
             f"{_node(config.pipeline_id)}[{config.pipeline_id}]"
         )
         bronze = _node(config.bronze_schema, config.bronze_table)
@@ -533,7 +555,7 @@ def new_source(
         raise ConfigValidationError([f"kind must be one of {', '.join(KINDS)}"])
     if not EMAIL.match(owner):
         raise ConfigValidationError(["owner must be an email address"])
-    target = bundle / "sources" / domain / source_system / SOURCE_FILE
+    target = bundle / "sources" / source_system / SOURCE_FILE
     if target.exists():
         raise ConfigValidationError([f"{target} already exists"])
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -568,14 +590,15 @@ def new_table(
     source_system: str,
     table: str,
     *,
-    requested_by: str,
+    requested_by: str | None,
     delivery: str | None,
 ) -> Path:
-    """Create a table spec in the source system's folder, ready to edit."""
+    """Create a table spec under the project, or next to source.yaml when there is no project."""
 
     _names({"domain": domain, "source_system": source_system, "table": table})
-    _names({"requested_by": requested_by})
-    folder = bundle / "sources" / domain / source_system
+    if requested_by:
+        _names({"requested_by": requested_by})
+    folder = bundle / "sources" / source_system
     source_file = folder / SOURCE_FILE
     if not source_file.exists():
         raise ConfigValidationError(
@@ -594,7 +617,9 @@ def new_table(
     elif delivery not in deliveries:
         raise ConfigValidationError([f"delivery must be one of {', '.join(deliveries)}"])
     owner = str(found.get("owner") or "TODO@example.com")
-    target = folder / f"{source_system}_{table}.yaml"
+    target_dir = folder / requested_by if requested_by else folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{source_system}_{table}.yaml"
     if target.exists():
         raise ConfigValidationError([f"{target} already exists"])
     kind = str(found.get("kind") or "")
@@ -609,7 +634,8 @@ def new_table(
             table=table,
             domain=domain,
             owner=owner,
-            requested_by=requested_by,
+            requested_by=requested_by or source_system,
+            requested_by_line=(f"requested_by: {requested_by}\n" if requested_by else ""),
             delivery=delivery,
         ),
         encoding="utf-8",
@@ -626,8 +652,7 @@ technical_owner: {owner}
 layer: bronze
 job_name: {source}_{delivery}
 delivery: {delivery}
-requested_by: {requested_by}
-
+{requested_by_line}
 data:
   classification: internal
 
@@ -667,8 +692,7 @@ technical_owner: {owner}
 layer: bronze
 job_name: {source}_{delivery}
 delivery: {delivery}
-requested_by: {requested_by}
-
+{requested_by_line}
 data:
   classification: internal
 
@@ -702,8 +726,7 @@ technical_owner: {owner}
 layer: bronze
 job_name: {source}_{delivery}
 delivery: {delivery}
-requested_by: {requested_by}
-
+{requested_by_line}
 data:
   classification: internal
 

@@ -1,0 +1,48 @@
+pipeline_id: abs_invoices
+domain: property
+data_domain: invoices
+team: fdh
+technical_owner: abs.owner@jll.com
+layer: bronze
+job_name: abs_daily
+delivery: daily
+requested_by: fdh
+
+data:
+  classification: confidential
+  pii:
+    - pii_finance
+
+source:
+  raw_path: invoices/
+  format: csv
+  delimiter: ","
+  header: true
+
+raw_to_bronze:
+  bronze:
+    schema: abs_bronze
+    table: invoices
+  dedup: true
+  primary_keys:
+    - invoice_id
+  watermark_column: updated_at
+  columns:
+    - name: invoice_id
+      type: string
+      description: Invoice identifier
+    - name: amount
+      type: decimal(18,2)
+      description: Invoice amount
+      pii:
+        - pii_finance
+    - name: updated_at
+      type: timestamp
+      description: When the source last updated the invoice
+  rules:
+    - name: amount_non_negative
+      expression: amount >= 0
+
+quarantine:
+  schema: abs_quarantine
+  table: invoices

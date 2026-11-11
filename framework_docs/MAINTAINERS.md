@@ -6,7 +6,7 @@ The version in [framework_src/pyproject.toml](../framework_src/pyproject.toml) i
 
 The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `object_registry` row.
 
-The registry DDL is create-only: `CREATE ... IF NOT EXISTS` for the schema, volume, and tables, and `CREATE OR REPLACE VIEW` for the views. It has no `ALTER`. Nothing has been deployed yet, so the columns are the first version. Once a catalog holds data, a column change is a migration with a plan for existing rows, and it needs its own reviewed script, not an edit to this file.
+The registry DDL in `framework_bundle/sql/framework_meta.sql` is create-only: `CREATE ... IF NOT EXISTS` for the schema, volume, and tables, and `CREATE OR REPLACE VIEW` for the views. It has no `ALTER`. Nothing has been deployed yet, so the columns are the first version. Once a catalog holds data, a column change is a migration with a plan for existing rows, and it needs its own reviewed script, not an edit dropped into that file.
 
 ## Deploy
 
@@ -34,7 +34,6 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 - Do not weaken the ownership check. The collector must keep refusing a pipeline or table another owner holds.
 - Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines. The collector is the exception: its checkpoint is under the events volume because it is a job.
 - Do not schedule a `VACUUM` that shortens retention.
-- Do not port the old SQL Server `tfm_*` procedures. Load strategies and pipeline datasets replace them.
 - Do not create a table or schema in a spec's name from a pipeline. Schemas and volumes are prepared outside the framework.
 
 ## Adding a source kind

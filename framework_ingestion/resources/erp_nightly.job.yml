@@ -47,8 +47,8 @@ resources:
           python_file: ../src/run_cli.py
           parameters:
           - sync
-          - ${workspace.file_path}/sources/finance/erp/erp_customers.yaml
-          - ${workspace.file_path}/sources/finance/erp/erp_orders.yaml
+          - ${workspace.file_path}/sources/erp/erp/erp_customers.yaml
+          - ${workspace.file_path}/sources/erp/billing/erp_orders.yaml
           - --catalog
           - ${var.catalog}
           - --out

@@ -64,32 +64,34 @@ function new-source {
 }
 
 # create a table spec in the right folder, from a template:
-# ./run.sh new-table <domain> <source_system> <table> <requested-by> [delivery]
+# ./run.sh new-table <domain> <source_system> <table> [requested-by] [delivery]
 function new-table {
+    local requested_args=()
     local delivery_args=()
+    [ -n "${4:-}" ] && requested_args=(--requested-by "$4")
     [ -n "${5:-}" ] && delivery_args=(--delivery "$5")
     "$PYTHON" -m lakeflow_framework.cli new-table "$THIS_DIR/framework_ingestion" \
-        "${1:?usage: ./run.sh new-table <domain> <source_system> <table> <requested-by> [delivery]}" \
+        "${1:?usage: ./run.sh new-table <domain> <source_system> <table> [requested-by] [delivery]}" \
         "${2:?source_system is required}" "${3:?table is required}" \
-        --requested-by "${4:?requested-by is required}" "${delivery_args[@]}"
+        "${requested_args[@]}" "${delivery_args[@]}"
 }
 
 # validate every project against the ingestion bundle and the other projects, then rewrite
-# framework_projects/PROJECTS_INDEX.md and each project's PROJECT_MAP.md
+# framework_curation/PROJECTS_INDEX.md and each project's PROJECT_MAP.md
 function projects:generate {
-    "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_projects" \
+    "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
         --sources "$THIS_DIR/framework_ingestion"
 }
 
 # fail if a project map is out of date (for CI); changes nothing
 function projects:check {
-    "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_projects" \
+    "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
         --sources "$THIS_DIR/framework_ingestion" --check
 }
 
 # create a project folder with its bundle file: ./run.sh new-project <domain> <project> <owner-email>
 function new-project {
-    "$PYTHON" -m lakeflow_framework.cli projects new "$THIS_DIR/framework_projects" \
+    "$PYTHON" -m lakeflow_framework.cli projects new "$THIS_DIR/framework_curation" \
         --domain "${1:?usage: ./run.sh new-project <domain> <project> <owner-email>}" \
         --project "${2:?project is required}" --owner "${3:?owner email is required}"
 }
@@ -101,7 +103,7 @@ function generate:check {
 
 # validate a bundle: ./run.sh bundle:validate <bundle> <target> [databricks-profile]
 # <bundle> is a folder with a databricks.yml: framework_bundle, framework_ingestion, or
-# framework_projects/<domain>/<project>
+# framework_curation/<domain>/<project>
 function bundle:validate {
     local bundle="${1:?usage: ./run.sh bundle:validate <bundle> <target> [databricks-profile]}"
     local target="${2:?usage: ./run.sh bundle:validate <bundle> <target> [databricks-profile]}"
@@ -130,14 +132,14 @@ function bundle:deploy {
 # steps that must finish before a bundle is validated or deployed, so maps match what is deployed
 # ingestion: validate every spec, regenerate the map, pipelines, and jobs, then check that every
 #   project still finds the bronze tables it reads
-# a project (framework_projects/<domain>/<project>): validate it and regenerate the project maps
+# a project (framework_curation/<domain>/<project>): validate it and regenerate the project maps
 function _prepare-bundle {
     case "$1" in
         framework_ingestion)
             generate
             projects:generate
             ;;
-        framework_projects/*)
+        framework_curation/*)
             projects:generate
             ;;
     esac
@@ -146,7 +148,7 @@ function _prepare-bundle {
 # stop with a clear message when the folder is not a bundle
 function _require-bundle {
     if [ ! -f "$THIS_DIR/$1/databricks.yml" ]; then
-        echo "error: $1 has no databricks.yml (try framework_bundle, framework_ingestion, or framework_projects/<domain>/<project>)" >&2
+        echo "error: $1 has no databricks.yml (try framework_bundle, framework_ingestion, or framework_curation/<domain>/<project>)" >&2
         return 1
     fi
 }

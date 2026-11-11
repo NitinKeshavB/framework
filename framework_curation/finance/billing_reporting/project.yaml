@@ -3,7 +3,8 @@ domain: finance
 owner: reporting.owner@jll.com
 
 # Reference bronze as <source_system>.<table> (see SOURCE_MAP.md in framework_ingestion),
-# your own tables as silver.<name>, and another project's as <project>.silver.<name>.
+# your own tables as silver.<name> or gold.<name>, your data products as product.<name>,
+# and another project's as <project>.silver.<name> or <project>.product.<name>.
 # triggered_by fires the job once every listed table has refreshed. reads never waits.
 silver:
   invoices_clean:
@@ -19,3 +20,8 @@ gold:
   people_cost:
     triggered_by: [silver.invoices_clean]
     reads: [headcount_reporting.silver.headcount_clean]
+
+products:
+  revenue:
+    triggered_by: [gold.revenue_daily]
+    deadline: { at: "09:00", on_miss: alert }

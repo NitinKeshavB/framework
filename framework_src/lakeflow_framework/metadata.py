@@ -14,19 +14,21 @@ from lakeflow_framework.quality import compile_rules
 
 
 def ddl_text() -> str:
-    path = Path(__file__).resolve().parents[2] / "framework_sql" / "framework_meta.sql"
+    """Registry DDL. It lives in the framework bundle, next to the job that applies it."""
+
+    path = Path(__file__).resolve().parents[2] / "framework_bundle" / "sql" / "framework_meta.sql"
     return path.read_text(encoding="utf-8")
 
 
-def render_ddl(catalog: str) -> str:
+def render_ddl(catalog: str, text: str | None = None) -> str:
     if not catalog or catalog.startswith("${"):
         raise ValueError("catalog is required")
-    return ddl_text().replace("${catalog}", catalog)
+    return (ddl_text() if text is None else text).replace("${catalog}", catalog)
 
 
-def ddl_statements(catalog: str) -> list[str]:
+def ddl_statements(catalog: str, text: str | None = None) -> list[str]:
     statements: list[str] = []
-    for part in render_ddl(catalog).split(";"):
+    for part in render_ddl(catalog, text).split(";"):
         lines = [line for line in part.splitlines() if not line.strip().startswith("--")]
         statement = "\n".join(lines).strip()
         if statement:
@@ -61,6 +63,35 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             recorded,
         )
     ]
+    dataflow_json = json.dumps(_dataflow_record(config), sort_keys=True)
+    rows.append(
+        _object(
+            "dataflow",
+            pipeline_name,
+            scope,
+            pipeline_name,
+            "contains",
+            dataflow_json,
+            _digest(dataflow_json),
+            "framework",
+            recorded,
+        )
+    )
+    if config.load_method == "volume_files":
+        raw_flow = json.dumps({"layer": "raw", "path": config.path}, sort_keys=True)
+        rows.append(
+            _object(
+                "flow",
+                f"{pipeline_name}.raw",
+                scope,
+                pipeline_name,
+                "reads",
+                raw_flow,
+                _digest(raw_flow),
+                "framework",
+                recorded,
+            )
+        )
     for layer, relation in (("raw", "writes"), ("bronze", "writes"), ("quarantine", "rejects_to")):
         if layer not in config.layers:
             continue
@@ -107,23 +138,57 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 recorded,
             )
         )
-    if config.job_name:
-        workflow_json = json.dumps({"pipeline_id": pipeline_name}, sort_keys=True)
+    rows.extend(_column_rows(config, recorded))
+    return rows
+
+
+def workflow_rows(
+    configs: list[PipelineConfig], recorded_at: str | None = None
+) -> list[dict[str, Any]]:
+    """One workflow per job, listing every pipeline in that delivery."""
+
+    recorded = recorded_at or _now()
+    grouped: dict[str, list[PipelineConfig]] = {}
+    for config in configs:
+        if config.job_name:
+            grouped.setdefault(config.job_name, []).append(config)
+    rows: list[dict[str, Any]] = []
+    for job_name, group in sorted(grouped.items()):
+        payload = json.dumps(
+            {"pipeline_ids": sorted({item.pipeline_id for item in group})}, sort_keys=True
+        )
+        scope = dict(_scope(group[0]))
+        requesters = {item.requested_by for item in group}
+        if len(requesters) != 1:
+            scope["requested_by"] = None
         rows.append(
             _object(
                 "workflow",
-                config.job_name,
+                job_name,
                 scope,
                 None,
                 None,
-                workflow_json,
-                _digest(workflow_json),
+                payload,
+                _digest(payload),
                 "framework",
                 recorded,
             )
         )
-    rows.extend(_column_rows(config, recorded))
     return rows
+
+
+def _dataflow_record(config: PipelineConfig) -> dict[str, Any]:
+    if config.load_method == "volume_files":
+        raw: str | None = config.path
+    elif config.has_raw:
+        raw = config.table_name("raw")
+    else:
+        raw = None
+    return {
+        "raw": raw,
+        "bronze": config.table_name("bronze"),
+        "quarantine": config.table_name("quarantine"),
+    }
 
 
 def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any]]:

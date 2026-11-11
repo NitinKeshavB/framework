@@ -23,8 +23,10 @@ from lakeflow_framework.metadata import (
 from lakeflow_framework.pipeline import MetadataNotFound
 
 
-def apply_ddl(spark, catalog: str) -> None:
-    for statement in ddl_statements(catalog):
+def apply_ddl(spark, catalog: str, text: str | None = None) -> None:
+    """Apply registry DDL. ``text`` is the bundle's SQL file when the job runs on a cluster."""
+
+    for statement in ddl_statements(catalog, text):
         if statement.upper().startswith("CREATE BLOOMFILTER"):
             try:
                 spark.sql(statement)

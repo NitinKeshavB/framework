@@ -34,16 +34,18 @@ Rows that fail a quality rule go to a quarantine table beside bronze.
 ```
 framework_ingestion/
   databricks.yml
-  sources/<domain>/<source_system>/        you edit these
+  sources/<source_system>/                 you edit these
     source.yaml                            kind, owner, raw volume or foreign catalog, deliveries
-    <source_system>_<table>.yaml           one spec per table, from any team
+    <source_system>_<table>.yaml           a spec with no project
+    <project>/
+      <source_system>_<table>.yaml         a spec that project is bringing in
   src/                                     entry points the jobs call
   SOURCE_MAP.md                            generated
   pipelines/<source_system>_<delivery>.py  generated
   resources/<source_system>_<delivery>.pipeline.yml and .job.yml   generated
 ```
 
-Several teams can add tables to one source system. A table spec says which `delivery` it arrives with (optional when the source has one) and `requested_by`, the team that asked for it. A table is registered once. A second team that needs the same table reads the existing bronze table and does not add a copy.
+The first folder is the source system. The child folder is the project bringing the table in, and it matches `requested_by`. When there is no project, paste the spec next to `source.yaml` and omit `requested_by`. A table is registered once. A second project that needs the same table reads the existing bronze table and does not add a copy.
 
 ## What a spec holds
 
@@ -99,7 +101,7 @@ The framework does not create these. The domain makes sure they exist before a d
 
 Bronze is owned by the **source system**. The registry stores `owner_kind = source_system` and `owner = <source system>` on every row, with `requested_by` (the team that asked for the table) and `delivery` beside it. A table has one owner, and the collector refuses a second owner's registration and records a failed `ownership_check` step. The team that asked for a table never owns it. Query the registry with an `owner` filter.
 
-`requested_by` replaces the old `project` field. A spec under `sources/` that has `project:` and no `requested_by:` is rejected.
+`requested_by` is the project folder. Omit it only when the spec sits next to `source.yaml`. A spec that says `project:` instead of `requested_by:` is rejected.
 
 ## Getting files into the raw volume
 

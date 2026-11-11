@@ -4,8 +4,8 @@ The repository overview is [../README.md](../README.md). This page is every file
 
 | File | Who writes it | Where |
 | --- | --- | --- |
-| `source.yaml` | The source system's owner | `framework_ingestion/sources/<domain>/<source_system>/` |
-| `<source_system>_<table>.yaml` | Any team that needs a table | The same folder |
+| `source.yaml` | The source system's owner | `framework_ingestion/sources/<source_system>/` |
+| `<source_system>_<table>.yaml` | The project bringing it in, or the source itself | `sources/<source_system>/<project>/`, or next to `source.yaml` when there is no project |
 | `project.yaml` | The project | `framework_projects/<domain>/<project>/` |
 
 Check them without a cluster: `./run.sh generate` for ingestion, `./run.sh projects:generate` for projects. Both print every error in one pass.

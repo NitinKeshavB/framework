@@ -1,0 +1,37 @@
+pipeline_id: drops_history
+domain: markets
+data_domain: history
+team: drops
+technical_owner: drops.owner@jll.com
+layer: bronze
+job_name: drops_landing
+delivery: landing
+
+data:
+  classification: internal
+
+source_to_raw:
+  method: copy_into
+  source:
+    system: drops
+    format: json
+    path: abfss://landing@storage.dfs.core.windows.net/drops/history/
+  raw:
+    schema: drops_raw
+    table: history
+
+raw_to_bronze:
+  bronze:
+    schema: drops_bronze
+    table: history
+  columns:
+    - name: drop_id
+      type: string
+      description: Drop identifier
+    - name: status
+      type: string
+      description: Drop status
+
+quarantine:
+  schema: drops_quarantine
+  table: history

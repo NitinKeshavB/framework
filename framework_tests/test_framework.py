@@ -244,7 +244,6 @@ def test_validation_reports_every_error():
             }
         )
     text = "\n".join(caught.value.errors)
-    assert "requested_by is required" in text
     assert "excel cannot use copy_into" in text
     assert "abfss:// or s3://" in text
     assert "dedup requires" in text

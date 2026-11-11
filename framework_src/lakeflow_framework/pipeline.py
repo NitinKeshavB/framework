@@ -223,9 +223,13 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
             return spark.read.table(raw.name)
         return spark.readStream.table(raw.name)
 
+    landing_name = f"{config.pipeline_id}_landing"
+
     def _read_stored() -> Any:
         """What quarantine and bronze read: the raw table, or the source itself."""
 
+        if config.load_method == "volume_files":
+            return spark.readStream.table(landing_name)
         if raw is None:
             return _read_origin()
         if config.is_batch:
@@ -241,9 +245,15 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
             )
         return frame.selectExpr("*", "current_timestamp() AS _ingested_at")
 
+    if config.load_method == "volume_files":
+
+        @pipelines.temporary_view(name=landing_name)
+        def _landing() -> Any:
+            return _lineage(_read_files())
+
     @pipelines.temporary_view(name=valid.name)
     def _valid() -> Any:
-        frame = _lineage(_read_origin())
+        frame = _read_stored() if config.load_method == "volume_files" else _lineage(_read_origin())
         if hasattr(frame, "filter"):
             return frame.filter(pass_where)
         return {"view": valid.name, "where": pass_where, "frame": frame}
@@ -252,7 +262,10 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
     @quarantine_kind(name=quarantine.name)
     def _quarantine() -> Any:
-        return _filtered(_lineage(_read_stored()), fail_where, failed_rules)
+        frame = _read_stored()
+        if config.load_method != "volume_files":
+            frame = _lineage(frame)
+        return _filtered(frame, fail_where, failed_rules)
 
     if bronze.relation == "auto_cdc":
         pipelines.create_streaming_table(name=bronze.name)

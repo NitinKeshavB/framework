@@ -1,0 +1,10 @@
+source_system: drops
+domain: markets
+owner: drops.owner@jll.com
+kind: cloud_files
+
+# Files on ADLS or S3. Each table lands in a raw table, then bronze.
+deliveries:
+  landing:
+    trigger: file_arrival
+    path: abfss://landing@storage.dfs.core.windows.net/drops/

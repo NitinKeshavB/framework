@@ -4,7 +4,7 @@ The whole path in this repository, from a spec to a registry row. A team adding 
 
 ## What a team does
 
-1. Add a table spec under `framework_ingestion/sources/<domain>/<source_system>/`. `./run.sh new-table` writes it from a template. A new source system needs its `source.yaml` first (`./run.sh new-source`).
+1. Add a table spec under `framework_ingestion/sources/<source_system>/<project>/`, or directly under `sources/<source_system>/` when no project is bringing it in. `./run.sh new-table` writes it from a template. A new source system needs its `source.yaml` first (`./run.sh new-source`).
 2. Replace every `TODO`, then run `./run.sh generate`.
 3. Open a pull request. The source system's owner reviews it, since every table in a delivery shares one pipeline.
 4. Silver and gold: add the table to a project's `project.yaml` and run `./run.sh projects:generate`.

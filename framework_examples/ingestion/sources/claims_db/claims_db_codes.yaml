@@ -1,0 +1,32 @@
+pipeline_id: claims_db_codes
+domain: claims
+data_domain: codes
+team: claims
+technical_owner: claims.owner@jll.com
+layer: bronze
+job_name: claims_db_nightly
+delivery: nightly
+
+data:
+  classification: internal
+
+# snapshot replaces bronze with the source table on every run.
+source:
+  table: ref.codes
+  mode: snapshot
+
+raw_to_bronze:
+  bronze:
+    schema: claims_db_bronze
+    table: codes
+  columns:
+    - name: code
+      type: string
+      description: Claim code
+    - name: label
+      type: string
+      description: Claim code label
+
+quarantine:
+  schema: claims_db_quarantine
+  table: codes

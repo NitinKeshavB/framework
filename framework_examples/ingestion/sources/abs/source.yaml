@@ -1,0 +1,13 @@
+source_system: abs
+domain: property
+owner: abs.owner@jll.com
+kind: sftp_files
+
+# Files land in this volume as delivered. Bronze reads them from here.
+raw_volume:
+  schema: abs_raw
+  volume: landing
+
+deliveries:
+  daily:
+    trigger: file_arrival

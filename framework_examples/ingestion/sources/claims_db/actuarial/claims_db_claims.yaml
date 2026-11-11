@@ -1,0 +1,40 @@
+pipeline_id: claims_db_claims
+domain: claims
+data_domain: claims
+team: actuarial
+technical_owner: claims.owner@jll.com
+layer: bronze
+job_name: claims_db_nightly
+delivery: nightly
+requested_by: actuarial
+
+data:
+  classification: confidential
+  pii:
+    - pii_basic
+
+# merge keeps bronze in step with the source on primary_keys.
+source:
+  table: dbo.claims
+  mode: merge
+
+raw_to_bronze:
+  bronze:
+    schema: claims_db_bronze
+    table: claims
+  primary_keys:
+    - claim_id
+  columns:
+    - name: claim_id
+      type: string
+      description: Claim identifier
+    - name: status
+      type: string
+      description: Claim status
+  rules:
+    - name: known_status
+      expression: status IN ('open', 'closed')
+
+quarantine:
+  schema: claims_db_quarantine
+  table: claims

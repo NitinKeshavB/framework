@@ -47,7 +47,7 @@ resources:
           python_file: ../src/run_cli.py
           parameters:
           - sync
-          - ${workspace.file_path}/sources/people/hr_docs/hr_docs_headcount.yaml
+          - ${workspace.file_path}/sources/hr_docs/hr/hr_docs_headcount.yaml
           - --catalog
           - ${var.catalog}
           - --out

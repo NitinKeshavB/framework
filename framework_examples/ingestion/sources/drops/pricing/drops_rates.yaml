@@ -1,0 +1,43 @@
+pipeline_id: drops_rates
+domain: markets
+data_domain: rates
+team: pricing
+technical_owner: drops.owner@jll.com
+layer: bronze
+job_name: drops_landing
+delivery: landing
+requested_by: pricing
+
+data:
+  classification: confidential
+
+source_to_raw:
+  method: autoloader
+  source:
+    system: drops
+    format: csv
+    path: abfss://landing@storage.dfs.core.windows.net/drops/rates/
+    delimiter: ","
+    header: true
+  raw:
+    schema: drops_raw
+    table: rates
+
+raw_to_bronze:
+  bronze:
+    schema: drops_bronze
+    table: rates
+  columns:
+    - name: rate_id
+      type: string
+      description: Rate identifier
+    - name: rate
+      type: decimal(18,6)
+      description: Quoted rate
+  rules:
+    - name: rate_positive
+      expression: rate > 0
+
+quarantine:
+  schema: drops_quarantine
+  table: rates
