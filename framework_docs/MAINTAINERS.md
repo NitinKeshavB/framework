@@ -6,7 +6,7 @@ The version in [framework_src/pyproject.toml](../framework_src/pyproject.toml) i
 
 The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `object_registry` row.
 
-The registry tables are created with `CREATE TABLE IF NOT EXISTS`, so a change to their columns does not alter a table that already exists. The owner columns replaced `project` before any deployment. Once a catalog holds data, a column change is a migration with a plan for existing rows.
+The registry DDL is create-only: `CREATE ... IF NOT EXISTS` for the schema, volume, and tables, and `CREATE OR REPLACE VIEW` for the views. It has no `ALTER`. Nothing has been deployed yet, so the columns are the first version. Once a catalog holds data, a column change is a migration with a plan for existing rows, and it needs its own reviewed script, not an edit to this file.
 
 ## Deploy
 

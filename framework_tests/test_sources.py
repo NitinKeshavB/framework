@@ -72,7 +72,9 @@ def _database_spec(mode="snapshot", extra="", table="dbo.things"):
 
 
 def _config(tmp_path: Path, source: str, name: str, spec: str, catalog="framework_dev"):
-    path = _write(tmp_path / "finance" / yaml.safe_load(source)["source_system"], source, name, spec)
+    path = _write(
+        tmp_path / "finance" / yaml.safe_load(source)["source_system"], source, name, spec
+    )
     (config,) = validate_configs([path], catalog=catalog)
     return config
 
@@ -204,7 +206,9 @@ def test_registry_rows_skip_the_raw_layer_and_round_trip(tmp_path: Path) -> None
     ):
         config = _config(tmp_path, source, name, spec)
         rows = object_rows(config)
-        tables = [row["full_name"] for row in rows if row["object_kind"].endswith(("table", "view"))]
+        tables = [
+            row["full_name"] for row in rows if row["object_kind"].endswith(("table", "view"))
+        ]
         assert len(tables) == 2 and not any("_raw." in table for table in tables)
         assert {row["full_name"] for row in rows if row["object_kind"] == "flow"} == {
             f"{config.pipeline_id}.bronze",

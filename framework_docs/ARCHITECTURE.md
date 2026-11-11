@@ -48,6 +48,99 @@ flowchart LR
   bronze --> silver[project silver and gold]
 ```
 
+## Registry, physical
+
+History is insert-only. A version is `(object_kind, full_name, recorded_at)`. A run step is `(run_id, step_no, status)`. The tables do not declare those as primary keys. A run matches the definition that was active when `owner`, `object_kind`, and `full_name` are equal and `started_at` is inside `[valid_from, valid_to)`.
+
+```mermaid
+erDiagram
+  object_registry ||--o{ run_ledger : "owner, object_kind, full_name"
+  object_registry {
+    string object_kind
+    string full_name
+    string owner_kind
+    string owner
+    string requested_by
+    string delivery
+    string parent_full_name
+    string relation
+    string config_json
+    string content_hash
+    string source
+    timestamp recorded_at
+  }
+  run_ledger {
+    string run_id
+    string parent_run_id
+    string object_kind
+    string full_name
+    string owner_kind
+    string owner
+    int step_no
+    string step_name
+    string status
+    timestamp started_at
+    timestamp ended_at
+    string failure_reason
+    string recon_json
+    timestamp recorded_at
+    date event_date
+  }
+```
+
+`object_registry` is clustered by `(owner, object_kind, full_name, recorded_at)`. `run_ledger` is clustered by `(owner, event_date, full_name, run_id)`.
+
+## Registry, logical
+
+Every box is a row in `object_registry`, except `RUN_STEP`, which is a row in `run_ledger`. `parent_full_name` and `relation` are the edges.
+
+```mermaid
+erDiagram
+  WORKFLOW |o--o{ PIPELINE : owns
+  PIPELINE ||--|{ FLOW : has
+  FLOW ||--|| SECURABLE : "writes or rejects_to"
+  PIPELINE ||--|{ LINK : "writes or rejects_to"
+  LINK }o--|| SECURABLE : names
+  SECURABLE ||--o{ COLUMN : column_of
+  PIPELINE ||--o{ RUN_STEP : "steps of a run"
+```
+
+| Kind | `full_name` | Parent | `relation` | What `config_json` holds |
+| --- | --- | --- | --- | --- |
+| `workflow` | `job_name` | none | none | `pipeline_id` |
+| `pipeline` | `pipeline_id` | `job_name` when set | `owns` | Canonical spec and compiled rules |
+| `flow` | `<pipeline_id>.raw`, `.bronze`, `.quarantine` (no `.raw` without a raw table) | pipeline | `writes` or `rejects_to` | Table name and layer |
+| `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, domain, classification, PII |
+| `link` | `<pipeline_id>-><table>` | pipeline | `writes` or `rejects_to` | Child table name |
+| `column` | `<table>.<column>` | table name | `column_of` | Ordinal, type, description, classification, PII |
+
+Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
+
+Each object is hashed on its own document, so a job rename versions the pipeline and the workflow but not a table or column whose own fields did not change. A column hash covers ordinal, data type, description, classification, and PII. The column name is the key, so a rename is a different column. Columns are recorded for every table the pipeline writes: raw (with `_source_file` and `_ingested_at`), bronze, and quarantine (with `failed_rules`). Without a raw table, bronze and quarantine carry the lineage columns the pipeline adds.
+
+## Views
+
+Views do not store a second copy. Current views keep the latest row. History views add `valid_from` (`recorded_at`) and `valid_to` (the next `recorded_at` for that object, or null).
+
+```mermaid
+flowchart TD
+  object_registry[object_registry]
+  run_ledger[run_ledger]
+  object_registry --> v_object_current
+  object_registry --> v_object_history
+  object_registry --> v_lineage
+  object_registry --> v_ownership_conflicts
+  v_object_current --> v_pipelines
+  v_object_current --> v_tables
+  v_object_current --> v_columns
+  v_object_history --> v_column_history
+  run_ledger --> v_process
+  run_ledger --> v_run_current
+  run_ledger --> v_recon
+```
+
+`v_lineage` is the latest `link` row for each parent, child, and relation. `v_pipelines`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` is the `record_success` step with `recon_json` parsed. `v_run_current` is the latest step in the last 7 days. `v_ownership_conflicts` lists any name with more than one owner.
+
 ## Design choices
 
 **Source drives the pipeline.** The kind of source decides the graph. Files stay in a raw volume and bronze reads them from there. Databases are read through a foreign catalog straight into bronze. Only the original `cloud_files` path has a raw table. Quarantine and bronze are always built, and both are filtered by the quality rules.

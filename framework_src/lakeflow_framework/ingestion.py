@@ -124,7 +124,12 @@ def render_map(systems: list[SourceSystem]) -> str:
     if not systems:
         lines.append("No source systems yet.")
         return "\n".join(lines) + "\n"
-    lines += ["## Requested by", "", "| Team or project | Tables | Source systems |", "| --- | --- | --- |"]
+    lines += [
+        "## Requested by",
+        "",
+        "| Team or project | Tables | Source systems |",
+        "| --- | --- | --- |",
+    ]
     requesters: dict[str, list[SourceTable]] = {}
     for system in systems:
         for table in system.tables:
@@ -218,9 +223,7 @@ def _pipeline_resource(name: str) -> dict[str, Any]:
     }
 
 
-def _job_resource(
-    system: SourceSystem, delivery: str, tables: list[SourceTable]
-) -> dict[str, Any]:
+def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]) -> dict[str, Any]:
     name = f"{system.name}_{delivery}"
     configs = [table.config for table in tables]
     spec_paths = [
@@ -326,9 +329,7 @@ def _yaml(document: dict[str, Any]) -> str:
     return f"{GENERATED}\n{body}"
 
 
-def _read_source(
-    path: Path, domain: str, name: str, errors: list[str]
-) -> SourceSystem | None:
+def _read_source(path: Path, domain: str, name: str, errors: list[str]) -> SourceSystem | None:
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
@@ -362,7 +363,8 @@ def _read_source(
         if engine and engine not in ENGINES:
             found.append(f"{path}: engine must be one of {', '.join(ENGINES)}")
     if "fetch" in document or any(
-        isinstance(item, dict) and "fetch" in item for item in (document.get("deliveries") or {}).values()
+        isinstance(item, dict) and "fetch" in item
+        for item in (document.get("deliveries") or {}).values()
     ):
         found.append(
             f"{path}: fetch is not built; deliver files to the raw volume with another process"
@@ -379,7 +381,9 @@ def _read_source(
         if bool(schedule) == bool(trigger):
             found.append(f"{path}: delivery {delivery} needs exactly one of schedule or trigger")
         if trigger and trigger not in TRIGGERS:
-            found.append(f"{path}: delivery {delivery} trigger must be one of {', '.join(TRIGGERS)}")
+            found.append(
+                f"{path}: delivery {delivery} trigger must be one of {', '.join(TRIGGERS)}"
+            )
         if trigger and kind == DATABASE_KIND:
             found.append(f"{path}: a database delivery runs on a schedule, not a {trigger}")
         if trigger == "file_arrival" and kind == "cloud_files":
@@ -396,7 +400,10 @@ def _read_source(
         owner,
         kind,
         {str(k): dict(v) for k, v in deliveries.items()},
-        raw_volume={"schema": str(volume.get("schema") or ""), "volume": str(volume.get("volume") or "")},
+        raw_volume={
+            "schema": str(volume.get("schema") or ""),
+            "volume": str(volume.get("volume") or ""),
+        },
         foreign_catalog=foreign_catalog,
         engine=engine,
     )
@@ -404,9 +411,7 @@ def _read_source(
 
 def _spec_files(folder: Path) -> list[Path]:
     return sorted(
-        path
-        for path in [*folder.glob("*.yaml"), *folder.glob("*.yml")]
-        if path.name != SOURCE_FILE
+        path for path in [*folder.glob("*.yaml"), *folder.glob("*.yml")] if path.name != SOURCE_FILE
     )
 
 
@@ -479,7 +484,9 @@ def _system_section(system: SourceSystem) -> list[str]:
         )
     if system.kind == DATABASE_KIND:
         engine = f" ({system.engine})" if system.engine else ""
-        lines.append(f"Foreign catalog: `{system.foreign_catalog}`{engine}. Tables load straight to bronze.")
+        lines.append(
+            f"Foreign catalog: `{system.foreign_catalog}`{engine}. Tables load straight to bronze."
+        )
     lines += ["", "| Delivery | When |", "| --- | --- |"]
     for name in sorted(system.deliveries):
         detail = system.deliveries[name]
@@ -530,9 +537,7 @@ def new_source(
     if target.exists():
         raise ConfigValidationError([f"{target} already exists"])
     target.parent.mkdir(parents=True, exist_ok=True)
-    head = (
-        f"source_system: {source_system}\ndomain: {domain}\nowner: {owner}\nkind: {kind}\n\n"
-    )
+    head = f"source_system: {source_system}\ndomain: {domain}\nowner: {owner}\nkind: {kind}\n\n"
     if kind in FILE_KINDS:
         body = (
             "# Files land in this volume as delivered. Bronze reads them from here.\n"
@@ -581,7 +586,9 @@ def new_table(
     if delivery is None:
         if len(deliveries) != 1:
             raise ConfigValidationError(
-                [f"{source_system} has several deliveries ({', '.join(deliveries)}); pass --delivery"]
+                [
+                    f"{source_system} has several deliveries ({', '.join(deliveries)}); pass --delivery"
+                ]
             )
         delivery = deliveries[0]
     elif delivery not in deliveries:
@@ -722,8 +729,11 @@ quarantine:
 
 
 def _names(values: dict[str, str]) -> None:
-    bad = [f"{key} must be an identifier, not {value!r}" for key, value in values.items()
-           if not IDENTIFIER.match(value)]
+    bad = [
+        f"{key} must be an identifier, not {value!r}"
+        for key, value in values.items()
+        if not IDENTIFIER.match(value)
+    ]
     if bad:
         raise ConfigValidationError(bad)
 

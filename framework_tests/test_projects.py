@@ -95,7 +95,11 @@ def test_own_and_other_project_references_are_checked(root: Path) -> None:
 
 def test_a_project_cannot_name_itself_with_three_parts(root: Path) -> None:
     path = _project(root, "finance", "billing_reporting")
-    _edit(path, "[silver.invoices_clean, silver.customer_orders]", "[billing_reporting.silver.invoices_clean]")
+    _edit(
+        path,
+        "[silver.invoices_clean, silver.customer_orders]",
+        "[billing_reporting.silver.invoices_clean]",
+    )
     assert "is your own table; write silver.invoices_clean" in _problems(root)
 
 
@@ -135,7 +139,11 @@ def test_fan_in_without_a_deadline_is_flagged_on_the_map(root: Path) -> None:
 
 
 def test_project_must_match_its_folder(root: Path) -> None:
-    _edit(_project(root, "finance", "billing_reporting"), "project: billing_reporting", "project: other")
+    _edit(
+        _project(root, "finance", "billing_reporting"),
+        "project: billing_reporting",
+        "project: other",
+    )
     assert "project must be billing_reporting, the folder name" in _problems(root)
 
 
@@ -152,7 +160,9 @@ def test_new_project_scaffolds_a_bundle_and_refuses_overwrite(tmp_path: Path) ->
 def test_an_empty_new_project_generates_a_map(root: Path) -> None:
     new_project(root, "retail", "sales_reporting", owner="sales.owner@jll.com")
     generate(root, INGESTION)
-    assert "No silver tables yet." in (root / "retail/sales_reporting" / MAP_NAME).read_text("utf-8")
+    assert "No silver tables yet." in (root / "retail/sales_reporting" / MAP_NAME).read_text(
+        "utf-8"
+    )
 
 
 def test_invalid_ingestion_blocks_project_checks(root: Path, tmp_path: Path) -> None:

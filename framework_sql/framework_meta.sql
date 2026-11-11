@@ -24,9 +24,10 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
   source STRING,
   recorded_at TIMESTAMP
 )
-CLUSTER BY (owner, object_kind, full_name)
+CLUSTER BY (owner, object_kind, full_name, recorded_at)
 TBLPROPERTIES (
-  'delta.autoOptimize.optimizeWrite' = 'true'
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
 );
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
@@ -48,7 +49,8 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
 )
 CLUSTER BY (owner, event_date, full_name, run_id)
 TBLPROPERTIES (
-  'delta.autoOptimize.optimizeWrite' = 'true'
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
 );
 
 CREATE BLOOMFILTER INDEX ON TABLE ${catalog}.framework_meta.object_registry
@@ -216,8 +218,45 @@ WHERE object_kind IN ('pipeline', 'table', 'streaming_table', 'materialized_view
 GROUP BY object_kind, full_name
 HAVING count(DISTINCT concat(owner_kind, ':', owner)) > 1;
 
--- Column history is insert-only. A changed data type, description, or sensitivity
--- tag is a new object_registry row. valid_to is the next version's recorded_at.
+-- Every object kind keeps its versions here. valid_to is the next version's recorded_at.
+-- A version was active during [valid_from, valid_to). A null valid_to is still active.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_history AS
+SELECT
+  object_kind,
+  full_name,
+  owner_kind,
+  owner,
+  requested_by,
+  delivery,
+  parent_full_name,
+  relation,
+  config_json,
+  content_hash,
+  source,
+  valid_from,
+  valid_to,
+  valid_to IS NULL AS is_current
+FROM (
+  SELECT
+    object_kind,
+    full_name,
+    owner_kind,
+    owner,
+    requested_by,
+    delivery,
+    parent_full_name,
+    relation,
+    config_json,
+    content_hash,
+    source,
+    recorded_at AS valid_from,
+    LEAD(recorded_at) OVER (
+      PARTITION BY object_kind, full_name
+      ORDER BY recorded_at, content_hash
+    ) AS valid_to
+  FROM ${catalog}.framework_meta.object_registry
+) versions;
+
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_columns AS
 SELECT
   parent_full_name AS table_name,
@@ -235,25 +274,18 @@ WHERE object_kind = 'column';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_column_history AS
 SELECT
-  history.*,
-  valid_to IS NULL AS is_current
-FROM (
-  SELECT
-    parent_full_name AS table_name,
-    get_json_object(config_json, '$.name') AS column_name,
-    owner_kind,
-    owner,
-    CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
-    get_json_object(config_json, '$.data_type') AS data_type,
-    get_json_object(config_json, '$.description') AS description,
-    get_json_object(config_json, '$.classification') AS classification,
-    get_json_object(config_json, '$.pii') AS pii,
-    content_hash,
-    recorded_at AS valid_from,
-    LEAD(recorded_at) OVER (
-      PARTITION BY full_name
-      ORDER BY recorded_at, content_hash
-    ) AS valid_to
-  FROM ${catalog}.framework_meta.object_registry
-  WHERE object_kind = 'column'
-) history;
+  parent_full_name AS table_name,
+  get_json_object(config_json, '$.name') AS column_name,
+  owner_kind,
+  owner,
+  CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
+  get_json_object(config_json, '$.data_type') AS data_type,
+  get_json_object(config_json, '$.description') AS description,
+  get_json_object(config_json, '$.classification') AS classification,
+  get_json_object(config_json, '$.pii') AS pii,
+  content_hash,
+  valid_from,
+  valid_to,
+  is_current
+FROM ${catalog}.framework_meta.v_object_history
+WHERE object_kind = 'column';

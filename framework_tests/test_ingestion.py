@@ -234,7 +234,9 @@ def test_removed_table_removes_its_generated_files_and_leaves_others(bundle: Pat
     (folder / "source.yaml").write_text(text, "utf-8")
     spec = (folder / "billing_invoices.yaml").read_text("utf-8")
     (folder / "billing_invoices.yaml").write_text(
-        spec.replace("delivery: daily", "delivery: nightly").replace("billing_daily", "billing_nightly"),
+        spec.replace("delivery: daily", "delivery: nightly").replace(
+            "billing_daily", "billing_nightly"
+        ),
         "utf-8",
     )
     generate(bundle)
@@ -333,7 +335,9 @@ def test_table_must_say_who_requested_it(bundle: Path) -> None:
 
 def test_specs_under_sources_use_requested_by_not_project(bundle: Path) -> None:
     path = _add_table(bundle, "credits", "collections")
-    text = path.read_text(encoding="utf-8").replace("requested_by: collections", "project: collections")
+    text = path.read_text(encoding="utf-8").replace(
+        "requested_by: collections", "project: collections"
+    )
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)

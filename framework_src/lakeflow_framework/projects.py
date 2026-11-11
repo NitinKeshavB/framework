@@ -60,7 +60,9 @@ class Project:
     tables: list[ProjectTable] = field(default_factory=list)
 
 
-def load_projects(root: Path, ingestion: Path) -> tuple[list[Project], dict[tuple[str, str], SourceTable]]:
+def load_projects(
+    root: Path, ingestion: Path
+) -> tuple[list[Project], dict[tuple[str, str], SourceTable]]:
     """Read every project and check it against the ingestion bundle and the other projects.
 
     Returns the projects and the bronze tables they can read. Raises one error with every problem.
@@ -81,7 +83,9 @@ def load_projects(root: Path, ingestion: Path) -> tuple[list[Project], dict[tupl
     return projects, bronze
 
 
-def render_files(projects: list[Project], bronze: dict[tuple[str, str], SourceTable]) -> dict[str, str]:
+def render_files(
+    projects: list[Project], bronze: dict[tuple[str, str], SourceTable]
+) -> dict[str, str]:
     """Generated files by path under the projects root."""
 
     files = {INDEX_NAME: _render_index(projects)}
@@ -243,8 +247,10 @@ def _read_table(
             found.append(f"{label}: deadline.on_miss must be one of {', '.join(ON_MISS)}")
         else:
             deadline = {"at": str(deadline["at"]), "on_miss": str(deadline.get("on_miss", "alert"))}
-    return None if len(found) > problems else ProjectTable(
-        layer, name, lists["triggered_by"], lists["reads"], deadline
+    return (
+        None
+        if len(found) > problems
+        else ProjectTable(layer, name, lists["triggered_by"], lists["reads"], deadline)
     )
 
 
@@ -254,7 +260,9 @@ def _duplicate_tables(projects: list[Project]) -> list[str]:
     names: dict[str, Project] = {}
     for project in projects:
         if project.name in names:
-            errors.append(f"{project.path}: project {project.name} is also defined in {names[project.name].path}")
+            errors.append(
+                f"{project.path}: project {project.name} is also defined in {names[project.name].path}"
+            )
         names[project.name] = project
         for table in project.tables:
             key = (table.layer, table.name)
@@ -279,7 +287,9 @@ def _check_references(
                 for ref in getattr(table, key):
                     problem = _reference_problem(ref, project, table, by_name, bronze)
                     if problem:
-                        errors.append(f"{project.path}: {table.layer}.{table.name} {key}: {problem}")
+                        errors.append(
+                            f"{project.path}: {table.layer}.{table.name} {key}: {problem}"
+                        )
     return errors
 
 
@@ -337,7 +347,11 @@ def _project_cycles(projects: list[Project]) -> list[str]:
         state[name] = 1
         for upstream in sorted(graph.get(name, ())):
             if state.get(upstream) == 1:
-                cycle = [*trail[trail.index(upstream) :], upstream] if upstream in trail else [name, upstream]
+                cycle = (
+                    [*trail[trail.index(upstream) :], upstream]
+                    if upstream in trail
+                    else [name, upstream]
+                )
                 errors.append("projects depend on each other in a loop: " + " -> ".join(cycle))
             elif state.get(upstream) is None and upstream in graph:
                 visit(upstream, [*trail, upstream])
@@ -432,7 +446,9 @@ def _render_index(projects: list[Project]) -> str:
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for project in sorted(projects, key=lambda p: (p.domain, p.name)):
-        count = {layer: sum(1 for t in project.tables if t.layer == layer) for layer in OWNED_LAYERS}
+        count = {
+            layer: sum(1 for t in project.tables if t.layer == layer) for layer in OWNED_LAYERS
+        }
         upstream = ", ".join(sorted(_upstream_projects(project))) or "-"
         lines.append(
             f"| {project.name} | {project.domain} | {project.owner} | "

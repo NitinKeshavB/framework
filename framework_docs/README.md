@@ -182,7 +182,7 @@ For source system `billing` and table `invoices`:
 - Files from a raw volume or a database: `<catalog>.billing_bronze.invoices` and `<catalog>.billing_quarantine.invoices`.
 - Cloud files also write `<catalog>.billing_raw.invoices`.
 
-Quarantine carries `_failed_rules`, the names of the rules that failed. Rows that pass go to bronze. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.
+Quarantine carries `failed_rules`, the names of the rules that failed. Rows that pass go to bronze. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.
 
 ## Operations
 

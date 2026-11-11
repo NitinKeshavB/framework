@@ -85,7 +85,8 @@ Query `<catalog>.framework_meta`:
 | `v_object_current` | Current pipeline, flow, and table definitions, with owner |
 | `v_pipelines` | Source system, requesting team, delivery, domain, data domain, team, owner, and who is mailed |
 | `v_tables` | Owner, requester, classification, and PII on each table |
-| `v_columns`, `v_column_history` | Bronze columns: type, description, tags, and every past version |
+| `v_object_history` | Every version of a pipeline, workflow, flow, table, link, or column, with `valid_from` and `valid_to`. Filter it to see the system at a moment. |
+| `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
 | `v_run_current`, `v_process` | Latest step in the last 7 days, and every step of a run |
 | `v_recon` | Source and target counts on the success step |

@@ -59,13 +59,13 @@ Rules in the spec become SQL predicates before a cluster starts.
 - Each declared type gets `TRY_CAST(column AS type) IS NOT NULL OR column IS NULL`, so a null is not also a cast failure.
 - Auto Loader on CSV, delimited text, JSON, and text adds `_rescued_data IS NULL`.
 
-A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `_failed_rules`, the names of every predicate that failed.
+A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `failed_rules`, the names of every predicate that failed.
 
 ## The registry
 
 Two tables in `<catalog>.framework_meta`. History is insert-only: the framework never runs `UPDATE` or `DELETE` on them.
 
-`object_registry` catalogs workflows (jobs), pipelines, flows, securables, links, and columns. A new row is written when the definition hash changes. `config_json` holds the spec, the compiled rules, and the attributes. `parent_full_name` and `relation` (`owns`, `writes`, `rejects_to`) replace a relationship table.
+`object_registry` catalogs workflows (jobs), pipelines, flows, securables, links, and columns. A new row is written when that object's own hash changes, so a job rename versions the pipeline and workflow and leaves an unchanged table or column alone. `config_json` holds the document for that one object. `parent_full_name` and `relation` (`owns`, `writes`, `rejects_to`, `column_of`) are the edges. The registry layout and the logical model are drawn in [ARCHITECTURE.md](ARCHITECTURE.md#registry-physical).
 
 Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `owner` is its name. Bronze rows are owned by the source system. `requested_by` is the team that asked for the table and `delivery` is how its source delivers. They are for the maps and do not affect ownership.
 
@@ -78,8 +78,9 @@ A pipeline or table has one owner. Before inserting, the collector looks up the 
 ### Views
 
 - `v_object_current`: latest definition. This is what the pipeline loads.
+- `v_object_history`: every version of every object (pipeline, workflow, flow, table, link, column). `valid_from` is `recorded_at`; `valid_to` is the next version's `recorded_at` for that object, null while it is the latest. A point in time is `valid_from <= t AND (valid_to IS NULL OR valid_to > t)`.
 - `v_pipelines`, `v_tables`: owner, requester, delivery, domain, data domain, team, technical owner, mail lists, classification, and PII.
-- `v_columns`, `v_column_history`: current bronze columns, and every version as SCD type 2 (`valid_from`, `valid_to`, `is_current`).
+- `v_columns`, `v_column_history`: the current columns of raw, bronze, and quarantine, and every version of them (`valid_from`, `valid_to`, `is_current`).
 - `v_lineage`: latest link per parent, child, and relation, written at sync.
 - `v_run_current`: latest step in the last 7 days. `v_process`: every step of a run. `v_recon`: counts on success steps.
 - `v_ownership_conflicts`: names with more than one owner.
@@ -92,10 +93,24 @@ About 10,000 jobs can write status files at once because those are files, not De
 
 The tables use liquid clustering:
 
-- `object_registry`: `CLUSTER BY (owner, object_kind, full_name)`
+- `object_registry`: `CLUSTER BY (owner, object_kind, full_name, recorded_at)`
 - `run_ledger`: `CLUSTER BY (owner, event_date, full_name, run_id)`
 
-Both set `delta.autoOptimize.optimizeWrite`. The DDL also creates bloom-filter indexes on `full_name` and `run_id`; if the runtime rejects that, the DDL task skips it. A daily job runs `OPTIMIZE`. `VACUUM` is not scheduled, so process history is never removed. Query with `owner` and, for runs, `event_date`.
+Both set `delta.autoOptimize.optimizeWrite` and `autoCompact`, so the collector's small inserts are compacted as they land. The DDL also creates bloom-filter indexes on `full_name` and `run_id`; if the runtime rejects that, the DDL task skips it. A daily job runs `OPTIMIZE`. `VACUUM` is not scheduled, so process history is never removed.
+
+Before an insert, the collector reads only the current hash for the owners, kinds, and names in that batch, and the current owner of the pipelines and tables in it. It does not scan history for other owners. Filter `owner` and `object_kind` (and `full_name` when known) before the `valid_from` / `valid_to` test. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
+
+To see the registry as it was at a moment:
+
+```sql
+SELECT object_kind, full_name, config_json, valid_from, valid_to
+FROM framework_meta.v_object_history
+WHERE owner = 'billing'
+  AND valid_from <= TIMESTAMP '2026-11-08 00:00:00'
+  AND (valid_to IS NULL OR valid_to > TIMESTAMP '2026-11-08 00:00:00')
+```
+
+Collecting the same document again does not insert. Putting an older document back in force does insert, so the days in between still resolve to the version that was active then.
 
 ## Checked on a real workspace
 

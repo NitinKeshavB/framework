@@ -203,7 +203,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
     valid, quarantine, bronze = by_kind["valid"], by_kind["quarantine"], by_kind["bronze"]
     pass_where = valid.detail["where"]
     fail_where = quarantine.detail["where"]
-    failed_rules = f"{quarantine.detail['failed_rules']} AS _failed_rules"
+    failed_rules = f"{quarantine.detail['failed_rules']} AS failed_rules"
     options = get_strategy(config.load_method).options(config)
 
     def _read_files() -> Any:
