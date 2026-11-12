@@ -98,6 +98,18 @@ Query `<catalog>.framework_meta`:
 
 Filter by `owner` and, for runs, `event_date`. History is insert-only.
 
+```sql
+-- latest status for every job owned by billing
+SELECT job_name, status, step_name, run_id, failure_reason
+FROM aal_dev_fdh.framework_meta.v_job_status
+WHERE owner = 'billing';
+
+-- what a delivery job loads
+SELECT job_name, pipeline_ids, requesters, delivery
+FROM aal_dev_fdh.framework_meta.v_workflows
+WHERE owner = 'billing';
+```
+
 ## Work in this repo
 
 ```bash

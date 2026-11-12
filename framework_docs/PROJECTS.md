@@ -1,18 +1,18 @@
-# Silver and gold projects
+# Curation: silver, gold, and data products
 
-The built structure is described in [framework_curation/README.md](../framework_curation/README.md) and the `project.yaml` contract in [README.md](README.md#projectyaml). This page records the design behind it and the part that is not built.
+The built structure is described in [framework_curation/README.md](../framework_curation/README.md) and the `project.yaml` contract in [README.md](../README.md#projectyaml). This page records the design behind it and the part that is not built.
 
 ## Model
 
 ```
-source system ──delivery──▶ bronze ──▶ silver ──▶ gold
-domain-owned, shared                  project-owned
+source system ──delivery──▶ bronze ──▶ silver ──▶ gold ──▶ product
+domain-owned, shared                  project-owned in framework_curation
 ```
 
 - A source system belongs to a domain. Many teams can add tables to it. Bronze is owned by the source system.
-- A delivery is how a source's data arrives: a schedule, or files landing in the raw volume.
-- Silver runs when the bronze or silver tables it is `triggered_by` have refreshed. Gold runs when all its upstream tables have, from one project or several.
-- Users declare dependencies. They do not write cron times for silver and gold.
+- A delivery is how a source's data arrives: a schedule, or files landing in the raw volume. One delivery is one ingestion pipeline and one job.
+- Silver runs when the bronze or silver tables it is `triggered_by` have refreshed. Gold and data products wait on lower layers the same way.
+- Users declare dependencies. They do not write cron times for silver, gold, or products.
 
 ## Ownership
 
@@ -20,13 +20,13 @@ domain-owned, shared                  project-owned
 | --- | --- | --- |
 | Source system | One domain, named owner | `owner_kind = source_system`, `owner = <source system>` |
 | Bronze table | The source system | the same, plus `requested_by` and `delivery` |
-| Silver and gold table | One project | `owner_kind = project`, `owner = <project>` |
+| Silver, gold, or data product | One project | `owner_kind = project`, `owner = <project>` |
 
-A table is registered once. Two requests for the same file share one bronze table. Another project reads a silver or gold table as `<project>.silver.<name>` and never creates it again. The checks are in three places: `generate` and `projects:generate` before merge, the collector at registration, and `v_ownership_conflicts` for anything that slipped through. See [END_TO_END.md](END_TO_END.md#ownership).
+A table is registered once. Two requests for the same file share one bronze table. Another project reads a silver, gold, or product as `<project>.silver.<name>` (or `.gold.` / `.product.`) and never creates it again. The checks are in three places: `generate` and `projects:generate` before merge, the collector at registration, and `v_ownership_conflicts` for anything that slipped through. See [END_TO_END.md](END_TO_END.md#ownership).
 
 ## What is built
 
-- `project.yaml` with silver and gold tables, `triggered_by`, `reads`, and deadlines
+- `project.yaml` with silver, gold, and `products`, `triggered_by`, `reads`, and deadlines
 - Reference checks against the ingestion bundle and the other projects
 - The lower-layers-only rule, unique table names across projects, and no loops between projects
 - `PROJECT_MAP.md` per project and `PROJECTS_INDEX.md`
@@ -35,7 +35,7 @@ A table is registered once. Two requests for the same file share one bronze tabl
 
 ## What is not built (phase 1)
 
-- The transform for a silver or gold table. There is no config for it yet.
+- The transform for a silver, gold, or product table. There is no config for it yet.
 - A pipeline and job generated per project from `project.yaml`.
 - The trigger. The plan is a job `table_update` trigger with `ALL_UPDATED` on the tables a table waits for. It is untested on a workspace, as is its limit on watched tables.
 - The deadline behaviour: at the deadline, `alert` or `run_stale`.

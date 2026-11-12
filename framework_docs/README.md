@@ -8,7 +8,7 @@ The repository overview is [../README.md](../README.md). This page is every file
 | `<source_system>_<table>.yaml` | The project bringing it in, or the source itself | `sources/<source_system>/<project>/`, or next to `source.yaml` when there is no project |
 | `project.yaml` | The project | `framework_curation/<domain>/<project>/` |
 
-Check them without a cluster: `./run.sh generate` for ingestion, `./run.sh projects:generate` for projects. Both print every error in one pass.
+Check them without a cluster: `./run.sh generate` for ingestion, `./run.sh projects:generate` for curation. Both print every error in one pass. Job runs, statuses, and definition metadata live in `framework_meta`; the views are listed in the [root README](../README.md#see-what-is-running).
 
 ## source.yaml
 
@@ -165,15 +165,19 @@ gold:
     triggered_by: [silver.invoices_clean, silver.customer_orders]
     reads: [headcount_reporting.silver.headcount_clean]
     deadline: { at: "08:00", on_miss: alert }
+products:
+  revenue:
+    triggered_by: [gold.revenue_daily]
+    deadline: { at: "09:00", on_miss: alert }
 ```
 
 | Reference | Meaning |
 | --- | --- |
 | `<source_system>.<table>` | A bronze table in the ingestion bundle |
-| `silver.<name>`, `gold.<name>` | A table of this project |
-| `<project>.silver.<name>` | A table of another project |
+| `silver.<name>`, `gold.<name>`, `product.<name>` | A table or data product of this project |
+| `<project>.silver.<name>`, `<project>.product.<name>` | A table of another project |
 
-A table depends only on lower layers. `triggered_by` is required and fires the job once every listed table has refreshed. `reads` is read without waiting. `deadline.on_miss` is `alert` or `run_stale`. A table with more than one `triggered_by` and no deadline is flagged on the map. The same layer and name cannot be created by two projects, and projects cannot depend on each other in a loop.
+A table depends only on lower layers: bronze, then silver, then gold, then a data product. `triggered_by` is required and fires the job once every listed table has refreshed. `reads` is read without waiting. `deadline.on_miss` is `alert` or `run_stale`. A table with more than one `triggered_by` and no deadline is flagged on the map. The same layer and name cannot be created by two projects, and projects cannot depend on each other in a loop.
 
 ## Tables the pipeline writes
 

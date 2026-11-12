@@ -42,6 +42,8 @@ A kind is a `source.yaml` rule set plus one load strategy. Add the strategy in `
 
 ## Tests and checks
 
+Package tests live in `framework_tests`, not inside the ingestion or curation bundles. They copy sample YAML into `tmp_path` and use fake Spark objects; they do not start a cluster.
+
 ```bash
 ./run.sh install
 ./run.sh test:quick        # framework_tests and the sample consumer tests; no Spark
@@ -50,7 +52,7 @@ A kind is a `source.yaml` rule set plus one load strategy. Add the strategy in `
 ./run.sh projects:check
 ```
 
-Coverage reporting is a later phase.
+CI runs the same four checks on every pull request (`.github/workflows/checks.yml`). Coverage reporting is a later phase.
 
 ## Runtime checks
 

@@ -8,8 +8,8 @@ Folders at the repository root start with `framework_`.
 - `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql`, the DDL job, the collector, and daily `OPTIMIZE`.
 - `framework_ingestion` is source to bronze: source systems, table specs, and the pipelines and jobs generated from them.
 - `framework_curation/<domain>/<project>` is one bundle per project for silver, gold, and data products.
-- `framework_examples/consumer` is the original single-bundle example. It uses the `cloud_files` shape and is reference only.
-- `framework_tests` runs without Spark.
+- `framework_examples/ingestion` is the set of specs to copy for each source kind. `framework_examples/consumer` is the original single-bundle example and is reference only.
+- `framework_tests` holds package tests. They copy sample YAML and use fake Spark objects; they do not start a cluster.
 - `framework_docs` is this documentation.
 
 Three things are kept apart on purpose: the **meta framework** (registry and collector), **source ingestion** (domain-owned, shared), and **curation** (silver, gold, and data products, one project owner each). They deploy separately and have different owners.

@@ -99,7 +99,9 @@ The framework does not create these. The domain makes sure they exist before a d
 
 ## Ownership and the registry
 
-Bronze is owned by the **source system**. The registry stores `owner_kind = source_system` and `owner = <source system>` on every row, with `requested_by` (the team that asked for the table) and `delivery` beside it. A table has one owner, and the collector refuses a second owner's registration and records a failed `ownership_check` step. The team that asked for a table never owns it. Query the registry with an `owner` filter.
+Bronze is owned by the **source system**. The registry stores `owner_kind = source_system` and `owner = <source system>` on every row, with `requested_by` (the team that asked for the table) and `delivery` beside it. A table has one owner, and the collector refuses a second owner's registration and records a failed `ownership_check` step. The team that asked for a table never owns it.
+
+Each delivery syncs a workflow, one pipeline and dataflow per table, the layer flows, securables, links, and columns. Job run steps use `object_kind = workflow`. Query status with `v_job_status`, definitions with `v_workflows` / `v_pipelines` / `v_dataflows` / `v_flows`, and filter by `owner`. The full view list is in the [root README](../README.md#see-what-is-running).
 
 `requested_by` is the project folder. Omit it only when the spec sits next to `source.yaml`. A spec that says `project:` instead of `requested_by:` is rejected.
 
