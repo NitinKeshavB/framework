@@ -1,6 +1,6 @@
 # Source ingestion bundle
 
-Domain-owned ingestion into bronze. Projects do not own anything here. Any team can ask for a file or a table by adding a spec. Silver and gold belong to the project bundles in [framework_projects](../framework_projects/README.md).
+Domain-owned ingestion into bronze. Projects do not own anything here. Any team can ask for a file or a table by adding a spec. Silver, gold, and data products belong to the project bundles in [framework_curation](../framework_curation/README.md).
 
 ## Three bundles
 
@@ -8,7 +8,7 @@ Domain-owned ingestion into bronze. Projects do not own anything here. Any team 
 | --- | --- | --- |
 | `framework_bundle` | The registry (`framework_meta`), the collector, and `OPTIMIZE` | Platform team |
 | `framework_ingestion` (this one) | Source to bronze | Domain, per source system |
-| `framework_projects/<domain>/<project>` | Silver and gold | One project each |
+| `framework_curation/<domain>/<project>` | Silver, gold, and data products | One project each |
 
 Deploy order: `framework_bundle`, then run its `framework_ddl` job and start `framework_collector`, then this bundle, then the projects.
 

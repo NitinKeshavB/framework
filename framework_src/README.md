@@ -12,7 +12,7 @@ Generated pipeline files contain these calls. Nobody writes them by hand.
 
 ```bash
 lakeflow-framework generate framework_ingestion          # specs to pipelines, jobs, SOURCE_MAP.md
-lakeflow-framework projects generate framework_projects --sources framework_ingestion
+lakeflow-framework projects generate framework_curation --sources framework_ingestion
 lakeflow-framework validate <folder> --catalog <catalog>  # check specs; no cluster
 ```
 

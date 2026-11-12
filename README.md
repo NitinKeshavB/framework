@@ -1,12 +1,12 @@
 # Lakeflow framework
 
-Config-driven ingestion and a metadata registry for Databricks Lakeflow. Teams add YAML, run one command, and the framework produces the pipelines, jobs, and a map. Source ingestion is shared by a domain. Silver and gold belong to projects.
+Config-driven ingestion and a metadata registry for Databricks Lakeflow. Teams add YAML, run one command, and the framework produces the pipelines, jobs, and a map. Source ingestion is shared by a domain. Silver, gold, and data products belong to projects.
 
 ## How it fits together
 
 ```
-source system ──delivery──▶ bronze ──▶ silver ──▶ gold
- (framework_ingestion)                 (framework_projects)
+source system ──delivery──▶ bronze ──▶ silver / gold / product
+ (framework_ingestion)                 (framework_curation)
         every definition and run is recorded in framework_meta (framework_bundle)
 ```
 
@@ -15,7 +15,7 @@ source system ──delivery──▶ bronze ──▶ silver ──▶ gold
 | `framework_src` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
 | `framework_bundle` | The deployed framework: the wheel, the `framework_meta` registry DDL, the collector, and daily `OPTIMIZE` | Platform team |
 | `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
-| `framework_projects` | One bundle per project for silver and gold, with ownership checks and maps | One project each |
+| `framework_curation` | One bundle per project for silver, gold, and data products, with ownership checks and maps | One project each |
 | `framework_examples/ingestion` | Specs for each ingestion kind: a raw volume, SharePoint, a database, and cloud files | None |
 | `framework_examples/consumer` | The original single-bundle example. Reference only. | None |
 | `framework_tests` | Package tests. They do not start Spark. | Platform team |
@@ -34,7 +34,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 ## Who owns what
 
 - A **source system** belongs to a domain. Its bronze tables are owned by the source system, never by the team that asked for them. The registry records `requested_by` beside the owner.
-- A **project** owns its silver and gold tables. A table name is owned once; another project reads it as `<project>.silver.<name>`.
+- A **project** owns its silver, gold, and data-product tables. A table name is owned once; another project reads it as `<project>.silver.<name>` or `<project>.product.<name>`.
 - The collector refuses a definition for a table another owner holds and records a failed `ownership_check` step. `v_ownership_conflicts` stays empty.
 
 ## Add a table to a source system
@@ -48,15 +48,15 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 `generate` validates every source and spec, then writes the pipelines, jobs, and `SOURCE_MAP.md`. Details are in [framework_ingestion/README.md](framework_ingestion/README.md).
 
-## Add a project, silver, or gold table
+## Add a project, silver, gold, or data product
 
 ```bash
 ./run.sh new-project finance billing_reporting reporting.owner@jll.com
-# edit framework_projects/finance/billing_reporting/project.yaml
+# edit framework_curation/finance/billing_reporting/project.yaml
 ./run.sh projects:generate
 ```
 
-`projects:generate` checks every reference against the ingestion bundle and the other projects, then writes `PROJECT_MAP.md` and `PROJECTS_INDEX.md`. Details are in [framework_projects/README.md](framework_projects/README.md). The silver and gold transforms themselves are phase 1.
+`projects:generate` checks every reference against the ingestion bundle and the other projects, then writes `PROJECT_MAP.md` and `PROJECTS_INDEX.md`. Details are in [framework_curation/README.md](framework_curation/README.md). The transforms themselves are phase 1.
 
 ## Prerequisites before a deploy
 
@@ -72,7 +72,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 1. `./run.sh bundle:deploy framework_bundle <target> <profile>`
 2. Run the `framework_ddl` job, then start `framework_collector`. The collector is the only writer of the registry tables.
 3. `./run.sh bundle:deploy framework_ingestion <target> <profile>`
-4. `./run.sh bundle:deploy framework_projects/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
+4. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
 
 `bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog.
 
@@ -82,13 +82,17 @@ Query `<catalog>.framework_meta`:
 
 | View | What it answers |
 | --- | --- |
-| `v_object_current` | Current pipeline, flow, and table definitions, with owner |
+| `v_object_current` | Current definitions for every object kind, with owner |
+| `v_workflows` | Each delivery job, its pipeline ids, and every requester |
 | `v_pipelines` | Source system, requesting team, delivery, domain, data domain, team, owner, and who is mailed |
+| `v_dataflows` | Raw path or table, bronze, and quarantine for each table load |
+| `v_flows` | Raw, bronze, and quarantine flows, with relation and path or table |
 | `v_tables` | Owner, requester, classification, and PII on each table |
 | `v_object_history` | Every version of a pipeline, workflow, flow, table, link, or column, with `valid_from` and `valid_to`. Filter it to see the system at a moment. |
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
 | `v_run_current`, `v_process` | Latest step in the last 7 days, and every step of a run |
+| `v_job_status` | Each job with its latest run step: `RUNNING`, `SUCCEEDED`, or `FAILED` |
 | `v_recon` | Source and target counts on the success step |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 

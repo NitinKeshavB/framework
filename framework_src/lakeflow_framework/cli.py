@@ -69,6 +69,11 @@ def main(argv: list[str] | None = None) -> int:
     step = commands.add_parser("step")
     step.add_argument("--owner", required=True, help="the source system or project that owns it")
     step.add_argument("--owner-kind", default="source_system", choices=["source_system", "project"])
+    step.add_argument(
+        "--object-kind",
+        default="pipeline",
+        help="workflow for a job run; pipeline for a table load or ownership check",
+    )
     step.add_argument("--full-name", required=True)
     step.add_argument("--run-id", required=True)
     step.add_argument("--step-no", required=True, type=int)
@@ -181,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = step_payload(
                 owner=args.owner,
                 owner_kind=args.owner_kind,
+                object_kind=args.object_kind,
                 full_name=args.full_name,
                 run_id=args.run_id,
                 step_no=args.step_no,

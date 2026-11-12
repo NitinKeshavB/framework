@@ -9,7 +9,7 @@ The whole path in this repository, from a spec to a registry row. A team adding 
 3. Open a pull request. The source system's owner reviews it, since every table in a delivery shares one pipeline.
 4. Silver and gold: add the table to a project's `project.yaml` and run `./run.sh projects:generate`.
 
-CI runs `./run.sh lint`, `test:quick`, `generate:check`, and `projects:check`. None of them start a cluster.
+CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check`. None of them start a cluster.
 
 ## What `generate` produces
 
@@ -82,7 +82,8 @@ A pipeline or table has one owner. Before inserting, the collector looks up the 
 - `v_pipelines`, `v_tables`: owner, requester, delivery, domain, data domain, team, technical owner, mail lists, classification, and PII.
 - `v_columns`, `v_column_history`: the current columns of raw, bronze, and quarantine, and every version of them (`valid_from`, `valid_to`, `is_current`).
 - `v_lineage`: latest link per parent, child, and relation, written at sync.
-- `v_run_current`: latest step in the last 7 days. `v_process`: every step of a run. `v_recon`: counts on success steps.
+- `v_workflows`, `v_dataflows`, `v_flows`: the job, the table load, and each layer flow from the current definitions.
+- `v_run_current`: latest step in the last 7 days. `v_process`: every step of a run. `v_job_status`: each job with that latest step. `v_recon`: counts on success steps. Job steps use `object_kind = workflow`.
 - `v_ownership_conflicts`: names with more than one owner.
 
 System tables remain the source for job definitions, run duration, pipeline events, and observed lineage. The collector copies the fields that would be lost when those age out or an object is dropped: the owner, the flow graph, the failure text, and the source reconciliation. Analysts query `framework_meta` only.

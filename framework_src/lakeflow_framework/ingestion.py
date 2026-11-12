@@ -249,10 +249,27 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
 
     def step(task: str, after: list[str], number: int, status: str, *more: str, **extra: Any):
         arguments = [
-            "step", "--owner-kind", "source_system", "--owner", system.name, "--full-name", name,
-            "--run-id", "{{job.run_id}}", "--step-no", str(number),
-            "--step-name", task, "--status", status, *more, "--out", EVENTS,
-        ]  # fmt: skip
+            "step",
+            "--owner-kind",
+            "source_system",
+            "--owner",
+            system.name,
+            "--object-kind",
+            "workflow",
+            "--full-name",
+            name,
+            "--run-id",
+            "{{job.run_id}}",
+            "--step-no",
+            str(number),
+            "--step-name",
+            task,
+            "--status",
+            status,
+            *more,
+            "--out",
+            EVENTS,
+        ]
         return run_cli(task, after, arguments, **extra)
 
     tasks = [
@@ -294,7 +311,7 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
     tasks.append(
         step(
             "record_failure",
-            [item["task_key"] for item in tasks[:-1]],
+            [item["task_key"] for item in tasks],
             90,
             "FAILED",
             "--failure-reason",

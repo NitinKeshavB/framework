@@ -14,8 +14,6 @@ artifacts:
 variables:
   catalog:
     default: aal_dev_fdh
-  dev_flag:
-    default: true
 
 targets:
   dev:
@@ -33,8 +31,6 @@ targets:
       root_path: /Workspace/Shared/aztech_finance
     variables:
       catalog: aal_dev_fdh
-      dev_flag:
-        default: false
     permissions:
       - user_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
         level: CAN_MANAGE

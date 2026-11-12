@@ -154,11 +154,15 @@ def workflow_rows(
             grouped.setdefault(config.job_name, []).append(config)
     rows: list[dict[str, Any]] = []
     for job_name, group in sorted(grouped.items()):
+        requesters = sorted({item.requested_by for item in group if item.requested_by})
         payload = json.dumps(
-            {"pipeline_ids": sorted({item.pipeline_id for item in group})}, sort_keys=True
+            {
+                "pipeline_ids": sorted({item.pipeline_id for item in group}),
+                "requested_by": requesters,
+            },
+            sort_keys=True,
         )
         scope = dict(_scope(group[0]))
-        requesters = {item.requested_by for item in group}
         if len(requesters) != 1:
             scope["requested_by"] = None
         rows.append(

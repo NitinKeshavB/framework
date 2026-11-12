@@ -434,7 +434,11 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "project" not in text.replace("project for silver", "")
     assert "${catalog}" not in text
     assert "CREATE BLOOMFILTER INDEX" in text
+    assert "v_workflows" in text
     assert "v_pipelines" in text
+    assert "v_dataflows" in text
+    assert "v_flows" in text
+    assert "v_job_status" in text
     assert "v_tables" in text
     assert "v_object_history" in text
     assert "PARTITION BY object_kind, full_name" in text
@@ -631,8 +635,10 @@ def test_cli_writes_a_step_file_with_recon(tmp_path: Path, capsys: pytest.Captur
             "step",
             "--owner",
             "billing",
+            "--object-kind",
+            "workflow",
             "--full-name",
-            "billing_invoices",
+            "billing_daily",
             "--run-id",
             "100",
             "--step-no",
@@ -649,6 +655,8 @@ def test_cli_writes_a_step_file_with_recon(tmp_path: Path, capsys: pytest.Captur
     )
     assert code == 0
     payload = json.loads(Path(capsys.readouterr().out.strip()).read_text(encoding="utf-8"))
+    assert payload["object_kind"] == "workflow"
+    assert payload["full_name"] == "billing_daily"
     assert payload["recon"]["source_count"] == 10
     assert payload["recon"]["rejected"] == 1
 

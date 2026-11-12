@@ -1,6 +1,6 @@
 # Silver and gold projects
 
-The built structure is described in [framework_projects/README.md](../framework_projects/README.md) and the `project.yaml` contract in [README.md](README.md#projectyaml). This page records the design behind it and the part that is not built.
+The built structure is described in [framework_curation/README.md](../framework_curation/README.md) and the `project.yaml` contract in [README.md](README.md#projectyaml). This page records the design behind it and the part that is not built.
 
 ## Model
 

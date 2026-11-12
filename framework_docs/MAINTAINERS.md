@@ -15,18 +15,18 @@ Order: `framework_bundle`, run `framework_ddl`, start `framework_collector`, the
 ```bash
 ./run.sh bundle:deploy framework_bundle <target> <profile>
 ./run.sh bundle:deploy framework_ingestion <target> <profile>
-./run.sh bundle:deploy framework_projects/<domain>/<project> <target> <profile>
+./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>
 ```
 
 `bundle:validate` and `bundle:deploy` regenerate first: an ingestion deploy rewrites the pipelines, jobs, and map, then checks that every project still finds the bronze tables it reads. A project deploy regenerates the project maps. A removed or renamed bronze table that a project reads stops the ingestion deploy. That is intended.
 
 All bundles must use the same catalog for a given target, because the ingestion jobs read the registry in the platform bundle's catalog. Check the `catalog` variable in each `databricks.yml` when you add a target.
 
-PyPI and a wheel volume are not part of this phase. Every bundle builds `framework_src` with the same artifact block.
+PyPI and a wheel volume are not part of this phase. Every bundle builds `framework_src` with the same artifact block. The wheel depends on PyYAML only. Databricks Connect and the DLT package are not installed into serverless environments.
 
 ## Generated files
 
-`SOURCE_MAP.md`, `pipelines/`, and `resources/` in `framework_ingestion`, and `PROJECT_MAP.md` and `PROJECTS_INDEX.md` in `framework_projects`, are generated and committed. CI should run `./run.sh generate:check` and `./run.sh projects:check`. Do not edit them by hand; the next `generate` overwrites them. A hand-written resource file must not start with the generated marker line.
+`SOURCE_MAP.md`, `pipelines/`, and `resources/` in `framework_ingestion`, and `PROJECT_MAP.md` and `PROJECTS_INDEX.md` in `framework_curation`, are generated and committed. CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check`. Do not edit generated files by hand; the next `generate` overwrites them. A hand-written resource file must not start with the generated marker line.
 
 ## What not to change
 

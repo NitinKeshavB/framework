@@ -171,7 +171,16 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     assert awaited.count("--pipeline") == 2
     assert "pipeline_task" in tasks["refresh_pipeline"]
     failed_after = {item["task_key"] for item in tasks["record_failure"]["depends_on"]}
-    assert failed_after == {"mark_running", "sync", "await_registry", "refresh_pipeline"}
+    assert failed_after == {
+        "mark_running",
+        "sync",
+        "await_registry",
+        "refresh_pipeline",
+        "record_success",
+    }
+    running = tasks["mark_running"]["spark_python_task"]["parameters"]
+    assert running[running.index("--object-kind") + 1] == "workflow"
+    assert running[running.index("--full-name") + 1] == "billing_daily"
 
 
 def test_file_sources_fire_when_files_land_in_the_raw_volume(bundle: Path) -> None:
@@ -534,7 +543,10 @@ def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) 
     assert any(name.endswith("billing_quarantine.invoices") for name in securables)
     (job,) = workflow_rows([config])
     assert job["object_kind"] == "workflow" and job["full_name"] == "billing_daily"
-    assert json.loads(job["config_json"])["pipeline_ids"] == ["billing_invoices"]
+    assert json.loads(job["config_json"]) == {
+        "pipeline_ids": ["billing_invoices"],
+        "requested_by": ["billing"],
+    }
 
     spark, pipelines = _Spark(), _Pipelines()
     build_pipeline("billing_invoices", spark=spark, pipelines=pipelines, config=config)
@@ -547,7 +559,10 @@ def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) 
     _add_table(bundle, "credits", "billing")
     configs = [table.config for table in load_sources(bundle)[0].tables]
     (job,) = workflow_rows(configs)
-    assert json.loads(job["config_json"])["pipeline_ids"] == ["billing_credits", "billing_invoices"]
+    assert json.loads(job["config_json"]) == {
+        "pipeline_ids": ["billing_credits", "billing_invoices"],
+        "requested_by": ["billing"],
+    }
 
 
 def test_a_spec_with_no_project_sits_next_to_source_yaml(bundle: Path) -> None:

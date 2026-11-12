@@ -12,7 +12,7 @@ Folders at the repository root start with `framework_`.
 - `framework_tests` runs without Spark.
 - `framework_docs` is this documentation.
 
-Three things are kept apart on purpose: the **meta framework** (registry and collector), **source ingestion** (domain-owned, shared), and **projects** (silver and gold, one owner each). They deploy separately and have different owners.
+Three things are kept apart on purpose: the **meta framework** (registry and collector), **source ingestion** (domain-owned, shared), and **curation** (silver, gold, and data products, one project owner each). They deploy separately and have different owners.
 
 ## Dependency direction
 
@@ -90,23 +90,25 @@ Every box is a row in `object_registry`, except `RUN_STEP`, which is a row in `r
 ```mermaid
 erDiagram
   WORKFLOW |o--o{ PIPELINE : owns
-  PIPELINE ||--|{ FLOW : has
-  FLOW ||--|| SECURABLE : "writes or rejects_to"
+  WORKFLOW ||--o{ RUN_STEP : "job run steps"
+  PIPELINE ||--|| DATAFLOW : contains
+  DATAFLOW ||--|{ FLOW : "reads writes rejects_to"
+  FLOW ||--o| SECURABLE : "writes or rejects_to"
   PIPELINE ||--|{ LINK : "writes or rejects_to"
   LINK }o--|| SECURABLE : names
   SECURABLE ||--o{ COLUMN : column_of
-  PIPELINE ||--o{ RUN_STEP : "steps of a run"
 ```
 
 | Kind | `full_name` | Parent | `relation` | What `config_json` holds |
 | --- | --- | --- | --- | --- |
-| `workflow` | `job_name` | none | none | Every `pipeline_id` in that job |
+| `workflow` | `job_name` | none | none | Every `pipeline_id` in that job, and every requester |
 | `pipeline` | `pipeline_id` | `job_name` when set | `owns` | Canonical spec and compiled rules |
 | `dataflow` | `pipeline_id` | the pipeline | `contains` | Raw layer, bronze table, and quarantine table |
 | `flow` | `<pipeline_id>.raw`, `.bronze`, `.quarantine` | the dataflow | `reads`, `writes`, or `rejects_to` | Volume path, or table name and layer |
 | `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, domain, classification, PII |
 | `link` | `<pipeline_id>-><table>` | pipeline | `writes` or `rejects_to` | Child table name |
 | `column` | `<table>.<column>` | table name | `column_of` | Ordinal, type, description, classification, PII |
+| `run_ledger` step | the job name | none | none | Status `RUNNING` / `SUCCEEDED` / `FAILED`, step name, optional recon |
 
 A file source whose raw layer is a volume still has a `raw` flow. That flow records the volume path and has no securable. A `cloud_files` raw flow has a securable, because its raw layer is a Delta table. A database load has no raw flow. Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
 
@@ -124,26 +126,31 @@ flowchart TD
   object_registry --> v_object_history
   object_registry --> v_lineage
   object_registry --> v_ownership_conflicts
+  v_object_current --> v_workflows
   v_object_current --> v_pipelines
+  v_object_current --> v_dataflows
+  v_object_current --> v_flows
   v_object_current --> v_tables
   v_object_current --> v_columns
   v_object_history --> v_column_history
   run_ledger --> v_process
   run_ledger --> v_run_current
   run_ledger --> v_recon
+  v_workflows --> v_job_status
+  v_run_current --> v_job_status
 ```
 
-`v_lineage` is the latest `link` row for each parent, child, and relation. `v_pipelines`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` is the `record_success` step with `recon_json` parsed. `v_run_current` is the latest step in the last 7 days. `v_ownership_conflicts` lists any name with more than one owner.
+`v_lineage` is the latest `link` row for each parent, child, and relation. `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` is the `record_success` step with `recon_json` parsed. `v_run_current` is the latest step in the last 7 days. `v_job_status` joins each workflow to that latest step. `v_ownership_conflicts` lists any name with more than one owner. Job run steps are stored with `object_kind = workflow` and `full_name = job_name`.
 
 ## Design choices
 
-**Source drives the pipeline.** The kind of source decides the graph. Files stay in a raw volume and bronze reads them from there. Databases are read through a foreign catalog straight into bronze. Only the original `cloud_files` path has a raw table. Quarantine and bronze are always built, and both are filtered by the quality rules.
+**The Unity Catalog volume is the raw layer for file kinds.** `sftp_files` and `sharepoint_files` keep the files as delivered and have no raw Delta table. A database has no raw layer. Only `cloud_files` writes a raw table first. Quarantine and bronze are always built, and both are filtered by the quality rules.
+
+**The source system owns bronze.** Many teams can add specs under one source. The registry records `requested_by` for the team that asked. The collector refuses a second source system for the same table. Two teams under the same source share that owner on purpose. Silver, gold, and data products are owned by a project.
+
+**A delivery is the pipeline.** Every table in a delivery loads in one Lakeflow pipeline and one job. A second schedule is a second delivery in that source's `source.yaml`. A project folder does not declare a pipeline. A new table in an existing delivery is a spec file and nothing else. Cross-table waits belong to curation, not to bronze.
 
 **Facts live once.** The source's kind, raw volume, and foreign catalog are in `source.yaml`. A table spec holds only the table. `compose_document` joins them, so a new table cannot disagree with its source.
-
-**Ownership is explicit.** Bronze is owned by the source system, because a source system is shared by many teams. Silver and gold are owned by a project. The registry stores `owner_kind` and `owner` on every row, plus `requested_by` for bronze. The collector enforces one owner per table.
-
-**A delivery is the unit of deployment.** Every table in a delivery loads in one pipeline and one job. A new table in an existing delivery is a spec file and nothing else.
 
 **Everything operational is generated from the specs.** Pipelines, jobs, and maps come from one model, so the map is the deployed state. Generated files are marked, deleted when unneeded, and checked in CI.
 

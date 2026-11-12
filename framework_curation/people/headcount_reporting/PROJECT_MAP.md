@@ -16,6 +16,12 @@ Owner: hr.owner@jll.com.
 | --- | --- | --- | --- |
 | headcount_by_department | `silver.headcount_clean` | - | - |
 
+## Data products
+
+| Table | Triggered by | Reads | Deadline |
+| --- | --- | --- | --- |
+| headcount | `gold.headcount_by_department` | - | - |
+
 ## Checks
 
 - None.
@@ -30,4 +36,6 @@ flowchart LR
   hr_docs_headcount([hr_docs.headcount]) --> silver_headcount_clean
   gold_headcount_by_department[gold.headcount_by_department]
   silver_headcount_clean --> gold_headcount_by_department
+  product_headcount[product.headcount]
+  gold_headcount_by_department --> product_headcount
 ```

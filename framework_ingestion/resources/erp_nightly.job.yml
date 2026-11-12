@@ -27,6 +27,8 @@ resources:
           - source_system
           - --owner
           - erp
+          - --object-kind
+          - workflow
           - --full-name
           - erp_nightly
           - --run-id
@@ -84,6 +86,8 @@ resources:
           - source_system
           - --owner
           - erp
+          - --object-kind
+          - workflow
           - --full-name
           - erp_nightly
           - --run-id
@@ -102,6 +106,7 @@ resources:
         - task_key: sync
         - task_key: await_registry
         - task_key: refresh_pipeline
+        - task_key: record_success
         run_if: AT_LEAST_ONE_FAILED
         environment_key: framework_env
         spark_python_task:
@@ -112,6 +117,8 @@ resources:
           - source_system
           - --owner
           - erp
+          - --object-kind
+          - workflow
           - --full-name
           - erp_nightly
           - --run-id

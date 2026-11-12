@@ -18,6 +18,12 @@ Owner: reporting.owner@jll.com.
 | people_cost | `silver.invoices_clean` | `headcount_reporting.silver.headcount_clean` (project headcount_reporting) | - |
 | revenue_daily | `silver.invoices_clean`, `silver.customer_orders` | - | 08:00 UTC, alert |
 
+## Data products
+
+| Table | Triggered by | Reads | Deadline |
+| --- | --- | --- | --- |
+| revenue | `gold.revenue_daily` | - | 09:00 UTC, alert |
+
 ## Checks
 
 - None.
@@ -39,4 +45,6 @@ flowchart LR
   gold_revenue_daily[gold.revenue_daily]
   silver_invoices_clean --> gold_revenue_daily
   silver_customer_orders --> gold_revenue_daily
+  product_revenue[product.revenue]
+  gold_revenue_daily --> product_revenue
 ```
