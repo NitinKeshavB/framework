@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Callable
 
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
     OBJECT_COLUMNS,
+    OWNED_KINDS,
     current_objects_sql,
     ddl_statements,
     ingest_steps,
@@ -68,6 +70,17 @@ def append_steps(spark, payloads: list[dict], seen: set | None = None, catalog: 
         date_columns=("event_date",),
         int_columns=("step_no",),
     )
+    _merge_current(
+        spark,
+        _table(catalog, "run_current"),
+        rows,
+        LEDGER_COLUMNS,
+        ("owner_kind", "owner", "object_kind", "full_name"),
+        timestamp_columns=("started_at", "ended_at", "recorded_at"),
+        date_columns=("event_date",),
+        int_columns=("step_no",),
+        newer_than="recorded_at",
+    )
     if seen is not None:
         seen.update(staged)
     return written
@@ -95,6 +108,14 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
         _table(catalog, "object_registry"),
         fresh,
         OBJECT_COLUMNS,
+        timestamp_columns=("recorded_at",),
+    )
+    _merge_current(
+        spark,
+        _table(catalog, "object_current"),
+        fresh,
+        OBJECT_COLUMNS,
+        ("object_kind", "full_name"),
         timestamp_columns=("recorded_at",),
     )
     for row in fresh:
@@ -195,6 +216,48 @@ def _current_object_hashes(spark, catalog: str, rows: list[dict]) -> dict[tuple[
     }
 
 
+def _merge_current(
+    spark,
+    table: str,
+    rows: list[dict],
+    columns: tuple[str, ...],
+    keys: tuple[str, ...],
+    timestamp_columns: tuple[str, ...] = (),
+    date_columns: tuple[str, ...] = (),
+    int_columns: tuple[str, ...] = (),
+    newer_than: str | None = None,
+) -> None:
+    """Replace the one current row for each key. History tables are not updated."""
+
+    if not rows or spark is None or not hasattr(spark, "createDataFrame"):
+        return
+    from pyspark.sql.types import StringType, StructField, StructType
+
+    string_rows = [
+        {column: None if row.get(column) is None else str(row.get(column)) for column in columns}
+        for row in rows
+    ]
+    schema = StructType([StructField(column, StringType(), True) for column in columns])
+    spark.createDataFrame(string_rows, schema).createOrReplaceTempView("_framework_current")
+    select = ", ".join(
+        _cast(column, timestamp_columns, date_columns, int_columns) for column in columns
+    )
+    assignments = ", ".join(f"t.{column} = s.{column}" for column in columns)
+    inserted = ", ".join(columns)
+    values = ", ".join(f"s.{column}" for column in columns)
+    matched = ""
+    if newer_than:
+        matched = f" AND s.{newer_than} >= t.{newer_than}"
+    on = " AND ".join(f"t.{key} = s.{key}" for key in keys)
+    spark.sql(
+        f"MERGE INTO {table} t "
+        f"USING (SELECT {select} FROM _framework_current) s "
+        f"ON {on} "
+        f"WHEN MATCHED{matched} THEN UPDATE SET {assignments} "
+        f"WHEN NOT MATCHED THEN INSERT ({inserted}) VALUES ({values})"
+    )
+
+
 def _insert(
     spark,
     table: str,
@@ -249,3 +312,155 @@ def _rows(frame: Any) -> list[dict]:
 
 def _names(frame: Any) -> set[str]:
     return {str(row["full_name"]) for row in _rows(frame)}
+
+
+def _event_time(column: str) -> str:
+    return (
+        f"COALESCE(to_timestamp({column}, 'yyyy-MM-dd''T''HH:mm:ss''Z'''), "
+        f"CAST({column} AS TIMESTAMP))"
+    )
+
+
+def event_statements(catalog: str) -> list[str]:
+    """Land one Auto Loader batch in Spark.
+
+    The driver never collects the batch. History is insert-only and checked for two days.
+    Current tables are merged so a status read is one row.
+    """
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", catalog or ""):
+        raise ValueError("catalog is required")
+    meta = f"{catalog}.framework_meta"
+    recorded = _event_time("e.recorded_at")
+    started = _event_time("e.started_at")
+    ended = _event_time("e.ended_at")
+    owned = ", ".join(f"'{kind}'" for kind in sorted(OWNED_KINDS))
+    latest_step = (
+        "SELECT * FROM _framework_events WHERE kind = 'step' "
+        "QUALIFY row_number() OVER ("
+        "PARTITION BY run_id, step_no, status ORDER BY recorded_at DESC) = 1"
+    )
+    current_step = (
+        "SELECT * FROM _framework_events WHERE kind = 'step' "
+        "QUALIFY row_number() OVER ("
+        "PARTITION BY owner_kind, owner, object_kind, full_name "
+        "ORDER BY recorded_at DESC) = 1"
+    )
+    latest_definition = (
+        "SELECT * FROM _framework_events WHERE kind = 'definition' "
+        "QUALIFY row_number() OVER ("
+        "PARTITION BY object_kind, full_name ORDER BY recorded_at DESC) = 1"
+    )
+    step_columns = (
+        f"e.run_id, e.parent_run_id, e.object_kind, e.full_name, e.owner_kind, e.owner, "
+        f"CAST(e.step_no AS INT), e.step_name, e.status, {started}, {ended}, "
+        f"e.failure_reason, e.recon_json, {recorded}, "
+        "CAST(substr(e.recorded_at, 1, 10) AS DATE)"
+    )
+    ledger_insert = (
+        f"INSERT INTO {meta}.run_ledger "
+        f"SELECT {step_columns} FROM ({latest_step}) e "
+        f"WHERE NOT EXISTS ("
+        f"SELECT 1 FROM {meta}.run_ledger r "
+        f"WHERE r.run_id = e.run_id AND r.step_no = CAST(e.step_no AS INT) "
+        f"AND r.status = e.status AND r.event_date >= date_sub(current_date(), 2))"
+    )
+    step_select = (
+        f"SELECT e.run_id, e.parent_run_id, e.object_kind, e.full_name, e.owner_kind, e.owner, "
+        f"CAST(e.step_no AS INT) AS step_no, e.step_name, e.status, "
+        f"{started} AS started_at, {ended} AS ended_at, e.failure_reason, e.recon_json, "
+        f"{recorded} AS recorded_at, CAST(substr(e.recorded_at, 1, 10) AS DATE) AS event_date "
+        f"FROM ({current_step}) e"
+    )
+    run_assignments = ", ".join(f"t.{column} = s.{column}" for column in LEDGER_COLUMNS)
+    run_values = ", ".join(f"s.{column}" for column in LEDGER_COLUMNS)
+    run_merge = (
+        f"MERGE INTO {meta}.run_current t USING ({step_select}) s "
+        f"ON t.owner_kind = s.owner_kind AND t.owner = s.owner "
+        f"AND t.object_kind = s.object_kind AND t.full_name = s.full_name "
+        f"WHEN MATCHED AND s.recorded_at >= t.recorded_at THEN UPDATE SET {run_assignments} "
+        f"WHEN NOT MATCHED THEN INSERT ({', '.join(LEDGER_COLUMNS)}) VALUES ({run_values})"
+    )
+    ownership = (
+        f"INSERT INTO {meta}.run_ledger "
+        f"SELECT concat('ownership-', substr(e.content_hash, 1, 16)), "
+        f"CAST(NULL AS STRING), e.object_kind, "
+        f"e.full_name, e.owner_kind, e.owner, 1, 'ownership_check', 'FAILED', "
+        f"{recorded}, {recorded}, "
+        f"concat(e.full_name, ' is owned by ', c.owner_kind, ' ', c.owner, '; ', "
+        f"e.owner_kind, ' ', e.owner, ' cannot register it'), "
+        f"CAST(NULL AS STRING), {recorded}, CAST(substr(e.recorded_at, 1, 10) AS DATE) "
+        f"FROM ({latest_definition}) e "
+        f"JOIN {meta}.object_current c "
+        f"ON c.object_kind = e.object_kind AND c.full_name = e.full_name "
+        f"WHERE e.object_kind IN ({owned}) "
+        f"AND (c.owner_kind <> e.owner_kind OR c.owner <> e.owner) "
+        f"AND NOT EXISTS ("
+        f"SELECT 1 FROM {meta}.run_ledger r "
+        f"WHERE r.run_id = concat('ownership-', substr(e.content_hash, 1, 16)) "
+        f"AND r.step_name = 'ownership_check' "
+        f"AND r.event_date >= date_sub(current_date(), 2))"
+    )
+    ownership_reason = (
+        "concat(e.full_name, ' is owned by ', c.owner_kind, ' ', c.owner, '; ', "
+        "e.owner_kind, ' ', e.owner, ' cannot register it')"
+    )
+    ownership_current = (
+        f"MERGE INTO {meta}.run_current t USING ("
+        f"SELECT concat('ownership-', substr(e.content_hash, 1, 16)) AS run_id, "
+        f"CAST(NULL AS STRING) AS parent_run_id, e.object_kind, e.full_name, e.owner_kind, "
+        f"e.owner, CAST(1 AS INT) AS step_no, 'ownership_check' AS step_name, 'FAILED' AS status, "
+        f"{recorded} AS started_at, {recorded} AS ended_at, {ownership_reason} AS failure_reason, "
+        f"CAST(NULL AS STRING) AS recon_json, {recorded} AS recorded_at, "
+        f"CAST(substr(e.recorded_at, 1, 10) AS DATE) AS event_date "
+        f"FROM ({latest_definition}) e "
+        f"JOIN {meta}.object_current c "
+        f"ON c.object_kind = e.object_kind AND c.full_name = e.full_name "
+        f"WHERE e.object_kind IN ({owned}) "
+        f"AND (c.owner_kind <> e.owner_kind OR c.owner <> e.owner)"
+        f") s ON t.owner_kind = s.owner_kind AND t.owner = s.owner "
+        f"AND t.object_kind = s.object_kind AND t.full_name = s.full_name "
+        f"WHEN MATCHED AND s.recorded_at >= t.recorded_at THEN UPDATE SET {run_assignments} "
+        f"WHEN NOT MATCHED THEN INSERT ({', '.join(LEDGER_COLUMNS)}) VALUES ({run_values})"
+    )
+    accepted = (
+        f"SELECT e.object_kind, e.full_name, e.owner_kind, e.owner, e.requested_by, e.delivery, "
+        f"e.parent_full_name, e.relation, e.config_json, e.content_hash, e.source, "
+        f"{recorded} AS recorded_at "
+        f"FROM ({latest_definition}) e "
+        f"LEFT JOIN {meta}.object_current c "
+        f"ON c.object_kind = e.object_kind AND c.full_name = e.full_name "
+        f"WHERE (c.full_name IS NULL OR (c.content_hash <> e.content_hash "
+        f"AND {recorded} >= c.recorded_at)) "
+        f"AND NOT (e.object_kind IN ({owned}) AND c.full_name IS NOT NULL "
+        f"AND (c.owner_kind <> e.owner_kind OR c.owner <> e.owner))"
+    )
+    object_insert = (
+        f"INSERT INTO {meta}.object_registry "
+        f"SELECT object_kind, full_name, owner_kind, owner, requested_by, delivery, "
+        f"parent_full_name, relation, config_json, content_hash, source, recorded_at "
+        f"FROM ({accepted}) a"
+    )
+    object_assignments = ", ".join(f"t.{column} = s.{column}" for column in OBJECT_COLUMNS)
+    object_values = ", ".join(f"s.{column}" for column in OBJECT_COLUMNS)
+    object_merge = (
+        f"MERGE INTO {meta}.object_current t USING ({accepted}) s "
+        f"ON t.object_kind = s.object_kind AND t.full_name = s.full_name "
+        f"WHEN MATCHED AND s.recorded_at >= t.recorded_at THEN UPDATE SET {object_assignments} "
+        f"WHEN NOT MATCHED THEN INSERT ({', '.join(OBJECT_COLUMNS)}) VALUES ({object_values})"
+    )
+    return [
+        ledger_insert,
+        run_merge,
+        ownership,
+        ownership_current,
+        object_insert,
+        object_merge,
+    ]
+
+
+def land_events(spark, catalog: str) -> None:
+    """Apply one micro-batch that is already registered as _framework_events."""
+
+    for statement in event_statements(catalog):
+        spark.sql(statement)

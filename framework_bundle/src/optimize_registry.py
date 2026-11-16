@@ -10,6 +10,8 @@ def main() -> None:
     spark = SparkSession.builder.getOrCreate()
     spark.sql(f"OPTIMIZE {catalog}.framework_meta.object_registry")
     spark.sql(f"OPTIMIZE {catalog}.framework_meta.run_ledger")
+    spark.sql(f"OPTIMIZE {catalog}.framework_meta.object_current")
+    spark.sql(f"OPTIMIZE {catalog}.framework_meta.run_current")
 
 
 if __name__ == "__main__":

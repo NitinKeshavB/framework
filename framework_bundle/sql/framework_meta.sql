@@ -1,5 +1,8 @@
 -- Registry for Lakeflow workflows, pipelines, flows, securables, runs, and reconciliation.
--- ${catalog} is replaced by the DDL task. These statements do not delete rows.
+-- ${catalog} is replaced by the DDL task. History tables are insert-only.
+-- object_current and run_current hold one row per key so a job status check does not
+-- window the history. The collector replaces those rows. The backfill below runs only
+-- while the current table is empty.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
@@ -53,7 +56,52 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'false'
 );
 
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_current AS
+-- One row per object. Lookups and dashboards read this, not the history window.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_current (
+  object_kind STRING,
+  full_name STRING,
+  owner_kind STRING,
+  owner STRING,
+  requested_by STRING,
+  delivery STRING,
+  parent_full_name STRING,
+  relation STRING,
+  config_json STRING,
+  content_hash STRING,
+  source STRING,
+  recorded_at TIMESTAMP
+)
+CLUSTER BY (owner, object_kind, full_name)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'false'
+);
+
+-- One row per job or pipeline: the latest step. run_ledger keeps every step.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_current (
+  run_id STRING,
+  parent_run_id STRING,
+  object_kind STRING,
+  full_name STRING,
+  owner_kind STRING,
+  owner STRING,
+  step_no INT,
+  step_name STRING,
+  status STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  failure_reason STRING,
+  recon_json STRING,
+  recorded_at TIMESTAMP,
+  event_date DATE
+)
+CLUSTER BY (owner, object_kind, full_name)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'false'
+);
+
+INSERT INTO ${catalog}.framework_meta.object_current
 SELECT
   object_kind,
   full_name,
@@ -68,10 +116,51 @@ SELECT
   source,
   recorded_at
 FROM ${catalog}.framework_meta.object_registry
+WHERE (SELECT COUNT(*) FROM ${catalog}.framework_meta.object_current) = 0
 QUALIFY row_number() OVER (
   PARTITION BY object_kind, full_name
   ORDER BY recorded_at DESC
 ) = 1;
+
+INSERT INTO ${catalog}.framework_meta.run_current
+SELECT
+  run_id,
+  parent_run_id,
+  object_kind,
+  full_name,
+  owner_kind,
+  owner,
+  step_no,
+  step_name,
+  status,
+  started_at,
+  ended_at,
+  failure_reason,
+  recon_json,
+  recorded_at,
+  event_date
+FROM ${catalog}.framework_meta.run_ledger
+WHERE (SELECT COUNT(*) FROM ${catalog}.framework_meta.run_current) = 0
+QUALIFY row_number() OVER (
+  PARTITION BY owner_kind, owner, object_kind, full_name
+  ORDER BY recorded_at DESC
+) = 1;
+
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_current AS
+SELECT
+  object_kind,
+  full_name,
+  owner_kind,
+  owner,
+  requested_by,
+  delivery,
+  parent_full_name,
+  relation,
+  config_json,
+  content_hash,
+  source,
+  recorded_at
+FROM ${catalog}.framework_meta.object_current;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_run_current AS
 SELECT
@@ -90,12 +179,8 @@ SELECT
   recon_json,
   recorded_at,
   event_date
-FROM ${catalog}.framework_meta.run_ledger
-WHERE event_date >= date_sub(current_date(), 7)
-QUALIFY row_number() OVER (
-  PARTITION BY owner_kind, owner, object_kind, full_name
-  ORDER BY recorded_at DESC
-) = 1;
+FROM ${catalog}.framework_meta.run_current
+WHERE event_date >= date_sub(current_date(), 7);
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_process AS
 SELECT
@@ -146,6 +231,7 @@ FROM (
     ) AS recon
   FROM ${catalog}.framework_meta.run_ledger
   WHERE step_name = 'record_success'
+    AND event_date >= date_sub(current_date(), 7)
 ) parsed;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_lineage AS
@@ -159,12 +245,8 @@ SELECT
   content_hash,
   source,
   recorded_at
-FROM ${catalog}.framework_meta.object_registry
-WHERE object_kind = 'link'
-QUALIFY row_number() OVER (
-  PARTITION BY parent_full_name, full_name, relation
-  ORDER BY recorded_at DESC
-) = 1;
+FROM ${catalog}.framework_meta.object_current
+WHERE object_kind = 'link';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_workflows AS
 SELECT
@@ -270,14 +352,14 @@ LEFT JOIN ${catalog}.framework_meta.v_run_current run
  AND run.owner_kind = workflow.owner_kind
  AND run.owner = workflow.owner;
 
--- A table has one owner. This view is empty when that holds. The collector refuses a definition
--- whose owner differs from the current one, so a row here means a registry written by hand.
+-- A table has one current owner. This view is empty when that holds. A row here means
+-- object_current was written by hand with two rows for the same name.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_conflicts AS
 SELECT
   object_kind,
   full_name,
   collect_set(concat(owner_kind, ':', owner)) AS owners
-FROM ${catalog}.framework_meta.object_registry
+FROM ${catalog}.framework_meta.object_current
 WHERE object_kind IN ('pipeline', 'table', 'streaming_table', 'materialized_view')
 GROUP BY object_kind, full_name
 HAVING count(DISTINCT concat(owner_kind, ':', owner)) > 1;

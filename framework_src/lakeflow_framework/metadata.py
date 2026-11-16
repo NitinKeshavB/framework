@@ -398,21 +398,29 @@ _SAFE_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def definition_file_name(row: Mapping[str, Any]) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", str(row["full_name"])).strip("_")
-    return (
-        f"{row['owner_kind']}/{row['owner']}/definitions/"
-        f"{row['object_kind']}_{safe_name}_{str(row['content_hash'])[:16]}.json"
-    )
-
-
 def write_definition_files(directory: Path, rows: list[dict[str, Any]]) -> list[Path]:
-    written: list[Path] = []
+    """One JSON-lines file per owner.
+
+    A sync used to write one file per column, flow, and link. At thousands of jobs that listing
+    is the collector's bottleneck. One file per owner is one Auto Loader file; each line is one
+    definition. The name is the hash of the body, so an unchanged sync overwrites the same file
+    and is not collected again.
+    """
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
-        payload = {"kind": "definition", **row}
-        target = directory / definition_file_name(row)
+        grouped.setdefault((str(row["owner_kind"]), str(row["owner"])), []).append(row)
+    written: list[Path] = []
+    for (owner_kind, owner), group in sorted(grouped.items()):
+        lines = [
+            json.dumps({"kind": "definition", **row}, sort_keys=True, separators=(",", ":"))
+            for row in group
+        ]
+        body = "\n".join(lines) + "\n"
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+        target = directory / owner_kind / owner / "definitions" / f"{digest}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        target.write_text(body, encoding="utf-8")
         written.append(target)
     return written
 
@@ -488,6 +496,7 @@ def step_payload(
         "ended_at": ended_at,
         "failure_reason": failure_reason,
         "recon": dict(recon) if recon else None,
+        "recon_json": json.dumps(recon, sort_keys=True) if recon else None,
         "recorded_at": _now(),
     }
 
@@ -523,7 +532,7 @@ def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
         "failure_reason": payload.get("failure_reason"),
         "recon_json": json.dumps(payload["recon"], sort_keys=True)
         if payload.get("recon")
-        else None,
+        else payload.get("recon_json"),
         "recorded_at": recorded,
         "event_date": recorded[:10],
     }
@@ -604,7 +613,7 @@ def registered_sql(pipeline_ids: list[str], catalog: str) -> str:
 
 
 def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
-    """Latest stored hash for each object. A matching hash means that version is still active."""
+    """Current hash for each object. object_current has one row, so this is a point lookup."""
 
     if not catalog or not _SAFE_TOKEN.match(catalog):
         raise ValueError("catalog is required")
@@ -624,13 +633,10 @@ def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
     quoted_owner_kinds = ", ".join(f"'{kind}'" for kind in owner_kinds)
     return (
         "SELECT object_kind, full_name, content_hash "
-        f"FROM {catalog}.framework_meta.object_registry "
+        f"FROM {catalog}.framework_meta.object_current "
         f"WHERE owner_kind IN ({quoted_owner_kinds}) AND owner IN ({quoted_owners}) "
         f"AND object_kind IN ({quoted_kinds}) "
-        f"AND full_name IN ({quoted_names}) "
-        "QUALIFY row_number() OVER ("
-        "PARTITION BY object_kind, full_name ORDER BY recorded_at DESC"
-        ") = 1"
+        f"AND full_name IN ({quoted_names})"
     )
 
 

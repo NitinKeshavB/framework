@@ -26,6 +26,7 @@ from lakeflow_framework.config import (
     EMAIL,
     FILE_KINDS,
     IDENTIFIER,
+    VOLUME_PATH,
     ConfigValidationError,
     PipelineConfig,
     email_notifications,
@@ -413,9 +414,11 @@ def _read_source(path: Path, name: str, errors: list[str]) -> SourceSystem | Non
         if trigger and kind == DATABASE_KIND:
             found.append(f"{path}: a database delivery runs on a schedule, not a {trigger}")
         if trigger == "file_arrival" and kind == "cloud_files":
-            if not CLOUD_PATH.match(str(detail.get("path") or "")):
+            arrival = str(detail.get("path") or "")
+            if not (CLOUD_PATH.match(arrival) or VOLUME_PATH.match(arrival)):
                 found.append(
-                    f"{path}: delivery {delivery} needs a path that starts with abfss:// or s3://"
+                    f"{path}: delivery {delivery} needs a path that starts with abfss:// or s3://, "
+                    "or a /Volumes path"
                 )
     errors.extend(found)
     if found:

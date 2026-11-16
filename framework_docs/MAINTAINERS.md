@@ -30,7 +30,7 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 
 ## What not to change
 
-- Do not add a writer besides the collector for `object_registry` and `run_ledger`. Jobs write JSON files only. The collector inserts a definition only when `(object_kind, full_name, content_hash)` is new, and a step only when `(run_id, step_no, status)` is new.
+- Do not add a writer besides the collector for the registry tables. Jobs write JSON files only. The collector inserts into `object_registry` and `run_ledger`. It merges `object_current` and `run_current`. Do not `UPDATE` or `DELETE` the history tables.
 - Do not weaken the ownership check. The collector must keep refusing a pipeline or table another owner holds.
 - Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines. The collector is the exception: its checkpoint is under the events volume because it is a job, and it lists only `*.json` so that checkpoint is not ingested.
 - Do not schedule a `VACUUM` that shortens retention.

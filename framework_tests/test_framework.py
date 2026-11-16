@@ -9,7 +9,12 @@ import pytest
 
 from lakeflow_framework import ConfigValidationError, build_pipeline, validate_configs
 from lakeflow_framework.cli import main
-from lakeflow_framework.collector import _cast, append_definitions, await_registered
+from lakeflow_framework.collector import (
+    _cast,
+    append_definitions,
+    await_registered,
+    event_statements,
+)
 from lakeflow_framework.config import config_from_document, email_notifications
 from lakeflow_framework.load import get_strategy
 from lakeflow_framework.metadata import (
@@ -428,12 +433,12 @@ def test_current_lookup_prunes_by_owner_kind_and_name():
             }
         ],
     )
-    assert "FROM framework_dev.framework_meta.object_registry" in statement
+    assert "FROM framework_dev.framework_meta.object_current" in statement
     assert "owner_kind IN ('source_system')" in statement
     assert "owner IN ('billing')" in statement
     assert "object_kind IN ('column')" in statement
     assert "full_name IN ('framework_dev.billing_bronze.invoices.amount')" in statement
-    assert "QUALIFY row_number()" in statement
+    assert "QUALIFY" not in statement
     assert "v_object_current" not in statement
 
 
@@ -455,6 +460,13 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "v_tables" in text
     assert "v_object_history" in text
     assert "PARTITION BY object_kind, full_name" in text
+    assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.object_current" in text
+    assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.run_current" in text
+    current_view = next(statement for statement in statements if "v_object_current" in statement)
+    assert "object_current" in current_view
+    assert "QUALIFY" not in current_view
+    recon = next(statement for statement in statements if "v_recon" in statement)
+    assert "date_sub(current_date(), 7)" in recon
     history = text.split("v_object_history", 1)[1]
     assert "PARTITION BY owner_kind, owner, object_kind, full_name" in history
     assert "CREATE BLOOMFILTER INDEX" not in text
@@ -631,18 +643,22 @@ def test_example_columns_keep_descriptions_and_sensitivity():
     assert recorded["classification"] == "confidential"
 
 
-def test_definition_files_are_one_object_each_and_steps_stay_separate(tmp_path: Path):
+def test_definition_files_are_one_file_per_owner(tmp_path: Path):
     rows = object_rows(config_from_document(_billing()))
     written = write_definition_files(tmp_path, rows)
-    assert len(written) == len(rows)
-    payload = json.loads(written[0].read_text(encoding="utf-8"))
-    assert payload["kind"] == "definition"
+    assert len(written) == 1
+    lines = [line for line in written[0].read_text(encoding="utf-8").splitlines() if line]
+    assert len(lines) == len(rows)
+    payloads = [json.loads(line) for line in lines]
+    assert {payload["kind"] for payload in payloads} == {"definition"}
     steps, definitions = split_payloads(
-        [payload, {"kind": "step", "run_id": "1"}, {"kind": "other"}]
+        payloads + [{"kind": "step", "run_id": "1"}, {"kind": "other"}]
     )
     assert len(steps) == 1
-    assert len(definitions) == 1
+    assert len(definitions) == len(rows)
     assert "kind" not in definitions[0]
+    again = write_definition_files(tmp_path, rows)
+    assert again == written
 
 
 def test_cli_writes_a_step_file_with_recon(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
@@ -952,12 +968,30 @@ def test_collector_bounds_the_micro_batch():
     assert 'option("cloudFiles.maxFilesPerTrigger", _MAX_FILES_PER_TRIGGER)' in text
     assert 'option("pathGlobFilter", "*.json")' in text
     assert "_checkpoints/collector" in text
-    assert "_MAX_SEEN = 50_000" in text
+    assert '_MAX_FILES_PER_TRIGGER = "5000"' in text
+    assert "land_events" in text
+    assert ".collect()" not in text
+    statements = event_statements("framework_dev")
+    landed = "\n".join(statements)
+    assert "framework_dev.framework_meta.object_current" in landed
+    assert "framework_dev.framework_meta.run_current" in landed
+    assert "date_sub(current_date(), 2)" in landed
+    assert "INSERT INTO framework_dev.framework_meta.object_registry" in landed
+    with pytest.raises(ValueError):
+        event_statements("framework dev")
 
 
 def test_an_unsafe_name_is_not_inserted_by_skipping_the_check():
     with pytest.raises(ValueError):
         append_definitions(object(), [_owned_row(full_name="not a name")], set(), "framework_dev")
+
+
+def test_cloud_files_accept_a_unity_catalog_volume_path():
+    config = config_from_document(
+        _billing(path="/Volumes/framework_dev/billing_raw/landing/invoices/")
+    )
+    assert config.load_method == "autoloader"
+    assert config.path == "/Volumes/framework_dev/billing_raw/landing/invoices/"
 
 
 def test_batch_sql_escapes_quotes_in_paths_and_excel_addresses():

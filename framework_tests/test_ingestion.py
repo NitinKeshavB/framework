@@ -228,6 +228,28 @@ def test_cloud_files_source_keeps_its_raw_table_and_adds_a_batch_load_step(bundl
     assert _job(bundle, "legacy_daily")["trigger"]["file_arrival"]["url"].startswith("abfss://")
 
 
+def test_cloud_files_file_arrival_can_watch_a_volume(bundle: Path) -> None:
+    folder = bundle / "sources" / "legacy" / "legacy"
+    folder.mkdir(parents=True)
+    volume = "/Volumes/framework_dev/legacy_raw/landing/"
+    (folder.parent / "source.yaml").write_text(
+        LEGACY_SOURCE.replace(
+            "abfss://landing@storage.dfs.core.windows.net/legacy/",
+            volume,
+        ),
+        "utf-8",
+    )
+    (folder / "legacy_credits.yaml").write_text(
+        LEGACY_SPEC.replace(
+            "abfss://landing@storage.dfs.core.windows.net/legacy/credits/",
+            volume + "credits/",
+        ),
+        "utf-8",
+    )
+    generate(bundle)
+    assert _job(bundle, "legacy_daily")["trigger"]["file_arrival"]["url"] == volume
+
+
 def test_specs_do_not_name_a_catalog_and_jobs_pass_the_environment_catalog(bundle: Path) -> None:
     spec = bundle / "sources/billing/billing/billing_invoices.yaml"
     assert "catalog:" not in spec.read_text("utf-8")

@@ -429,8 +429,8 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         errors.append(f"{label}: path is required")
     elif path and load_method == "volume_files" and not VOLUME_PATH.match(path):
         errors.append(f"{label}: path must be a /Volumes/<catalog>/<schema>/<volume> path")
-    elif path and load_method != "volume_files" and not CLOUD_PATH.match(path):
-        errors.append(f"{label}: path must start with abfss:// or s3://")
+    elif path and load_method != "volume_files" and not _storage_path(path):
+        errors.append(f"{label}: path must start with abfss:// or s3://, or be a /Volumes path")
 
     source_catalog = str(source.get("catalog") or "") if is_database else ""
     source_table = str(source.get("table") or "") if is_database else ""
@@ -714,6 +714,12 @@ def _email_list(value: Any, key: str, label: str, errors: list[str], required: b
         else:
             emails.append(text)
     return emails
+
+
+def _storage_path(path: str) -> bool:
+    """Cloud URI or a Unity Catalog volume. Auto Loader, COPY INTO, and read_files accept both."""
+
+    return bool(CLOUD_PATH.match(path) or VOLUME_PATH.match(path))
 
 
 def _put(mapping: dict[str, Any], key: str, value: Any) -> None:

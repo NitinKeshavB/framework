@@ -63,7 +63,7 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 ## The registry
 
-Two tables in `<catalog>.framework_meta`. History is insert-only: the framework never runs `UPDATE` or `DELETE` on them. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql).
+Four tables in `<catalog>.framework_meta`. `object_registry` and `run_ledger` are the history and stay insert-only. `object_current` and `run_current` hold one row per key so a job status check does not window that history. The collector merges those two. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
 
 `object_registry` catalogs every definition the job syncs:
 
@@ -85,13 +85,13 @@ Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `o
 
 ### Ownership
 
-A pipeline or table has one owner. Before inserting, the collector looks up the current owner of each pipeline and table in the batch. If another owner holds it, the row is not inserted and the collector writes a `FAILED` `ownership_check` step to the ledger, with the holder named in `failure_reason`. The collector keeps running. Flows, links, workflows, dataflows, and columns follow their pipeline or table. `v_ownership_conflicts` lists any name with two owners in its history; it should be empty. Moving a table to another owner is a deliberate manual change, not something the collector allows.
+A pipeline or table has one owner. Before inserting, the collector looks up the current owner of each pipeline and table in the batch. If another owner holds it, the row is not inserted and the collector writes a `FAILED` `ownership_check` step to the ledger, with the holder named in `failure_reason`. The collector keeps running. Flows, links, workflows, dataflows, and columns follow their pipeline or table. `v_ownership_conflicts` lists a name that has two rows in `object_current`; it should be empty. Moving a table to another owner is a deliberate manual change, not something the collector allows.
 
 ### Views
 
 | View | What it answers |
 | --- | --- |
-| `v_object_current` | Latest definition for every object. This is what the pipeline loads. |
+| `v_object_current` | The current definition for every object, read from `object_current`. This is what the pipeline loads. |
 | `v_object_history` | Every version, with `valid_from` / `valid_to`. A point in time is `valid_from <= t AND (valid_to IS NULL OR valid_to > t)`. |
 | `v_workflows` | Each delivery job, its pipeline ids, and every requester. |
 | `v_pipelines` | Owner, requester, delivery, domain, team, technical owner, mail lists. |
@@ -101,9 +101,9 @@ A pipeline or table has one owner. Before inserting, the collector looks up the 
 | `v_columns`, `v_column_history` | Current and past columns of raw, bronze, and quarantine. |
 | `v_lineage` | Latest link per parent, child, and relation. |
 | `v_process` | Every step of every run. |
-| `v_run_current` | Latest step per job in the last 7 days. |
+| `v_run_current` | Latest step per job in the last 7 days, read from `run_current`. |
 | `v_job_status` | Each workflow joined to that latest step: `RUNNING`, `SUCCEEDED`, or `FAILED`. |
-| `v_recon` | Counts on success steps. |
+| `v_recon` | Counts on success steps from the last 7 days. Older counts stay in `run_ledger`. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
 
 Example: the latest status for every billing job.
@@ -124,13 +124,15 @@ About 10,000 jobs can write status files at once because those are files, not De
 The tables use liquid clustering:
 
 - `object_registry`: `CLUSTER BY (owner, object_kind, full_name, recorded_at)`
+- `object_current`: `CLUSTER BY (owner, object_kind, full_name)`
 - `run_ledger`: `CLUSTER BY (owner, event_date, full_name, run_id)`
+- `run_current`: `CLUSTER BY (owner, object_kind, full_name)`
 
-Both set `delta.autoOptimize.optimizeWrite`. `autoCompact` is off: the collector commits every 30 seconds, and compacting after each commit rewrites the same files and falls behind the jobs waiting on `await_registry`. A daily job runs `OPTIMIZE`, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
+All four set `delta.autoOptimize.optimizeWrite`. `autoCompact` is off: the collector commits every 30 seconds, and compacting after each commit rewrites the same files and falls behind the jobs waiting on `await_registry`. A daily job runs `OPTIMIZE`, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
-`v_object_history` partitions by `owner_kind`, `owner`, `object_kind`, and `full_name`. A query that filters `owner` is applied before that window. Filtering only `valid_from` cannot be, because that would change which row comes next. `v_object_current` still keeps one current row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
+`v_object_history` partitions by `owner_kind`, `owner`, `object_kind`, and `full_name`. A query that filters `owner` is applied before that window. Filtering only `valid_from` cannot be, because that would change which row comes next. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
 
-Before an insert, the collector reads only the current hash for the owners, kinds, and names in that batch, and the current owner of the pipelines and tables in it. It does not scan history for other owners. Step dedupe also filters `owner` and `event_date`, the leading cluster columns of `run_ledger`. The collector lists at most 1000 `*.json` files per trigger, so a backlog cannot be pulled onto the driver in one batch, and the checkpoint directory under the events volume is not ingested. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
+A sync writes one JSON-lines file per owner. An unchanged sync overwrites that same file, so Auto Loader does not read it again. Step files stay one per status. The collector lands a batch in Spark: it does not collect the rows onto the driver. It appends a definition when `object_current` has no row or a different hash, and a step when `(run_id, step_no, status)` is absent from the last two days of `run_ledger`. It then merges the current tables, and only when the incoming `recorded_at` is at least as new as the row already there. A file that arrives late does not roll the current row backward. The checkpoint directory under the events volume is not ingested. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
 
 To see the registry as it was at a moment:
 
