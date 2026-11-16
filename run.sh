@@ -126,6 +126,16 @@ function bundle:deploy {
         cd "$THIS_DIR/$bundle"
         databricks bundle validate -t "$target" "${profile_args[@]}"
         databricks bundle deploy -t "$target" "${profile_args[@]}"
+        # The workspace copy and the registry match when this returns.
+        # framework_bundle applies the DDL. framework_ingestion registers every spec.
+        case "$bundle" in
+            framework_bundle)
+                databricks bundle run framework_ddl -t "$target" "${profile_args[@]}"
+                ;;
+            framework_ingestion)
+                databricks bundle run registry_sync -t "$target" "${profile_args[@]}"
+                ;;
+        esac
     )
 }
 

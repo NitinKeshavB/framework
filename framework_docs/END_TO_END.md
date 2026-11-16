@@ -33,7 +33,9 @@ The job writes small JSON files at each step. It does not write the registry tab
 5. **refresh_pipeline** runs the Lakeflow pipeline. `build_pipeline` reads each spec back from the registry. A missing row is an error.
 6. **record_success** writes `SUCCEEDED` and can carry counts (`--recon-json`). **record_failure** writes `FAILED` if any earlier task fails, including a failed success step.
 
-Files land in `/Volumes/<catalog>/framework_meta/framework_events` as `<owner_kind>/<owner>/<full_name>/<run_id>_<step_no>_<status>.json`, and definitions under `<owner_kind>/<owner>/definitions/`. One collector job is the only writer of `object_registry` and `run_ledger`. Start `framework_collector` after the first deploy; it is paused by default.
+Files land in `/Volumes/<catalog>/framework_meta/framework_events` as `<owner_kind>/<owner>/<full_name>/<run_id>_<step_no>_<status>.json`, and definitions under `<owner_kind>/<owner>/definitions/`. The collector lands those files. It is paused by default; start it after the first framework deploy so run steps reach the ledger.
+
+Deploy also updates the registry before it returns. `bundle:deploy framework_bundle` runs `framework_ddl`. `bundle:deploy framework_ingestion` runs `registry_sync`, which inserts the deployed specs with the same writer the collector uses. A later delivery sync of an unchanged spec does not add another history row.
 
 ## How each kind loads
 

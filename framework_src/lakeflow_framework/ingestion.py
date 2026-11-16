@@ -74,8 +74,12 @@ class SourceSystem:
     engine: str = ""
 
 
-def load_sources(bundle: Path) -> list[SourceSystem]:
-    """Read and validate every source system. Raises one error listing every problem."""
+def load_sources(bundle: Path, catalog: str | None = None) -> list[SourceSystem]:
+    """Read and validate every source system. Raises one error listing every problem.
+
+    ``catalog`` is the environment catalog. Generate omits it and uses a stand-in, because a spec
+    does not name dev or prod. Deploy passes the target's catalog so the registered names match it.
+    """
 
     root = bundle / "sources"
     errors: list[str] = []
@@ -105,7 +109,7 @@ def load_sources(bundle: Path) -> list[SourceSystem]:
     if spec_files:
         try:
             configs = validate_configs(
-                [path for _, path in spec_files], catalog=PLACEHOLDER_CATALOG
+                [path for _, path in spec_files], catalog=catalog or PLACEHOLDER_CATALOG
             )
         except ConfigValidationError as exc:
             errors.extend(exc.errors)
@@ -116,6 +120,27 @@ def load_sources(bundle: Path) -> list[SourceSystem]:
     if errors:
         raise ConfigValidationError(errors)
     return systems
+
+
+def registry_rows(bundle: Path, catalog: str) -> list[dict[str, Any]]:
+    """Every definition this bundle deploys, named in ``catalog``.
+
+    Deploy writes these rows into the registry after the files are uploaded, so a pipeline can
+    read what was just deployed without waiting for the next delivery run.
+    """
+
+    from lakeflow_framework.metadata import new_object_rows, object_rows, workflow_rows
+
+    if not catalog or not re.fullmatch(r"[A-Za-z0-9_-]+", catalog):
+        raise ConfigValidationError(["catalog is required"])
+    systems = load_sources(bundle, catalog=catalog)
+    configs = [table.config for system in systems for table in system.tables]
+    seen: set[tuple[str, str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    for config in configs:
+        rows.extend(new_object_rows(object_rows(config), seen))
+    rows.extend(new_object_rows(workflow_rows(configs), seen))
+    return rows
 
 
 def render_map(systems: list[SourceSystem]) -> str:

@@ -10,7 +10,7 @@ The registry DDL in `framework_bundle/sql/framework_meta.sql` is create-only: `C
 
 ## Deploy
 
-Order: `framework_bundle`, run `framework_ddl`, start `framework_collector`, then `framework_ingestion`, then each project.
+Order: `framework_bundle` (deploy runs `framework_ddl`), start `framework_collector`, then `framework_ingestion` (deploy runs `registry_sync`), then each project.
 
 ```bash
 ./run.sh bundle:deploy framework_bundle <target> <profile>
@@ -30,7 +30,7 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 
 ## What not to change
 
-- Do not add a writer besides the collector for the registry tables. Jobs write JSON files only. The collector inserts into `object_registry` and `run_ledger`. It merges `object_current` and `run_current`. Do not `UPDATE` or `DELETE` the history tables.
+- Delivery jobs write JSON files only. The collector inserts those into `object_registry` and `run_ledger` and merges `object_current` and `run_current`. `registry_sync`, which deploy runs, calls the same insert for the specs just uploaded. Do not `UPDATE` or `DELETE` the history tables. Do not add another writer.
 - Do not weaken the ownership check. The collector must keep refusing a pipeline or table another owner holds.
 - Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines. The collector is the exception: its checkpoint is under the events volume because it is a job, and it lists only `*.json` so that checkpoint is not ingested.
 - Do not schedule a `VACUUM` that shortens retention.

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,7 +13,14 @@ import yaml
 
 from lakeflow_framework.cli import main
 from lakeflow_framework.config import ConfigValidationError
-from lakeflow_framework.ingestion import MAP_NAME, generate, load_sources, new_source, new_table
+from lakeflow_framework.ingestion import (
+    MAP_NAME,
+    generate,
+    load_sources,
+    new_source,
+    new_table,
+    registry_rows,
+)
 from lakeflow_framework.metadata import object_rows, workflow_rows
 from lakeflow_framework.pipeline import build_pipeline
 
@@ -604,3 +613,44 @@ def test_a_spec_with_no_project_sits_next_to_source_yaml(bundle: Path) -> None:
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
     assert "belongs in billing/billing/" in " ".join(caught.value.errors)
+
+
+def test_registry_rows_use_the_deployed_catalog() -> None:
+    rows = registry_rows(SAMPLE, "aal_dev_fdh")
+    pipelines = {row["full_name"] for row in rows if row["object_kind"] == "pipeline"}
+    assert "billing_invoices" in pipelines
+    tables = [
+        row["full_name"] for row in rows if row["object_kind"] in {"table", "streaming_table"}
+    ]
+    assert tables
+    assert all(name.startswith("aal_dev_fdh.") for name in tables)
+    with pytest.raises(ConfigValidationError):
+        registry_rows(SAMPLE, "not a catalog")
+
+
+def test_deploy_updates_the_registry(tmp_path: Path) -> None:
+    """Deploy runs the registry job after the upload. The CLI is not contacted."""
+
+    log = tmp_path / "calls"
+    binary = tmp_path / "databricks"
+    binary.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$DEPLOY_LOG"\n',
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    env["DEPLOY_LOG"] = str(log)
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        ["bash", "./run.sh", "bundle:deploy", "framework_bundle", "dev", "prof"],
+        cwd=root,
+        env=env,
+        check=True,
+    )
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls == [
+        "bundle validate -t dev --profile prof",
+        "bundle deploy -t dev --profile prof",
+        "bundle run framework_ddl -t dev --profile prof",
+    ]
