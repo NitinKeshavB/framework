@@ -204,8 +204,14 @@ def _generated_files(bundle: Path) -> list[str]:
 
 
 def _pipeline_source(tables: list[SourceTable]) -> str:
-    lines = [GENERATED, "from lakeflow_framework import build_pipeline", ""]
-    lines += [f'build_pipeline("{table.config.pipeline_id}")' for table in tables]
+    # One call reads every pipeline document in this delivery. A call per table repeats that scan.
+    ids = ", ".join(f'"{table.config.pipeline_id}"' for table in tables)
+    lines = [
+        GENERATED,
+        "from lakeflow_framework import build_pipelines",
+        "",
+        f"build_pipelines([{ids}])",
+    ]
     return "\n".join(lines) + "\n"
 
 

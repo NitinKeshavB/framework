@@ -395,6 +395,7 @@ OWNED_KINDS = ("pipeline", "table", "streaming_table", "materialized_view")
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_HASH = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def definition_file_name(row: Mapping[str, Any]) -> str:
@@ -683,16 +684,38 @@ def ownership_conflicts(
     return accepted, refused
 
 
-def step_keys_sql(catalog: str, run_ids: list[str]) -> str:
+def step_keys_sql(
+    catalog: str,
+    run_ids: list[str],
+    owners: list[str] | None = None,
+    event_dates: list[str] | None = None,
+) -> str:
+    """Steps already stored for these runs.
+
+    ``owner`` and ``event_date`` are the leading cluster columns. They are added only when every
+    value is safe, so a bad value widens the lookup instead of hiding a row that should dedupe.
+    """
+
     if not catalog or not _SAFE_TOKEN.match(catalog):
         raise ValueError("catalog is required")
     safe_ids = [value for value in run_ids if _SAFE_TOKEN.match(value)]
     if not safe_ids:
         raise ValueError("run id is required")
-    quoted = ", ".join(f"'{value}'" for value in safe_ids)
+    quoted_ids = ", ".join(f"'{value}'" for value in dict.fromkeys(safe_ids))
+    filters = [f"run_id IN ({quoted_ids})"]
+    if owners:
+        unique_owners = list(dict.fromkeys(owners))
+        if all(_SAFE_TOKEN.match(value) for value in unique_owners):
+            quoted_owners = ", ".join(f"'{value}'" for value in sorted(unique_owners))
+            filters.append(f"owner IN ({quoted_owners})")
+    if event_dates:
+        unique_dates = list(dict.fromkeys(event_dates))
+        if all(_SAFE_DATE.match(value) for value in unique_dates):
+            quoted_dates = ", ".join(f"DATE '{value}'" for value in sorted(unique_dates))
+            filters.append(f"event_date IN ({quoted_dates})")
     return (
         f"SELECT run_id, step_no, status FROM {catalog}.framework_meta.run_ledger "
-        f"WHERE run_id IN ({quoted})"
+        f"WHERE {' AND '.join(filters)}"
     )
 
 

@@ -86,7 +86,7 @@ raw_to_bronze:
 quarantine: { schema: billing_quarantine, table: invoices }
 ```
 
-`source` also takes `path_glob`, `max_files_per_trigger`, `header_rows` and `data_address` (Excel, both required), and `external_location`. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`.
+`source` also takes `path_glob`, `max_files_per_trigger` (default 1000), `multiline` (JSON only; default false), `header_rows` and `data_address` (Excel, both required), and `external_location`. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`. An Excel address may quote the sheet name, as in `'Sheet1'!A1`.
 
 ## Table spec: a database table
 

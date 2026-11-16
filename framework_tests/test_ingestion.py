@@ -163,8 +163,7 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     _add_table(bundle, "credits", "collections")
     generate(bundle)
     source = (bundle / "pipelines" / "billing_daily.py").read_text("utf-8")
-    assert 'build_pipeline("billing_credits")' in source
-    assert 'build_pipeline("billing_invoices")' in source
+    assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
     tasks = _tasks(bundle)
     assert tasks["sync"]["spark_python_task"]["parameters"].count("--out") == 1
     awaited = tasks["await_registry"]["spark_python_task"]["parameters"]
@@ -199,7 +198,7 @@ def test_database_job_has_a_schedule_and_syncs_both_tables(tmp_path: Path) -> No
     synced = _tasks(tmp_path, "erp_nightly")["sync"]["spark_python_task"]["parameters"]
     assert sum(item.endswith(".yaml") for item in synced) == 2
     source = (tmp_path / "pipelines" / "erp_nightly.py").read_text("utf-8")
-    assert 'build_pipeline("erp_customers")' in source and 'build_pipeline("erp_orders")' in source
+    assert 'build_pipelines(["erp_customers", "erp_orders"])' in source
 
 
 def test_scheduled_delivery_gets_a_schedule_not_a_file_trigger(bundle: Path) -> None:
@@ -511,7 +510,7 @@ class _Pipelines:
 
 def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) -> None:
     generate(bundle)
-    assert 'build_pipeline("billing_invoices")' in (
+    assert 'build_pipelines(["billing_invoices"])' in (
         bundle / "pipelines" / "billing_daily.py"
     ).read_text("utf-8")
     refresh = _tasks(bundle)["refresh_pipeline"]["pipeline_task"]["pipeline_id"]

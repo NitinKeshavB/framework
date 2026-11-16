@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from lakeflow_framework.config import FORMATS, PipelineConfig
 
+# A trigger with no cap will list an entire backlog in one micro-batch.
+DEFAULT_MAX_FILES_PER_TRIGGER = 1000
 SPARK_FORMAT = {
     "csv": "csv",
     "delimited": "csv",
@@ -57,8 +59,9 @@ class AutoLoader(LoadStrategy):
             "cloudFiles.allowOverwrites": "false",
             "cloudFiles.useNotifications": "false",
         }
-        if config.max_files_per_trigger:
-            options["cloudFiles.maxFilesPerTrigger"] = str(config.max_files_per_trigger)
+        options["cloudFiles.maxFilesPerTrigger"] = str(
+            config.max_files_per_trigger or DEFAULT_MAX_FILES_PER_TRIGGER
+        )
         if config.file_format in RESCUE_FORMATS:
             options["cloudFiles.schemaEvolutionMode"] = "rescue"
             options["rescuedDataColumn"] = "_rescued_data"
@@ -67,7 +70,9 @@ class AutoLoader(LoadStrategy):
             options["delimiter"] = config.delimiter or ","
             options["mode"] = "PERMISSIVE"
         if config.file_format == "json":
-            options["multiLine"] = "true"
+            # multiLine reads each file as one document. Leave it off unless the spec asks.
+            if config.json_multiline:
+                options["multiLine"] = "true"
             options["mode"] = "PERMISSIVE"
         if config.file_format == "excel":
             options["cloudFiles.schemaEvolutionMode"] = "none"
@@ -103,13 +108,13 @@ class CopyInto(LoadStrategy):
         if config.file_format in {"csv", "delimited"}:
             header = str(config.header).lower()
             pairs.append(f"'header' = '{header}'")
-            pairs.append(f"'delimiter' = '{config.delimiter}'")
+            pairs.append(f"'delimiter' = {_sql_string(config.delimiter)}")
         format_options = ", ".join(pairs)
         return [
             " ".join(
                 [
                     f"COPY INTO {target}",
-                    f"FROM '{config.path}'",
+                    f"FROM {_sql_string(config.path)}",
                     f"FILEFORMAT = {file_format}",
                     f"FORMAT_OPTIONS ({format_options})",
                     "COPY_OPTIONS ('force' = 'false')",
@@ -129,30 +134,40 @@ class Ctas(LoadStrategy):
         return [f"CREATE OR REPLACE TABLE {target} AS SELECT {projection} FROM {reader}"]
 
 
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _read_files(config: PipelineConfig) -> str:
     spark_format = SPARK_FORMAT[config.file_format]
-    options = [f"format => '{spark_format}'"]
+    options = [f"format => {_sql_string(spark_format)}"]
     if config.file_format in {"csv", "delimited"}:
         options.append(f"header => {str(config.header).lower()}")
-        options.append(f"delimiter => '{config.delimiter}'")
+        options.append(f"delimiter => {_sql_string(config.delimiter)}")
     if config.file_format == "excel":
         options.append(f"headerRows => {config.header_rows}")
-        options.append(f"dataAddress => '{config.data_address}'")
-    return f"read_files('{config.path}', {', '.join(options)})"
+        options.append(f"dataAddress => {_sql_string(str(config.data_address))}")
+    return f"read_files({_sql_string(config.path)}, {', '.join(options)})"
 
 
-def _projection(config: PipelineConfig, source: str) -> str:
-    metadata = "_metadata.file_path AS _source_file, current_timestamp() AS _ingested_at"
+def projection_exprs(config: PipelineConfig, source: str) -> list[str]:
+    """Select list for one file read. Lineage columns are part of the raw table, not a second pass."""
+
+    metadata = ["_metadata.file_path AS _source_file", "current_timestamp() AS _ingested_at"]
     if config.file_format == "fixed_width":
         fields = [
             f"substring(value, {column.start}, {column.length}) AS {column.name}"
             for column in config.fixed_columns
         ]
-        return ", ".join(fields + [metadata])
+        return fields + metadata
     if config.file_format == "yaml":
         column = "value" if source == "file" else "content"
-        return f"CAST({column} AS STRING) AS content, {metadata}"
-    return f"*, {metadata}"
+        return [f"CAST({column} AS STRING) AS content", *metadata]
+    return ["*", *metadata]
+
+
+def _projection(config: PipelineConfig, source: str) -> str:
+    return ", ".join(projection_exprs(config, source))
 
 
 _STRATEGIES = {

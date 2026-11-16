@@ -14,10 +14,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from lakeflow_framework.config import IDENTIFIER, PipelineConfig, config_from_document
-from lakeflow_framework.load import _projection, get_strategy
+from lakeflow_framework.load import _projection, get_strategy, projection_exprs
 from lakeflow_framework.quality import compile_rules, fail_sql, failed_rules_sql, pass_sql
-
-STREAMING_FILES = {"autoloader", "volume_files"}
 
 
 class MetadataNotFound(Exception):
@@ -60,6 +58,40 @@ def build_pipeline(
     if pipelines is not None:
         _register(graph, pipelines, spark, parsed)
     return graph
+
+
+def build_pipelines(
+    pipeline_ids: list[str],
+    *,
+    spark: Any = None,
+    pipelines: Any = None,
+    metadata: Any = None,
+) -> list[Graph]:
+    """Register every table in a delivery. The registry is queried once for the whole list."""
+
+    if not pipeline_ids:
+        return []
+    if spark is None and pipelines is None and metadata is None:
+        pipelines = _cluster_pipelines()
+        spark = _cluster_session()
+    reader = metadata
+    if reader is None:
+        if spark is None:
+            raise MetadataNotFound("build_pipelines has no metadata reader")
+        reader = UnityMetadata(spark)
+    if hasattr(reader, "get_pipelines"):
+        documents = reader.get_pipelines(list(pipeline_ids))
+    else:
+        documents = {pipeline_id: reader.get_pipeline(pipeline_id) for pipeline_id in pipeline_ids}
+    graphs: list[Graph] = []
+    for pipeline_id in pipeline_ids:
+        document = documents.get(pipeline_id) if isinstance(documents, dict) else None
+        if not document:
+            raise MetadataNotFound(f"{pipeline_id} is not in the metadata registry")
+        graphs.append(
+            build_pipeline(pipeline_id, spark=spark, pipelines=pipelines, config=document)
+        )
+    return graphs
 
 
 def _cluster_session() -> Any:
@@ -213,12 +245,12 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
         return reader.load(config.path)
 
     def _read_origin() -> Any:
-        """The source as it is: files for Auto Loader, the table for a database load."""
+        """Database loads have no landed table. File loads must not call this: it would list files again."""
 
-        if config.load_method in STREAMING_FILES:
-            return _read_files()
         if config.load_method == "database_table":
             return spark.read.table(config.source_reference())
+        if raw is None:
+            raise MetadataNotFound(f"{config.pipeline_id} has no source table to read")
         if config.is_batch:
             return spark.read.table(raw.name)
         return spark.readStream.table(raw.name)
@@ -226,7 +258,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
     landing_name = f"{config.pipeline_id}_landing"
 
     def _read_stored() -> Any:
-        """What quarantine and bronze read: the raw table, or the source itself."""
+        """The landed source: the landing view, or the raw table. Bronze reads the valid view of this."""
 
         if config.load_method == "volume_files":
             return spark.readStream.table(landing_name)
@@ -253,7 +285,11 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
     @pipelines.temporary_view(name=valid.name)
     def _valid() -> Any:
-        frame = _read_stored() if config.load_method == "volume_files" else _lineage(_read_origin())
+        # One file listing. Later hops read the landed table (or the landing view), not the path again.
+        if raw is not None or config.load_method == "volume_files":
+            frame = _read_stored()
+        else:
+            frame = _lineage(_read_origin())
         if hasattr(frame, "filter"):
             return frame.filter(pass_where)
         return {"view": valid.name, "where": pass_where, "frame": frame}
@@ -283,15 +319,17 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
         @bronze_kind(name=bronze.name)
         def _bronze() -> Any:
-            if raw is None:
-                reader = spark.read if config.is_batch else spark.readStream
-                return reader.table(valid.name)
-            return _filtered(_read_stored(), pass_where)
+            # The pass predicate already ran in the valid view. Reading it again scans the source twice.
+            reader = spark.read if config.is_batch else spark.readStream
+            return reader.table(valid.name)
 
     if config.load_method == "autoloader":
 
         def _raw() -> Any:
-            return _read_files()
+            frame = _read_files()
+            if hasattr(frame, "selectExpr"):
+                return frame.selectExpr(*projection_exprs(config, source="file"))
+            return frame
 
         registered = _raw
         for name, expression in reversed(graph.expectations):
@@ -323,3 +361,31 @@ class UnityMetadata:
 
         payload = rows[0]["config_json"] if isinstance(rows[0], dict) else rows[0].config_json
         return json.loads(payload)["config"]
+
+    def get_pipelines(self, pipeline_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Current config for each id. One query, so a delivery does not scan the registry per table."""
+
+        import json
+
+        ids: list[str] = []
+        for pipeline_id in pipeline_ids:
+            if not IDENTIFIER.fullmatch(pipeline_id):
+                raise MetadataNotFound(f"{pipeline_id} is not a pipeline id")
+            if pipeline_id not in ids:
+                ids.append(pipeline_id)
+        if not ids:
+            return {}
+        quoted = ", ".join(f"'{pipeline_id}'" for pipeline_id in ids)
+        frame = self.spark.sql(
+            "SELECT full_name, config_json FROM framework_meta.v_object_current "
+            f"WHERE object_kind = 'pipeline' AND full_name IN ({quoted})"
+        )
+        rows = frame.collect() if hasattr(frame, "collect") else list(frame)
+        found: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if isinstance(row, dict):
+                name, payload = str(row["full_name"]), row["config_json"]
+            else:
+                name, payload = str(row.full_name), row.config_json
+            found[name] = json.loads(payload)["config"]
+        return found

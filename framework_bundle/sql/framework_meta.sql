@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
 CLUSTER BY (owner, object_kind, full_name, recorded_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'true'
+  'delta.autoOptimize.autoCompact' = 'false'
 );
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
@@ -50,16 +50,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
 CLUSTER BY (owner, event_date, full_name, run_id)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'true'
-);
-
-CREATE BLOOMFILTER INDEX ON TABLE ${catalog}.framework_meta.object_registry
-FOR COLUMNS (full_name OPTIONS (fpp=0.1, numItems=1000000));
-
-CREATE BLOOMFILTER INDEX ON TABLE ${catalog}.framework_meta.run_ledger
-FOR COLUMNS (
-  run_id OPTIONS (fpp=0.1, numItems=10000000),
-  full_name OPTIONS (fpp=0.1, numItems=1000000)
+  'delta.autoOptimize.autoCompact' = 'false'
 );
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_current AS
@@ -324,7 +315,7 @@ FROM (
     source,
     recorded_at AS valid_from,
     LEAD(recorded_at) OVER (
-      PARTITION BY object_kind, full_name
+      PARTITION BY owner_kind, owner, object_kind, full_name
       ORDER BY recorded_at, content_hash
     ) AS valid_to
   FROM ${catalog}.framework_meta.object_registry

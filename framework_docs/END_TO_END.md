@@ -15,7 +15,7 @@ CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check`
 
 For each delivery of each source system, from the specs alone:
 
-- `pipelines/<source_system>_<delivery>.py` calls `build_pipeline("<id>")` once for each table.
+- `pipelines/<source_system>_<delivery>.py` calls `build_pipelines([...])` once, with every table in that delivery. The registry is read in one query.
 - `resources/<source_system>_<delivery>.pipeline.yml` is one serverless Lakeflow pipeline.
 - `resources/<source_system>_<delivery>.job.yml` is one job. A file source fires on files landing in the raw volume. A scheduled source uses its cron.
 - `SOURCE_MAP.md` shows the same model as a diagram and tables.
@@ -44,7 +44,7 @@ The graph depends on the kind. Quarantine and bronze are filtered by the quality
 | Files, `volume_files` | Auto Loader on the raw volume path. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table of failing rows | Streaming table of passing rows, or Auto CDC on the keys when `dedup: true` |
 | Database, `snapshot` | The foreign-catalog table, in batch | Materialized view of failing rows | Materialized view of passing rows |
 | Database, `merge` | The same, as snapshots | Materialized view | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
-| Cloud files, `autoloader` | Auto Loader into a raw streaming table | Streaming table | Streaming table, or Auto CDC with `dedup: true` |
+| Cloud files, `autoloader` | Auto Loader once into a raw streaming table. The projection, including `_source_file` and `_ingested_at`, is applied on that read. | Streaming table, read from the raw table | Streaming table read from the valid view, or Auto CDC from that view when `dedup: true` |
 | Cloud files, `copy_into` | `COPY INTO` a raw table (`force = false`) before the pipeline | Streaming table | Streaming table |
 | Cloud files, `ctas` | `CREATE OR REPLACE TABLE` raw | Materialized view | Materialized view |
 
@@ -126,9 +126,11 @@ The tables use liquid clustering:
 - `object_registry`: `CLUSTER BY (owner, object_kind, full_name, recorded_at)`
 - `run_ledger`: `CLUSTER BY (owner, event_date, full_name, run_id)`
 
-Both set `delta.autoOptimize.optimizeWrite` and `autoCompact`, so the collector's small inserts are compacted as they land. The DDL also creates bloom-filter indexes on `full_name` and `run_id`; if the runtime rejects that, the DDL task skips it. A daily job runs `OPTIMIZE`. `VACUUM` is not scheduled, so process history is never removed.
+Both set `delta.autoOptimize.optimizeWrite`. `autoCompact` is off: the collector commits every 30 seconds, and compacting after each commit rewrites the same files and falls behind the jobs waiting on `await_registry`. A daily job runs `OPTIMIZE`, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
-Before an insert, the collector reads only the current hash for the owners, kinds, and names in that batch, and the current owner of the pipelines and tables in it. It does not scan history for other owners. Filter `owner` and `object_kind` (and `full_name` when known) before the `valid_from` / `valid_to` test. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
+`v_object_history` partitions by `owner_kind`, `owner`, `object_kind`, and `full_name`. A query that filters `owner` is applied before that window. Filtering only `valid_from` cannot be, because that would change which row comes next. `v_object_current` still keeps one current row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
+
+Before an insert, the collector reads only the current hash for the owners, kinds, and names in that batch, and the current owner of the pipelines and tables in it. It does not scan history for other owners. Step dedupe also filters `owner` and `event_date`, the leading cluster columns of `run_ledger`. The collector lists at most 1000 `*.json` files per trigger, so a backlog cannot be pulled onto the driver in one batch, and the checkpoint directory under the events volume is not ingested. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
 
 To see the registry as it was at a moment:
 
@@ -156,7 +158,7 @@ None of the following has run on Databricks. The code assumes them:
 - COPY INTO as a job statement before the pipeline.
 - Excel `headerRows` and `dataAddress` without `schemaLocation`.
 - `DESCRIBE DETAIL` `numRecords` on streaming tables and materialized views.
-- Bloom-filter index syntax, and the collector checkpoint under the events volume.
+- The collector checkpoint under the events volume, with `pathGlobFilter` of `*.json` so checkpoint files are not ingested.
 - Workspace concurrency if many pipelines run together.
 
 If one fails, record the observed syntax here and change the single strategy or DDL statement. Do not spread a workaround across the bundles.

@@ -9,7 +9,7 @@ import pytest
 
 from lakeflow_framework import ConfigValidationError, build_pipeline, validate_configs
 from lakeflow_framework.cli import main
-from lakeflow_framework.collector import append_definitions, await_registered
+from lakeflow_framework.collector import _cast, append_definitions, await_registered
 from lakeflow_framework.config import config_from_document, email_notifications
 from lakeflow_framework.load import get_strategy
 from lakeflow_framework.metadata import (
@@ -25,10 +25,11 @@ from lakeflow_framework.metadata import (
     ownership_conflicts,
     split_payloads,
     step_file_name,
+    step_keys_sql,
     step_payload,
     write_definition_files,
 )
-from lakeflow_framework.pipeline import MetadataNotFound, UnityMetadata, assemble
+from lakeflow_framework.pipeline import MetadataNotFound, UnityMetadata, assemble, build_pipelines
 from lakeflow_framework.quality import compile_rules, fail_sql
 
 EXAMPLES = (
@@ -269,6 +270,16 @@ def test_autoloader_options_omit_checkpoint_and_schema_location():
     assert "cloudFiles.schemaLocation" not in options
     assert "checkpoint" not in options
     assert options["rescuedDataColumn"] == "_rescued_data"
+    assert options["cloudFiles.maxFilesPerTrigger"] == "1000"
+    json_options = get_strategy("autoloader").options(
+        config_from_document(_billing(format="json", delimiter=None))
+    )
+    assert "multiLine" not in json_options
+    multiline = _billing(format="json", delimiter=None)
+    multiline["source_to_raw"]["source"]["multiline"] = True
+    assert (
+        get_strategy("autoloader").options(config_from_document(multiline))["multiLine"] == "true"
+    )
 
 
 def test_copy_into_and_ctas_sql():
@@ -396,6 +407,8 @@ def test_one_line_pipeline_file_uses_the_running_session(monkeypatch: pytest.Mon
     build_pipeline("billing_invoices")
     assert pipelines.names
     assert pipelines.cdc[0]["keys"] == ["invoice_id"]
+    assert spark.readStream.loads == 1
+    assert any("_source_file" in expr for exprs in spark.readStream.exprs for expr in exprs)
 
 
 def test_one_line_pipeline_file_off_cluster_says_why():
@@ -430,10 +443,10 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "CLUSTER BY (owner, object_kind, full_name, recorded_at)" in text
     assert "delta.autoOptimize.autoCompact" in text
     assert "CLUSTER BY (owner, event_date, full_name, run_id)" in text
+    assert "'delta.autoOptimize.autoCompact' = 'false'" in text
     assert "v_ownership_conflicts" in text
     assert "project" not in text.replace("project for silver", "")
     assert "${catalog}" not in text
-    assert "CREATE BLOOMFILTER INDEX" in text
     assert "v_workflows" in text
     assert "v_pipelines" in text
     assert "v_dataflows" in text
@@ -442,6 +455,9 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "v_tables" in text
     assert "v_object_history" in text
     assert "PARTITION BY object_kind, full_name" in text
+    history = text.split("v_object_history", 1)[1]
+    assert "PARTITION BY owner_kind, owner, object_kind, full_name" in history
+    assert "CREATE BLOOMFILTER INDEX" not in text
     assert "v_columns" in text
     assert "v_column_history" in text
     assert "valid_from" in text
@@ -889,6 +905,85 @@ def test_definition_and_step_files_are_filed_under_their_owner(tmp_path: Path):
                      step_name="a", status="RUNNING")  # fmt: skip
 
 
+def test_a_delivery_reads_every_pipeline_document_once():
+    calls: list[list[str]] = []
+
+    class Reader:
+        def get_pipelines(self, pipeline_ids):
+            calls.append(list(pipeline_ids))
+            return {
+                "billing_invoices": _billing(),
+                "ledger_entries": _ledger(),
+            }
+
+    spark, pipelines = _FakeSpark(), _FakePipelines()
+    graphs = build_pipelines(
+        ["billing_invoices", "ledger_entries"],
+        spark=spark,
+        pipelines=pipelines,
+        metadata=Reader(),
+    )
+    assert calls == [["billing_invoices", "ledger_entries"]]
+    assert [graph.pipeline_id for graph in graphs] == ["billing_invoices", "ledger_entries"]
+    # Auto Loader lists files once. The batch bronze hop reads the valid view, not the raw table again.
+    assert spark.readStream.loads == 1
+    assert spark.read.tables.count("ledger_entries_valid") == 1
+
+
+def test_step_lookup_prunes_by_owner_and_event_date():
+    statement = step_keys_sql(
+        "framework_dev",
+        ["100", "100"],
+        owners=["billing", "billing"],
+        event_dates=["2026-11-09"],
+    )
+    assert "run_id IN ('100')" in statement
+    assert "owner IN ('billing')" in statement
+    assert "event_date IN (DATE '2026-11-09')" in statement
+    widened = step_keys_sql("framework_dev", ["100"], owners=["bad owner"])
+    assert "owner IN" not in widened
+    assert "to_timestamp" in _cast("recorded_at", ("recorded_at",), (), ())
+
+
+def test_collector_bounds_the_micro_batch():
+    text = (
+        Path(__file__).resolve().parents[1] / "framework_bundle" / "src" / "collect_events.py"
+    ).read_text(encoding="utf-8")
+    assert 'option("cloudFiles.maxFilesPerTrigger", _MAX_FILES_PER_TRIGGER)' in text
+    assert 'option("pathGlobFilter", "*.json")' in text
+    assert "_checkpoints/collector" in text
+    assert "_MAX_SEEN = 50_000" in text
+
+
+def test_an_unsafe_name_is_not_inserted_by_skipping_the_check():
+    with pytest.raises(ValueError):
+        append_definitions(object(), [_owned_row(full_name="not a name")], set(), "framework_dev")
+
+
+def test_batch_sql_escapes_quotes_in_paths_and_excel_addresses():
+    copy_sql = get_strategy("copy_into").batch_sql(
+        config_from_document(
+            _billing(
+                load_method="copy_into",
+                dedup=False,
+                watermark_column=None,
+                path="abfss://landing@storage.dfs.core.windows.net/a'b/",
+            )
+        )
+    )[0]
+    assert "a''b" in copy_sql
+    excel = _billing(
+        format="excel",
+        load_method="ctas",
+        dedup=False,
+        watermark_column=None,
+        delimiter=None,
+        header_rows=1,
+        data_address="'Sheet1'!A1",
+    )
+    assert "'''Sheet1''!A1'" in get_strategy("ctas").batch_sql(config_from_document(excel))[0]
+
+
 def test_pipeline_lookup_binds_the_id_and_rejects_sql():
     class Frame:
         def collect(self):
@@ -924,10 +1019,27 @@ def _dump(document: dict) -> str:
     return yaml.safe_dump(document)
 
 
+class _Frame:
+    def __init__(self, reader: "_Reader"):
+        self.reader = reader
+
+    def filter(self, where: str) -> "_Frame":
+        self.reader.wheres.append(where)
+        return self
+
+    def selectExpr(self, *exprs: str) -> "_Frame":
+        self.reader.exprs.append(exprs)
+        return self
+
+
 class _Reader:
     def __init__(self):
         self.options = {}
         self.format_name = None
+        self.loads = 0
+        self.tables: list[str] = []
+        self.wheres: list[str] = []
+        self.exprs: list[tuple[str, ...]] = []
 
     def format(self, name):
         self.format_name = name
@@ -938,10 +1050,13 @@ class _Reader:
         return self
 
     def load(self, path):
-        return {"format": self.format_name, "path": path, "options": dict(self.options)}
+        self.loads += 1
+        self.path = path
+        return _Frame(self)
 
     def table(self, name):
-        return {"table": name}
+        self.tables.append(name)
+        return _Frame(self)
 
 
 class _FakeSpark:

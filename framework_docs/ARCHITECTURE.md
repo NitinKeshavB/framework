@@ -142,6 +142,8 @@ flowchart TD
 
 `v_lineage` is the latest `link` row for each parent, child, and relation. `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` is the `record_success` step with `recon_json` parsed. `v_run_current` is the latest step in the last 7 days. `v_job_status` joins each workflow to that latest step. `v_ownership_conflicts` lists any name with more than one owner. Job run steps are stored with `object_kind = workflow` and `full_name = job_name`.
 
+`v_object_history` windows by `owner_kind`, `owner`, `object_kind`, and `full_name`. Filter those columns, and `owner` in particular, or the window reads every version in the table. `v_object_current` does not include `owner` in its partition: a pipeline or table has one current row.
+
 ## Design choices
 
 **The Unity Catalog volume is the raw layer for file kinds.** `sftp_files` and `sharepoint_files` keep the files as delivered and have no raw Delta table. A database has no raw layer. Only `cloud_files` writes a raw table first. Quarantine and bronze are always built, and both are filtered by the quality rules.
@@ -160,7 +162,7 @@ flowchart TD
 
 **The registry is two tables.** Attributes and relationships are columns on `object_registry`. Run steps, failure text, and reconciliation are rows in `run_ledger`.
 
-**Auto Loader options are a fixed map.** A format allow-list, a positive `max_files_per_trigger`, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`.
+**Auto Loader options are a fixed map.** A format allow-list, `max_files_per_trigger` (1000 when the spec omits it), JSON `multiline` only when the spec sets it, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`. File methods list the path once; bronze and quarantine read the landed table or the landing view.
 
 Lakeflow Connect is how SharePoint, and later other managed sources, will reach the raw volume or bronze. See the [roadmap](ROADMAP.md).
 

@@ -130,13 +130,11 @@ def _refuse_other_owners(spark, catalog: str, rows: list[dict]) -> list[dict]:
     """Drop definitions for a table or pipeline another owner already holds.
 
     A refused definition is not inserted. It is recorded as a FAILED ownership_check step in the
-    run ledger, so it shows in the run views and the collector keeps running.
+    run ledger, so it shows in the run views and the collector keeps running. An unsafe name
+    raises instead of skipping the check: skipping it would insert the row.
     """
 
-    try:
-        statement = owners_sql(catalog, [str(row["full_name"]) for row in rows])
-    except ValueError:
-        return rows
+    statement = owners_sql(catalog, [str(row["full_name"]) for row in rows])
     current = {
         (str(row["object_kind"]), str(row["full_name"])): (
             str(row["owner_kind"]),
@@ -174,10 +172,14 @@ def _table(catalog: str, name: str) -> str:
 
 
 def _existing_step_keys(spark, catalog: str, payloads: list[dict]) -> set[tuple[str, int, str]]:
-    try:
-        statement = step_keys_sql(catalog, [str(payload["run_id"]) for payload in payloads])
-    except ValueError:
-        return set()
+    recorded = [str(payload.get("recorded_at") or "") for payload in payloads]
+    dates = [value[:10] for value in recorded if len(value) >= 10]
+    statement = step_keys_sql(
+        catalog,
+        [str(payload["run_id"]) for payload in payloads],
+        owners=[str(payload.get("owner") or "") for payload in payloads],
+        event_dates=dates if len(dates) == len(payloads) else None,
+    )
     return {
         (str(row["run_id"]), int(row["step_no"]), str(row["status"]))
         for row in _rows(spark.sql(statement))
@@ -185,10 +187,8 @@ def _existing_step_keys(spark, catalog: str, payloads: list[dict]) -> set[tuple[
 
 
 def _current_object_hashes(spark, catalog: str, rows: list[dict]) -> dict[tuple[str, str], str]:
-    try:
-        statement = current_objects_sql(catalog, rows)
-    except ValueError:
-        return {}
+    # A failed lookup must not look like "nothing stored", or the batch is appended again.
+    statement = current_objects_sql(catalog, rows)
     return {
         (str(row["object_kind"]), str(row["full_name"])): str(row["content_hash"])
         for row in _rows(spark.sql(statement))
@@ -226,7 +226,12 @@ def _cast(
     int_columns: tuple[str, ...],
 ) -> str:
     if column in timestamp_columns:
-        return f"CAST({column} AS TIMESTAMP) AS {column}"
+        # The framework writes UTC timestamps as 2026-11-09T00:00:00Z. CAST alone drops the T/Z form
+        # on some runtimes and stores NULL, which breaks history ordering.
+        return (
+            f"COALESCE(to_timestamp({column}, 'yyyy-MM-dd''T''HH:mm:ss''Z'''), "
+            f"CAST({column} AS TIMESTAMP)) AS {column}"
+        )
     if column in date_columns:
         return f"CAST({column} AS DATE) AS {column}"
     if column in int_columns:
