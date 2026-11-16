@@ -8,7 +8,7 @@ include:
 artifacts:
   framework_wheel:
     type: whl
-    path: ../../framework_src
+    path: ../../framework_lff_lib
     build: python -m pip wheel --no-deps --wheel-dir dist .
 
 variables:

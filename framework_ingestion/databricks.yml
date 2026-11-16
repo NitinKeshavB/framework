@@ -12,13 +12,14 @@ include:
 artifacts:
   framework_wheel:
     type: whl
-    path: ../framework_src
+    path: ../framework_lff_lib
     build: python -m pip wheel --no-deps --wheel-dir dist .
 
 variables:
   catalog:
-    description: Unity Catalog for this environment. Must match the framework bundle.
     default: aal_dev_fdh
+  dev_flag:
+    default: true
 
 targets:
   dev:
@@ -36,3 +37,13 @@ targets:
       root_path: /Workspace/Shared/aztech_ingestion
     variables:
       catalog: aal_dev_fdh
+      dev_flag:
+        default: false
+    presets:
+      name_prefix: '[fdh] '
+    permissions:
+      - user_name: adm_ye9z286@allianzms.onmicrosoft.com
+        user_name: nitinkeshav.bolla@allianz.com.au
+        group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
+        level: CAN_MANAGE
+        

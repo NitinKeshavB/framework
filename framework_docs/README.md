@@ -83,7 +83,7 @@ raw_to_bronze:
     - name: amount_non_negative
       expression: amount >= 0
 
-quarantine: { schema: billing_quarantine, table: invoices }
+quarantine: { schema: billing_quarantine}
 ```
 
 `source` also takes `path_glob`, `max_files_per_trigger`, `header_rows` and `data_address` (Excel, both required), and `external_location`. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`.
@@ -114,14 +114,14 @@ raw_to_bronze:
   columns:
     - { name: customer_id, type: string }
 
-quarantine: { schema: erp_quarantine, table: customers }
+quarantine: { schema: erp_quarantine}
 ```
 
 `snapshot` replaces bronze with the source table on every run. `merge` keeps bronze in step with the source on `primary_keys`. `dedup` is not used for database tables.
 
 ## Common spec rules
 
-- `raw_to_bronze` holds the bronze table, keys, `columns`, and `rules`. `quarantine` names the table that receives rows that fail the rules.
+- `raw_to_bronze` holds the bronze table, keys, `columns`, and `rules`. Rows that fail the rules go to `<bronze table>_qrntn` in the bronze schema by default. The `quarantine` block is optional and can override `table`, `schema`, `classification`, or `pii`.
 - A column is `name`, `type`, and an optional `description`, which becomes the column comment. `classification` and `pii` on a column are only needed when they differ from the bronze table.
 - `pii` values are `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, `pii_personal`. Omit `pii` when there is none. A `raw`, `bronze`, or `quarantine` block can override `classification` or `pii`.
 - `notify.on_failure` is who is mailed when the job fails. It defaults to the technical owner. The generated job's `email_notifications` carries the addresses of all its tables.
@@ -183,7 +183,7 @@ A table depends only on lower layers: bronze, then silver, then gold, then a dat
 
 For source system `billing` and table `invoices`:
 
-- Files from a raw volume or a database: `<catalog>.billing_bronze.invoices` and `<catalog>.billing_quarantine.invoices`.
+- Files from a raw volume or a database: `<catalog>.billing_bronze.invoices` and `<catalog>.billing_bronze.invoices_qrntn`. The quarantine table is the bronze table name plus `_qrntn`, in the bronze schema, unless the spec sets `quarantine.table` or `quarantine.schema`.
 - Cloud files also write `<catalog>.billing_raw.invoices`.
 
 Quarantine carries `failed_rules`, the names of the rules that failed. Rows that pass go to bronze. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.

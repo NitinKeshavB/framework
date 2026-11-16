@@ -1,6 +1,6 @@
 # lakeflow_framework
 
-Config-driven ingestion for Databricks Lakeflow on Python 3.11. Pin this wheel and supply YAML: a `source.yaml` per source system and a spec per table. The package validates them, generates the pipelines, jobs, and maps, and builds each pipeline's datasets.
+Config-driven ingestion for Databricks Lakeflow on Python 3.11 or 3.12. Pin this wheel and supply YAML: a `source.yaml` per source system and a spec per table. The package validates them, generates the pipelines, jobs, and maps, and builds each pipeline's datasets.
 
 ```python
 from lakeflow_framework import build_pipeline

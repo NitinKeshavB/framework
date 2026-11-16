@@ -57,4 +57,3 @@ raw_to_bronze:
 
 quarantine:
   schema: payroll_quarantine
-  table: timesheets

@@ -10,7 +10,7 @@ resources:
       libraries:
         - file:
             path: ../pipelines/billing_invoices.py
-        - whl: ../../../framework_src/dist/*.whl
+        - whl: ../../../framework_lff_lib/dist/*.whl
 
     ledger_entries:
       name: ledger_entries
@@ -22,7 +22,7 @@ resources:
       libraries:
         - file:
             path: ../pipelines/ledger_entries.py
-        - whl: ../../../framework_src/dist/*.whl
+        - whl: ../../../framework_lff_lib/dist/*.whl
 
     orders_events:
       name: orders_events
@@ -34,7 +34,7 @@ resources:
       libraries:
         - file:
             path: ../pipelines/orders_events.py
-        - whl: ../../../framework_src/dist/*.whl
+        - whl: ../../../framework_lff_lib/dist/*.whl
 
     payroll_timesheets:
       name: payroll_timesheets
@@ -46,7 +46,7 @@ resources:
       libraries:
         - file:
             path: ../pipelines/payroll_timesheets.py
-        - whl: ../../../framework_src/dist/*.whl
+        - whl: ../../../framework_lff_lib/dist/*.whl
 
     price_book:
       name: price_book
@@ -58,4 +58,4 @@ resources:
       libraries:
         - file:
             path: ../pipelines/price_book.py
-        - whl: ../../../framework_src/dist/*.whl
+        - whl: ../../../framework_lff_lib/dist/*.whl

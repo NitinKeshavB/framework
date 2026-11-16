@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Config-driven Lakeflow file ingestion. Consumers pin this wheel and supply YAML."
 authors = [{ name = "NitinKeshav", email = "nitinkeshav.bolla@allianz.com" }]
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+# Jobs run Python 3.11 (serverless environment version 2). Pipelines may run a newer one, and
+# pip refuses a wheel whose range excludes the interpreter, so the range covers both.
+requires-python = ">=3.11,<3.13"
 license = "MIT"
 dependencies = [
     "PyYAML>=6",
@@ -16,13 +18,14 @@ dependencies = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 keywords = ["lakeflow", "databricks", "ingestion", "bronze"]
 
 [project.scripts]
 lakeflow-framework = "lakeflow_framework.cli:main"
 
-# pip install -e "framework_src[dev]"
+# pip install -e "framework_lff_lib[dev]"
 # dev is the local tool set. test is pytest only.
 [project.optional-dependencies]
 test = ["pytest>=8"]

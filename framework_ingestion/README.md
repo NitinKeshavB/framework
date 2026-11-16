@@ -78,7 +78,7 @@ That is all. The generator validates every source and spec, then rewrites the ma
 
 `SOURCE_MAP.md` shows who requested what, each source's raw volume or foreign catalog, its deliveries, every table with where it reads and its bronze target, and a diagram. It comes from the same model as the jobs, so it describes what is deployed.
 
-`./run.sh bundle:validate` and `bundle:deploy` run `generate` first, so the map and the resources are rewritten before the bundle is checked. They then check that every project still finds the bronze tables it reads. An invalid spec stops the run before Databricks is contacted. `./run.sh generate:check` changes nothing and fails if the generated files are out of date, for CI.
+`./run.sh bundle:validate` and `bundle:deploy` run `generate` first, so the map and the resources are rewritten before the bundle is checked. They do not look at `framework_curation`, which is a separate bundle with its own `./run.sh projects:generate`. An invalid spec stops the run before Databricks is contacted. `./run.sh generate:check` changes nothing and fails if the generated files are out of date, for CI.
 
 ## Deploy
 

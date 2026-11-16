@@ -1,6 +1,6 @@
 target-version = "py311"
 line-length = 100
-src = ["framework_src", "framework_tests", "framework_examples", "framework_bundle"]
+src = ["framework_lff_lib", "framework_tests", "framework_examples", "framework_bundle"]
 extend-exclude = ["venv", ".venv", "dist"]
 
 [lint]

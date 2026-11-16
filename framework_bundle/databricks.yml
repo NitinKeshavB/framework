@@ -11,7 +11,7 @@ include:
 artifacts:
   framework_wheel:
     type: whl
-    path: ../framework_src
+    path: ../framework_lff_lib
     build: python -m pip wheel --no-deps --wheel-dir dist .
 
 variables:
@@ -35,7 +35,8 @@ targets:
     variables:
       catalog: aal_dev_fdh
     permissions:
-      - user_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
+      - user_name: adm_ye9z286@allianzms.onmicrosoft.com
+        user_name: nitinkeshav.bolla@allianz.com.au
+        group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
         level: CAN_MANAGE
-      - user_name: nitinkeshav.bolla@allianz.com.au
-        level: CAN_MANAGE
+        

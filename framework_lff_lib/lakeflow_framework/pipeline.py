@@ -311,10 +311,12 @@ class UnityMetadata:
     def get_pipeline(self, pipeline_id: str) -> dict[str, Any] | None:
         if not IDENTIFIER.fullmatch(pipeline_id):
             raise MetadataNotFound(f"{pipeline_id} is not a pipeline id")
+        # Inside a pipeline, spark.sql is wrapped by Lakeflow and takes only the statement, so a
+        # bound parameter (args=) fails. The id is safe to inline: it matched IDENTIFIER above,
+        # so it holds only letters, digits, and underscores.
         frame = self.spark.sql(
             "SELECT config_json FROM framework_meta.v_object_current "
-            "WHERE object_kind = 'pipeline' AND full_name = :pipeline_id",
-            args={"pipeline_id": pipeline_id},
+            f"WHERE object_kind = 'pipeline' AND full_name = '{pipeline_id}'"
         )
         rows = frame.collect() if hasattr(frame, "collect") else list(frame)
         if not rows:

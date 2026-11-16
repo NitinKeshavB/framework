@@ -33,4 +33,3 @@ raw_to_bronze:
 
 quarantine:
   schema: erp_quarantine
-  table: orders

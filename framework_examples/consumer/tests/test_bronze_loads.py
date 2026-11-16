@@ -26,7 +26,7 @@ def test_billing_publishes_raw_to_bronze():
     assert config.layer == "bronze"
     assert config.table_name("raw") == "framework_dev.billing_raw.invoices"
     assert config.table_name("bronze") == "framework_dev.billing_bronze.invoices"
-    assert config.table_name("quarantine") == "framework_dev.billing_quarantine.invoices"
+    assert config.table_name("quarantine") == "framework_dev.billing_quarantine.invoices_qrntn"
     assert [dataset.kind for dataset in graph.datasets] == ["raw", "valid", "quarantine", "bronze"]
     assert graph.auto_cdc["keys"] == ["invoice_id"]
     assert graph.auto_cdc["sequence_by"] == "updated_at"

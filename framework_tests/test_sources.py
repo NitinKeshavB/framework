@@ -26,7 +26,7 @@ raw_to_bronze:
   columns:
     - {{name: thing_id, type: string}}
 {extra}
-quarantine: {{schema: {system}_quarantine, table: things}}
+quarantine: {{schema: {system}_quarantine}}
 """
 
 FILE_SOURCE = """\
@@ -185,7 +185,7 @@ def test_snapshot_mode_replaces_bronze_with_a_materialized_view(tmp_path: Path) 
     pipelines = _Pipelines()
     build_pipeline("db_things", spark=_Spark(), pipelines=pipelines, config=config)
     assert pipelines.kinds["framework_dev.db_bronze.things"] == "materialized_view"
-    assert pipelines.kinds["framework_dev.db_quarantine.things"] == "materialized_view"
+    assert pipelines.kinds["framework_dev.db_quarantine.things_qrntn"] == "materialized_view"
 
 
 def test_volume_files_register_streaming_tables_without_a_raw_table(tmp_path: Path) -> None:
@@ -193,7 +193,7 @@ def test_volume_files_register_streaming_tables_without_a_raw_table(tmp_path: Pa
     spark, pipelines = _Spark(), _Pipelines()
     build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config)
     assert pipelines.kinds["framework_dev.files_bronze.things"] == "table"
-    assert pipelines.kinds["framework_dev.files_quarantine.things"] == "table"
+    assert pipelines.kinds["framework_dev.files_quarantine.things_qrntn"] == "table"
     assert not any(name.endswith("_raw.things") for name in pipelines.names)
     assert not pipelines.expectations
     assert spark.readStream.format_name == "cloudFiles"
@@ -240,10 +240,18 @@ def test_database_spec_problems_are_named(tmp_path: Path, spec: str, message: st
 
 def test_volume_spec_problems_are_named(tmp_path: Path) -> None:
     folder = tmp_path / "files"
-    path = _write(folder, FILE_SOURCE, "files_things.yaml", _volume_spec(source="  format: csv\n"))
+    # No raw_path means the files are in the volume itself.
+    root = _write(folder, FILE_SOURCE, "files_things.yaml", _volume_spec(source="  format: csv\n"))
+    (config,) = validate_configs([root], catalog="framework_dev")
+    assert config.path == "/Volumes/framework_dev/files_raw/landing/"
+    # A full path would be joined onto the volume path and point nowhere.
+    full = _volume_spec(
+        source="  raw_path: /Volumes/framework_dev/files_raw/landing\n  format: csv\n"
+    )
+    path = _write(folder, FILE_SOURCE, "files_things.yaml", full)
     with pytest.raises(ConfigValidationError) as caught:
         validate_configs([path], catalog="framework_dev")
-    assert "raw_path is required" in " ".join(caught.value.errors)
+    assert "not a full path" in " ".join(caught.value.errors)
     fixed = _volume_spec(source="  raw_path: things/\n  format: fixed_width\n")
     path = _write(folder, FILE_SOURCE, "files_things.yaml", fixed)
     with pytest.raises(ConfigValidationError) as caught:

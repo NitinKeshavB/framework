@@ -48,4 +48,3 @@ raw_to_bronze:
 
 quarantine:
   schema: catalog_quarantine
-  table: prices

@@ -1,0 +1,19 @@
+source_system: abs
+domain: finance
+owner: sonia.rajeev@allianz.com.au
+kind: sftp_files
+
+# Files land in volumes of this schema as delivered. Bronze reads them from there.
+# Each table spec names its own volume, next to its other file settings.
+raw_volume:
+  schema: abs_raw
+
+# A delivery fires when files arrive in the volume its tables read, so all tables in one
+# delivery must read the same volume. Give another volume its own delivery, or use a schedule.
+deliveries:
+  daily:
+    schedule: "0 0 2 * * ?"          # or: schedule: "0 0 2 * * ?" (Quartz cron, UTC)
+
+# Inherited by every table spec under abs/, so not repeated there: domain, owner as the
+# technical_owner, layer, the only delivery and its job (abs_daily), and from the folder a spec
+# sits in: requested_by and team. Everything about a file or its sensitivity is in the table spec.

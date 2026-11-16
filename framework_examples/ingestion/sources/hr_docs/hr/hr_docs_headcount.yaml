@@ -34,4 +34,3 @@ raw_to_bronze:
 
 quarantine:
   schema: hr_docs_quarantine
-  table: headcount

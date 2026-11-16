@@ -33,7 +33,7 @@ resources:
               - --out
               - /Volumes/${var.catalog}/framework_meta/framework_events
           libraries:
-            - whl: ../../../framework_src/dist/*.whl
+            - whl: ../../../framework_lff_lib/dist/*.whl
         - task_key: sync
           depends_on:
             - task_key: mark_running
@@ -47,7 +47,7 @@ resources:
               - --out
               - /Volumes/${var.catalog}/framework_meta/framework_events
           libraries:
-            - whl: ../../../framework_src/dist/*.whl
+            - whl: ../../../framework_lff_lib/dist/*.whl
         - task_key: await_registry
           depends_on:
             - task_key: sync
@@ -64,7 +64,7 @@ resources:
               - --pipeline
               - price_book
           libraries:
-            - whl: ../../../framework_src/dist/*.whl
+            - whl: ../../../framework_lff_lib/dist/*.whl
         - task_key: batch_load
           depends_on:
             - task_key: await_registry
@@ -75,7 +75,7 @@ resources:
               - ../configs/bronze/payroll_timesheets.yaml
               - ../configs/bronze/price_book.yaml
           libraries:
-            - whl: ../../../framework_src/dist/*.whl
+            - whl: ../../../framework_lff_lib/dist/*.whl
         - task_key: orders_pipeline
           depends_on:
             - task_key: batch_load
@@ -115,7 +115,7 @@ resources:
               - --out
               - /Volumes/${var.catalog}/framework_meta/framework_events
           libraries:
-            - whl: ../../../framework_src/dist/*.whl
+            - whl: ../../../framework_lff_lib/dist/*.whl
         - task_key: record_failure
           depends_on:
             - task_key: mark_running
@@ -149,4 +149,4 @@ resources:
               - --out
               - /Volumes/${var.catalog}/framework_meta/framework_events
           libraries:
-            - whl: ../../../framework_src/dist/*.whl
+            - whl: ../../../framework_lff_lib/dist/*.whl

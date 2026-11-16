@@ -29,4 +29,3 @@ raw_to_bronze:
 
 quarantine:
   schema: claims_db_quarantine
-  table: codes
