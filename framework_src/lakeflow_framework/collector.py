@@ -16,6 +16,7 @@ from lakeflow_framework.metadata import (
     new_object_rows,
     owners_sql,
     ownership_conflicts,
+    recorded_versions_sql,
     registered_sql,
     split_payloads,
     step_key,
@@ -103,13 +104,32 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
         ]
     if not fresh:
         return 0
-    written = _insert(
-        spark,
-        _table(catalog, "object_registry"),
-        fresh,
-        OBJECT_COLUMNS,
-        timestamp_columns=("recorded_at",),
-    )
+    # History is checked by the exact version, not only by the current hash. A retry after the
+    # insert has landed and the current merge has not still repairs object_current, and does not
+    # append the same version again.
+    to_insert = fresh
+    if catalog:
+        recorded = _recorded_versions(spark, catalog, fresh)
+        to_insert = [
+            row
+            for row in fresh
+            if (
+                row["object_kind"],
+                row["full_name"],
+                row["content_hash"],
+                str(row["recorded_at"]),
+            )
+            not in recorded
+        ]
+    written = 0
+    if to_insert:
+        written = _insert(
+            spark,
+            _table(catalog, "object_registry"),
+            to_insert,
+            OBJECT_COLUMNS,
+            timestamp_columns=("recorded_at",),
+        )
     _merge_current(
         spark,
         _table(catalog, "object_current"),
@@ -205,6 +225,20 @@ def _existing_step_keys(spark, catalog: str, payloads: list[dict]) -> set[tuple[
         (str(row["run_id"]), int(row["step_no"]), str(row["status"]))
         for row in _rows(spark.sql(statement))
     }
+
+
+def _recorded_versions(spark, catalog: str, rows: list[dict]) -> set[tuple[str, str, str, str]]:
+    found: set[tuple[str, str, str, str]] = set()
+    for row in _rows(spark.sql(recorded_versions_sql(catalog, rows))):
+        found.add(
+            (
+                str(row["object_kind"]),
+                str(row["full_name"]),
+                str(row["content_hash"]),
+                str(row["recorded_at"]),
+            )
+        )
+    return found
 
 
 def _current_object_hashes(spark, catalog: str, rows: list[dict]) -> dict[tuple[str, str], str]:
@@ -439,7 +473,12 @@ def event_statements(catalog: str) -> list[str]:
         f"INSERT INTO {meta}.object_registry "
         f"SELECT object_kind, full_name, owner_kind, owner, requested_by, delivery, "
         f"parent_full_name, relation, config_json, content_hash, source, recorded_at "
-        f"FROM ({accepted}) a"
+        f"FROM ({accepted}) a "
+        f"WHERE NOT EXISTS ("
+        f"SELECT 1 FROM {meta}.object_registry h "
+        f"WHERE h.owner = a.owner AND h.object_kind = a.object_kind "
+        f"AND h.full_name = a.full_name AND h.content_hash = a.content_hash "
+        f"AND h.recorded_at = a.recorded_at)"
     )
     object_assignments = ", ".join(f"t.{column} = s.{column}" for column in OBJECT_COLUMNS)
     object_values = ", ".join(f"s.{column}" for column in OBJECT_COLUMNS)

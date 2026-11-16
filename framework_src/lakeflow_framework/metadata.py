@@ -396,6 +396,7 @@ _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SAFE_INSTANT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def write_definition_files(directory: Path, rows: list[dict[str, Any]]) -> list[Path]:
@@ -637,6 +638,43 @@ def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
         f"WHERE owner_kind IN ({quoted_owner_kinds}) AND owner IN ({quoted_owners}) "
         f"AND object_kind IN ({quoted_kinds}) "
         f"AND full_name IN ({quoted_names})"
+    )
+
+
+def recorded_versions_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
+    """History rows for these exact versions. A retry matches hash and recorded_at."""
+
+    if not catalog or not _SAFE_TOKEN.match(catalog):
+        raise ValueError("catalog is required")
+    names = sorted({str(row["full_name"]) for row in rows})
+    kinds = sorted({str(row["object_kind"]) for row in rows})
+    owners = sorted({str(row.get("owner") or "") for row in rows})
+    hashes = sorted({str(row["content_hash"]) for row in rows})
+    instants = sorted({str(row["recorded_at"]) for row in rows})
+    if not names or any(not _SAFE_NAME.match(name) for name in names):
+        raise ValueError("object name is required")
+    if any(not _SAFE_TOKEN.match(kind) for kind in kinds):
+        raise ValueError("object kind is required")
+    if any(not _SAFE_TOKEN.match(owner) for owner in owners):
+        raise ValueError("owner is required")
+    if any(not _SAFE_HASH.match(value) for value in hashes):
+        raise ValueError("content hash is required")
+    if any(not _SAFE_INSTANT.match(value) for value in instants):
+        raise ValueError("recorded_at is required")
+    quoted_names = ", ".join(f"'{name}'" for name in names)
+    quoted_kinds = ", ".join(f"'{kind}'" for kind in kinds)
+    quoted_owners = ", ".join(f"'{owner}'" for owner in owners)
+    quoted_hashes = ", ".join(f"'{value}'" for value in hashes)
+    quoted_times = ", ".join(
+        f"to_timestamp('{instant}', 'yyyy-MM-dd''T''HH:mm:ss''Z''')" for instant in instants
+    )
+    return (
+        "SELECT object_kind, full_name, content_hash, "
+        "date_format(recorded_at, 'yyyy-MM-dd''T''HH:mm:ss''Z''') AS recorded_at "
+        f"FROM {catalog}.framework_meta.object_registry "
+        f"WHERE owner IN ({quoted_owners}) "
+        f"AND object_kind IN ({quoted_kinds}) AND full_name IN ({quoted_names}) "
+        f"AND content_hash IN ({quoted_hashes}) AND recorded_at IN ({quoted_times})"
     )
 
 

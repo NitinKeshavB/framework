@@ -977,8 +977,62 @@ def test_collector_bounds_the_micro_batch():
     assert "framework_dev.framework_meta.run_current" in landed
     assert "date_sub(current_date(), 2)" in landed
     assert "INSERT INTO framework_dev.framework_meta.object_registry" in landed
+    history = next(
+        statement
+        for statement in statements
+        if statement.startswith("INSERT INTO framework_dev.framework_meta.object_registry")
+    )
+    assert "NOT EXISTS" in history and "h.content_hash = a.content_hash" in history
+    current = next(
+        statement
+        for statement in statements
+        if statement.startswith("MERGE INTO framework_dev.framework_meta.object_current")
+    )
+    assert "NOT EXISTS" not in current
     with pytest.raises(ValueError):
         event_statements("framework dev")
+
+
+def test_a_retried_definition_repairs_the_current_row_without_a_second_history_row(monkeypatch):
+    inserted: list[list[dict]] = []
+    merged: list[list[dict]] = []
+
+    def fake_insert(_spark, _table, rows, *_args, **_kwargs):
+        inserted.append(rows)
+        return len(rows)
+
+    def fake_merge(_spark, _table, rows, *_args, **_kwargs):
+        merged.append(rows)
+
+    monkeypatch.setattr("lakeflow_framework.collector._insert", fake_insert)
+    monkeypatch.setattr("lakeflow_framework.collector._merge_current", fake_merge)
+    row = _owned_row()
+
+    class Frame:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def collect(self):
+            return self.rows
+
+    class Spark:
+        def sql(self, statement):
+            if "object_registry" in statement and "content_hash" in statement:
+                return Frame(
+                    [
+                        {
+                            "object_kind": row["object_kind"],
+                            "full_name": row["full_name"],
+                            "content_hash": row["content_hash"],
+                            "recorded_at": row["recorded_at"],
+                        }
+                    ]
+                )
+            return Frame([])
+
+    assert append_definitions(Spark(), [row], set(), "framework_dev") == 0
+    assert inserted == []
+    assert merged == [[row]]
 
 
 def test_an_unsafe_name_is_not_inserted_by_skipping_the_check():
