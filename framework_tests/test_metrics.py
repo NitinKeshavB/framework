@@ -148,6 +148,13 @@ class _Pipelines:
     def create_streaming_table(self, name, **_options):
         self.tables.append(name)
 
+    def temporary_view(self, name, **_options):
+        def register(function):
+            self.views[name] = function
+            return function
+
+        return register
+
     def append_flow(self, target, name):
         def register(function):
             self.flows.append((target, name))
@@ -181,9 +188,12 @@ def test_metrics_pipeline_adds_one_append_flow_per_event_log():
     metrics.register(dp, spark, "framework_dev")
     assert dp.tables == ["flow_events"]
     assert dp.flows == [
-        ("flow_events", "abs_daily_to_flow_events"),
-        ("flow_events", "erp_hourly_to_flow_events"),
+        ("flow_events", "abs_daily_events"),
+        ("flow_events", "erp_hourly_events"),
     ]
+    assert "abs_daily_event_log_src" in dp.views
+    assert "erp_hourly_event_log_src" in dp.views
+    assert "abs_daily_event_log" not in {name for _target, name in dp.flows}
     assert "FROM flow_events" in dp.views["table_load_metrics"]()
 
 

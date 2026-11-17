@@ -217,15 +217,21 @@ def register(dp, spark, catalog: str) -> None:
 
 
 def _append(dp, spark, log: str, job: str) -> None:
-    # The flow must not be named <job>_event_log: that is already a table in this schema, and
-    # Lakeflow treats a flow with the same name as a cycle on that table.
-    @dp.append_flow(target=EVENTS, name=f"{job}_to_flow_events")
-    def _events():
+    # Never name a flow or view <job>_event_log. That table already exists in this schema (the
+    # delivery pipeline's published event log), and a flow with the same name is a self-cycle.
+    view = f"{job}_event_log_src"
+
+    @dp.temporary_view(name=view)
+    def _src():
         return (
             spark.readStream.table(log)
             .where("event_type IN ('flow_definition', 'flow_progress')")
             .selectExpr(*event_columns(job))
         )
+
+    @dp.append_flow(target=EVENTS, name=f"{job}_events")
+    def _events():
+        return spark.readStream.table(view)
 
 
 def _running_pipeline():
