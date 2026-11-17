@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -23,7 +22,12 @@ _EXPECTATIONS = (
 
 
 def record_bronze_loads(spark, catalog: str, job_name: str) -> int:
-    """Append rows_read / bronze / quarantine counts for the latest pipeline update of ``job_name``."""
+    """Append rows_read / bronze / quarantine counts for the latest pipeline update of ``job_name``.
+
+    Uses ``INSERT INTO ... SELECT`` so column types come from the SQL (with explicit CASTs), not
+    from inferring a Python row. That avoids "types cannot be determined after inferring" when
+    some metrics are null, and keeps the rows off the driver.
+    """
 
     if not _IDENTIFIER.fullmatch(catalog or ""):
         raise ValueError("catalog is required")
@@ -32,18 +36,27 @@ def record_bronze_loads(spark, catalog: str, job_name: str) -> int:
     meta = f"{catalog}.framework_meta"
     event_log = f"{meta}.{job_name}{EVENT_LOG_SUFFIX}"
     log.info("load metrics: recording latest update of %s from %s", job_name, event_log)
-    frame = spark.sql(latest_bronze_loads_sql(event_log, meta, job_name))
-    rows = _rows(frame)
-    if not rows:
+    loads = latest_bronze_loads_sql(event_log, meta, job_name)
+    spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW _framework_bronze_loads AS {loads}")
+    counted = _rows(spark.sql("SELECT count(*) AS n FROM _framework_bronze_loads"))
+    written = int(counted[0]["n"]) if counted else 0
+    if not written:
         log.info("load metrics: no flow_progress for the latest update yet")
         return 0
-    recorded = datetime.now(timezone.utc).replace(microsecond=0)
-    for row in rows:
-        row["recorded_at"] = recorded
-        if row.get("expectations") is not None and not isinstance(row["expectations"], str):
-            row["expectations"] = str(row["expectations"])
-    spark.createDataFrame(rows).write.mode("append").saveAsTable(f"{meta}.{LEDGER}")
-    for row in rows:
+    spark.sql(
+        f"INSERT INTO {meta}.{LEDGER} SELECT "
+        f"job_name, pipeline_id, pipeline_name, update_id, dataflow, owner_kind, owner, "
+        f"bronze_table, quarantine_table, started_at, ended_at, duration_seconds, "
+        f"rows_read, rows_bronze, rows_quarantine, rows_processed, "
+        f"bronze_status, quarantine_status, expectations, current_timestamp() AS recorded_at "
+        f"FROM _framework_bronze_loads"
+    )
+    for row in _rows(
+        spark.sql(
+            "SELECT dataflow, update_id, rows_read, rows_bronze, rows_quarantine, rows_processed "
+            "FROM _framework_bronze_loads"
+        )
+    ):
         log.info(
             "load metrics: %s update %s dataflow %s: read=%s bronze=%s quarantine=%s processed=%s",
             job_name,
@@ -54,8 +67,8 @@ def record_bronze_loads(spark, catalog: str, job_name: str) -> int:
             row.get("rows_quarantine"),
             row.get("rows_processed"),
         )
-    log.info("load metrics: appended %d row(s) to %s.%s", len(rows), meta, LEDGER)
-    return len(rows)
+    log.info("load metrics: appended %d row(s) to %s.%s", written, meta, LEDGER)
+    return written
 
 
 def latest_bronze_loads_sql(event_log: str, meta: str, job_name: str) -> str:
@@ -101,7 +114,7 @@ loads AS (
     max(pipeline_name) AS pipeline_name,
     min(event_at) AS started_at,
     max(event_at) AS ended_at,
-    max_by(status, event_at) AS status,
+    max_by(status, event_at) FILTER (WHERE status IS NOT NULL) AS status,
     sum(output_rows) AS rows_written
   FROM progress
   GROUP BY pipeline_id, update_id, flow_name
@@ -156,26 +169,31 @@ staged_expectations AS (
   GROUP BY r.dataflow
 )
 SELECT
-  '{job_name}' AS job_name,
-  r.pipeline_id,
-  max(r.pipeline_name) AS pipeline_name,
-  r.update_id,
-  r.dataflow,
-  max(r.owner_kind) AS owner_kind,
-  max(r.owner) AS owner,
-  max(CASE WHEN r.layer = 'bronze' THEN r.table_name END) AS bronze_table,
-  max(CASE WHEN r.layer = 'quarantine' THEN r.table_name END) AS quarantine_table,
-  min(r.started_at) AS started_at,
-  max(r.ended_at) AS ended_at,
-  (unix_millis(max(r.ended_at)) - unix_millis(min(r.started_at))) / 1000.0 AS duration_seconds,
-  max(CASE WHEN r.layer = 'staged' THEN r.rows_written END) AS rows_read,
-  max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END) AS rows_bronze,
-  max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END) AS rows_quarantine,
-  coalesce(max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END), 0)
-    + coalesce(max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END), 0) AS rows_processed,
-  max(CASE WHEN r.layer = 'bronze' THEN r.status END) AS bronze_status,
-  max(CASE WHEN r.layer = 'quarantine' THEN r.status END) AS quarantine_status,
-  max(e.expectations) AS expectations
+  CAST('{job_name}' AS STRING) AS job_name,
+  CAST(r.pipeline_id AS STRING) AS pipeline_id,
+  CAST(max(r.pipeline_name) AS STRING) AS pipeline_name,
+  CAST(r.update_id AS STRING) AS update_id,
+  CAST(r.dataflow AS STRING) AS dataflow,
+  CAST(max(r.owner_kind) AS STRING) AS owner_kind,
+  CAST(max(r.owner) AS STRING) AS owner,
+  CAST(max(CASE WHEN r.layer = 'bronze' THEN r.table_name END) AS STRING) AS bronze_table,
+  CAST(max(CASE WHEN r.layer = 'quarantine' THEN r.table_name END) AS STRING) AS quarantine_table,
+  CAST(min(r.started_at) AS TIMESTAMP) AS started_at,
+  CAST(max(r.ended_at) AS TIMESTAMP) AS ended_at,
+  CAST(
+    (unix_millis(max(r.ended_at)) - unix_millis(min(r.started_at))) / 1000.0 AS DOUBLE
+  ) AS duration_seconds,
+  CAST(max(CASE WHEN r.layer = 'staged' THEN r.rows_written END) AS BIGINT) AS rows_read,
+  CAST(max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END) AS BIGINT) AS rows_bronze,
+  CAST(max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END) AS BIGINT) AS rows_quarantine,
+  CAST(
+    coalesce(max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END), 0)
+      + coalesce(max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END), 0)
+    AS BIGINT
+  ) AS rows_processed,
+  CAST(max(CASE WHEN r.layer = 'bronze' THEN r.status END) AS STRING) AS bronze_status,
+  CAST(max(CASE WHEN r.layer = 'quarantine' THEN r.status END) AS STRING) AS quarantine_status,
+  CAST(max(e.expectations) AS STRING) AS expectations
 FROM resolved r
 LEFT JOIN staged_expectations e ON e.dataflow = r.dataflow
 WHERE r.dataflow IS NOT NULL
