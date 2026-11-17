@@ -86,7 +86,7 @@ raw_to_bronze:
 quarantine: { schema: billing_quarantine}
 ```
 
-`source` also takes `path_glob`, `max_files_per_trigger` (default 1000), `multiline` (JSON only; default false), `header_rows` and `data_address` (Excel, both required), and `external_location`. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`. An Excel address may quote the sheet name, as in `'Sheet1'!A1`.
+`source` also takes `path_glob`, `max_files_per_trigger` (default 1000), `multiline` (JSON only; default false), `header_rows` and `data_address` (Excel, both required), `external_location`, and `file_events` (default false; set it only once file events are enabled on the volume's external location). `raw_to_bronze.bronze.cluster_by` takes up to four columns; without it bronze uses automatic liquid clustering. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`. An Excel address may quote the sheet name, as in `'Sheet1'!A1`.
 
 ## Table spec: a database table
 
@@ -186,7 +186,7 @@ For source system `billing` and table `invoices`:
 - Files from a raw volume or a database: `<catalog>.billing_bronze.invoices` and `<catalog>.billing_bronze.invoices_qrntn`. The quarantine table is the bronze table name plus `_qrntn`, in the bronze schema, unless the spec sets `quarantine.table` or `quarantine.schema`.
 - Cloud files also write `<catalog>.billing_raw.invoices`.
 
-Quarantine carries `failed_rules`, the names of the rules that failed. Rows that pass go to bronze. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.
+Bronze and quarantine carry `_dq_failed_rules`, the names of the rules that failed. Bronze keeps every row, so filter it on `size(_dq_failed_rules) = 0` for clean rows; with `dedup` or a database `merge`, bronze holds only passing rows. Quarantine holds the rows that failed any rule. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.
 
 ## Operations
 

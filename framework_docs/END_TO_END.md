@@ -39,18 +39,27 @@ Deploy also updates the registry before it returns. `bundle:deploy framework_bun
 
 ## How each kind loads
 
-The graph depends on the kind. Quarantine and bronze are filtered by the quality rules; nothing is dropped with `expect_or_drop`.
+Each table reads its source once. The dataset that reads it adds `_dq_failed_rules`, the names of the rules the row failed, so each rule is evaluated once per row. Nothing is dropped with `expect_or_drop`.
+
+- **Append loads** (no `dedup`, database `snapshot`): bronze holds every row with `_dq_failed_rules`. Quarantine reads bronze `WHERE size(_dq_failed_rules) > 0`. Readers who want only clean rows filter bronze on `size(_dq_failed_rules) = 0`.
+- **Auto CDC loads** (`dedup: true`, database `merge`): a CDC target keeps one row per key and cannot hold a row with a null key. So the checked rows land once in a private `<pipeline_id>_staged` table, which is not published to Unity Catalog. A temporary view keeps the passing rows for Auto CDC, and quarantine reads the failing rows from the staging table. Bronze holds only passing rows.
+
+Each rule is also a warn expectation, `NOT array_contains(_dq_failed_rules, '<rule>')`, on the dataset that reads the source, so pass and fail counts reach the pipeline event log without evaluating the rule again.
 
 | Kind and method | Reads | Quarantine | Bronze |
 | --- | --- | --- | --- |
-| Files, `volume_files` | Auto Loader on the raw volume path. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table of failing rows | Streaming table of passing rows, or Auto CDC on the keys when `dedup: true` |
-| Database, `snapshot` | The foreign-catalog table, in batch | Materialized view of failing rows | Materialized view of passing rows |
-| Database, `merge` | The same, as snapshots | Materialized view | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
+| Files, `volume_files` | Auto Loader on the raw volume path, once. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table read from bronze (or the staging table) | Streaming table of every row, or Auto CDC on the keys when `dedup: true` |
+| Database, `snapshot` | The foreign-catalog table, in batch, once | Materialized view read from bronze | Materialized view of every row |
+| Database, `merge` | The same, into the private staging materialized view | Materialized view read from the staging view | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
 | Cloud files, `autoloader` | Auto Loader once into a raw streaming table. The projection, including `_source_file` and `_ingested_at`, is applied on that read. | Streaming table, read from the raw table | Streaming table read from the valid view, or Auto CDC from that view when `dedup: true` |
 | Cloud files, `copy_into` | `COPY INTO` a raw table (`force = false`) before the pipeline | Streaming table | Streaming table |
 | Cloud files, `ctas` | `CREATE OR REPLACE TABLE` raw | Materialized view | Materialized view |
 
 The three cloud-files rows are frozen. The code is kept and tested, but validation rejects these methods until they run end to end on serverless.
+
+Every published table gets a comment, `table_properties` (`quality` and `lakeflow_framework.pipeline_id`), and liquid clustering: `cluster_by_auto`, unless the spec sets `raw_to_bronze.bronze.cluster_by` (up to four columns). An Auto CDC bronze clusters on its first four primary keys by default. Turn on predictive optimization for the catalog once (`ALTER CATALOG <catalog> ENABLE PREDICTIVE OPTIMIZATION`, which needs the catalog owner); it runs `OPTIMIZE` and `VACUUM` on these tables.
+
+Auto Loader on CSV, delimited text, and JSON gets `cloudFiles.schemaHints` from `columns`, so the declared columns land typed and the first run does not sample files to infer them. A value that does not parse lands in `_rescued_data`, so the `schema_conformance` rule sends it to quarantine. Without file events Auto Loader lists the directory; point `raw_path` at the narrowest folder. Once file events are enabled on the external location behind the volume, set `source.file_events: true` to use `cloudFiles.useManagedFileEvents`.
 
 Excel works with Auto Loader and CTAS but not `copy_into`. `dedup: true` needs `primary_keys` and `watermark_column`, and uses `stored_as_scd_type` integer `1`: the latest row for each key wins. The watermark must be in `columns` with its type. Files land it as a string, so the valid view casts it before Auto CDC orders on it, and a null or uncastable watermark goes to quarantine. Keys also generate not-null rules when dedup is off.
 
@@ -63,7 +72,7 @@ Rules in the spec become SQL predicates before a cluster starts.
 - Each declared type gets `TRY_CAST(column AS type) IS NOT NULL OR column IS NULL`, so a null is not also a cast failure.
 - Auto Loader on CSV, delimited text, JSON, and text adds `_rescued_data IS NULL`.
 
-A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `failed_rules`, the names of every predicate that failed.
+A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Bronze and quarantine rows carry `_dq_failed_rules`, the names of every predicate that failed.
 
 ## The registry
 
@@ -159,7 +168,7 @@ None of the following has run on Databricks. The code assumes them:
 - A streaming view read by name from a downstream streaming table.
 - Auto Loader with `_metadata.file_path` on a volume path.
 - A file-arrival trigger on a Unity Catalog volume path, and `${workspace.file_path}` spec paths on serverless.
-- Serverless `environment_version` 2 with the wheel as a dependency.
+- Serverless `environment_version` 4 with the wheel as a dependency, and `performance_target: STANDARD` on each generated job.
 - Federated tables as a pipeline source, and `merge` as a snapshot flow.
 - COPY INTO as a job statement before the pipeline.
 - Excel `headerRows` and `dataAddress` without `schemaLocation`.

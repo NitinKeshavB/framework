@@ -13,9 +13,10 @@ resources:
       environments:
       - environment_key: framework_env
         spec:
-          environment_version: '2'
+          environment_version: '4'
           dependencies:
           - ../../framework_lff_lib/dist/*.whl
+      performance_target: STANDARD
       tasks:
       - task_key: mark_running
         environment_key: framework_env

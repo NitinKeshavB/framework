@@ -13,9 +13,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from lakeflow_framework.config import IDENTIFIER, PipelineConfig, config_from_document
+from lakeflow_framework.config import (
+    IDENTIFIER,
+    MAX_CLUSTER_KEYS,
+    PipelineConfig,
+    config_from_document,
+)
 from lakeflow_framework.load import _projection, get_strategy, projection_exprs
-from lakeflow_framework.quality import compile_rules, fail_sql, failed_rules_sql, pass_sql
+from lakeflow_framework.quality import (
+    DQ_COLUMN,
+    FAILED,
+    PASSED,
+    compile_rules,
+    expectations,
+    failed_rules_sql,
+)
 
 
 class MetadataNotFound(Exception):
@@ -115,12 +127,18 @@ def _cluster_pipelines() -> Any:
 
 
 def assemble(config: PipelineConfig) -> Graph:
+    """The datasets for one table. The source is read once, by the dataset that checks the rules.
+
+    An append load writes every row to bronze with DQ_COLUMN, and quarantine reads the failing
+    rows back from bronze. Auto CDC keeps one row per key and cannot hold a row with a null key,
+    so a CDC load lands the checked rows in a private staging table first; bronze and quarantine
+    both read that table.
+    """
+
     strategy = get_strategy(config.load_method)
     rules = compile_rules(config)
+    relation = "batch" if config.is_batch else "streaming"
     bronze_name = config.table_name("bronze")
-    quarantine_name = config.table_name("quarantine")
-    valid_name = f"{config.pipeline_id}_valid"
-    expectations = [(rule.name, rule.expression) for rule in rules]
     datasets: list[Dataset] = []
     if config.has_raw:
         origin = config.table_name("raw")
@@ -141,35 +159,32 @@ def assemble(config: PipelineConfig) -> Graph:
         origin = config.source_reference()
     else:
         origin = config.path
-    relation = "batch" if config.is_batch else "streaming"
-    datasets.append(
-        Dataset(
-            kind="valid",
-            name=valid_name,
-            relation="temporary_view",
-            detail={"where": pass_sql(rules), "source": origin},
-        )
-    )
-    datasets.append(
-        Dataset(
-            kind="quarantine",
-            name=quarantine_name,
-            relation=relation,
-            detail={
-                "where": fail_sql(rules),
-                "failed_rules": failed_rules_sql(rules),
-                "source": origin,
-            },
-        )
-    )
+    checked = {"source": origin, "failed_rules": failed_rules_sql(rules)}
+    if config.load_method in {"autoloader", "volume_files"}:
+        checked["options"] = strategy.options(config)
     auto_cdc = None
     if config.uses_auto_cdc:
+        staged_name = f"{config.pipeline_id}_staged"
+        valid_name = f"{config.pipeline_id}_valid"
+        datasets.append(Dataset(kind="staged", name=staged_name, relation=relation, detail=checked))
+        datasets.append(
+            Dataset(
+                kind="valid",
+                name=valid_name,
+                relation="temporary_view",
+                detail={"source": staged_name, "where": PASSED},
+            )
+        )
         datasets.append(
             Dataset(
                 kind="bronze",
                 name=bronze_name,
                 relation="auto_cdc",
-                detail={"keys": list(config.primary_keys), "sequence_by": config.watermark_column},
+                detail={
+                    "source": valid_name,
+                    "keys": list(config.primary_keys),
+                    "sequence_by": config.watermark_column,
+                },
             )
         )
         auto_cdc = {
@@ -179,19 +194,22 @@ def assemble(config: PipelineConfig) -> Graph:
             "sequence_by": config.watermark_column,
             "stored_as_scd_type": 1,
         }
+        rejected_from = staged_name
     else:
-        datasets.append(
-            Dataset(
-                kind="bronze",
-                name=bronze_name,
-                relation=relation,
-                detail={"where": pass_sql(rules), "source": origin},
-            )
+        datasets.append(Dataset(kind="bronze", name=bronze_name, relation=relation, detail=checked))
+        rejected_from = bronze_name
+    datasets.append(
+        Dataset(
+            kind="quarantine",
+            name=config.table_name("quarantine"),
+            relation=relation,
+            detail={"source": rejected_from, "where": FAILED},
         )
+    )
     return Graph(
         pipeline_id=config.pipeline_id,
         datasets=datasets,
-        expectations=expectations,
+        expectations=list(expectations(rules).items()),
         batch_sql=strategy.batch_sql(config),
         auto_cdc=auto_cdc,
     )
@@ -220,19 +238,18 @@ def _resolve_config(
     return config_from_document(document)
 
 
-def _filtered(frame: Any, where: str, extra: str | None = None) -> Any:
+def _filtered(frame: Any, where: str) -> Any:
     """Keep the rows matching ``where``. Test doubles without ``filter`` return a description."""
 
     if not hasattr(frame, "filter"):
         return {"where": where, "frame": frame}
-    result = frame.filter(where)
-    return result.selectExpr("*", extra) if extra else result
+    return frame.filter(where)
 
 
 def _typed_sequence(frame: Any, config: PipelineConfig) -> Any:
     """Cast the sequence column to its declared type, so Auto CDC does not order strings.
 
-    The valid filter has already passed its cast and not-null rules, so the cast cannot fail.
+    The valid view keeps only rows whose cast and not-null rules passed, so the cast cannot fail.
     """
 
     sequence, type_name = config.watermark_column, config.sequence_type
@@ -246,14 +263,47 @@ def _typed_sequence(frame: Any, config: PipelineConfig) -> Any:
     )
 
 
+def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
+    """Comment, properties, and clustering for a table the pipeline publishes."""
+
+    tags = config.tags.get(layer) or config.tags.get("bronze")
+    classification = tags.classification if tags else ""
+    options: dict[str, Any] = {
+        "comment": (
+            f"{layer.capitalize()} for {config.pipeline_id} from source system "
+            f"{config.source_system} ({config.data_domain}). Technical owner "
+            f"{config.technical_owner}. Classification {classification}. "
+            f"{DQ_COLUMN} lists the rules each row failed."
+        ),
+        "table_properties": {
+            "quality": layer,
+            "lakeflow_framework.pipeline_id": config.pipeline_id,
+        },
+    }
+    if layer == "staged":
+        options["private"] = True
+        return options
+    keys = list(config.cluster_by) if layer == "bronze" else []
+    if not keys and layer == "bronze" and config.uses_auto_cdc:
+        keys = list(config.primary_keys)[:MAX_CLUSTER_KEYS]
+    if keys:
+        options["cluster_by"] = keys
+    else:
+        options["cluster_by_auto"] = True
+    return options
+
+
 def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) -> None:
     by_kind = {dataset.kind: dataset for dataset in graph.datasets}
     raw = by_kind.get("raw")
-    valid, quarantine, bronze = by_kind["valid"], by_kind["quarantine"], by_kind["bronze"]
-    pass_where = valid.detail["where"]
-    fail_where = quarantine.detail["where"]
-    failed_rules = f"{quarantine.detail['failed_rules']} AS failed_rules"
+    staged = by_kind.get("staged")
+    bronze, quarantine = by_kind["bronze"], by_kind["quarantine"]
+    checked = staged or bronze
     options = get_strategy(config.load_method).options(config)
+    persisted = pipelines.materialized_view if config.is_batch else pipelines.table
+
+    def _reader() -> Any:
+        return spark.read if config.is_batch else spark.readStream
 
     def _read_files() -> Any:
         reader = spark.readStream.format("cloudFiles")
@@ -261,68 +311,39 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
             reader = reader.option(key, value)
         return reader.load(config.path)
 
-    def _read_origin() -> Any:
-        """Database loads have no landed table. File loads must not call this: it would list files again."""
-
-        if config.load_method == "database_table":
-            return spark.read.table(config.source_reference())
-        if raw is None:
-            raise MetadataNotFound(f"{config.pipeline_id} has no source table to read")
-        return _read_raw()
-
-    def _read_raw() -> Any:
-        if config.is_batch:
-            return spark.read.table(raw.name)
-        return spark.readStream.table(raw.name)
-
-    landing_name = f"{config.pipeline_id}_landing"
-
-    def _read_stored() -> Any:
-        """The landed source: the landing view, or the raw table. Bronze reads the valid view of this."""
-
+    def _read_source() -> Any:
         if config.load_method == "volume_files":
-            return spark.readStream.table(landing_name)
-        if raw is None:
-            return _read_origin()
-        return _read_raw()
-
-    def _lineage(frame: Any) -> Any:
-        if raw is not None or not hasattr(frame, "selectExpr"):
-            return frame
-        if config.load_method == "volume_files":
-            return frame.selectExpr(
-                "*", "_metadata.file_path AS _source_file", "current_timestamp() AS _ingested_at"
-            )
-        return frame.selectExpr("*", "current_timestamp() AS _ingested_at")
-
-    if config.load_method == "volume_files":
-
-        @pipelines.temporary_view(name=landing_name)
-        def _landing() -> Any:
-            return _lineage(_read_files())
-
-    @pipelines.temporary_view(name=valid.name)
-    def _valid() -> Any:
-        # One file listing. Later hops read the landed table (or the landing view), not the path again.
-        if raw is not None or config.load_method == "volume_files":
-            frame = _read_stored()
+            frame = _read_files()
+            extra = ["_metadata.file_path AS _source_file", "current_timestamp() AS _ingested_at"]
+        elif config.load_method == "database_table":
+            frame = spark.read.table(config.source_reference())
+            extra = ["current_timestamp() AS _ingested_at"]
+        elif raw is not None:
+            return _reader().table(raw.name)
         else:
-            frame = _lineage(_read_origin())
-        if hasattr(frame, "filter"):
-            return _typed_sequence(frame.filter(pass_where), config)
-        return {"view": valid.name, "where": pass_where, "frame": frame}
+            raise MetadataNotFound(f"{config.pipeline_id} has no source table to read")
+        return frame.selectExpr("*", *extra) if hasattr(frame, "selectExpr") else frame
 
-    quarantine_kind = pipelines.materialized_view if config.is_batch else pipelines.table
+    def _checked() -> Any:
+        frame = _read_source()
+        failed_rules = f"{checked.detail['failed_rules']} AS {DQ_COLUMN}"
+        if hasattr(frame, "selectExpr"):
+            return frame.selectExpr("*", failed_rules)
+        return {"frame": frame, "select": failed_rules}
 
-    @quarantine_kind(name=quarantine.name)
-    def _quarantine() -> Any:
-        frame = _read_stored()
-        if config.load_method != "volume_files":
-            frame = _lineage(frame)
-        return _filtered(frame, fail_where, failed_rules)
+    registered = _checked
+    if graph.expectations:
+        registered = pipelines.expect_all(dict(graph.expectations))(registered)
+    persisted(name=checked.name, **_table_options(config, checked.kind))(registered)
 
-    if bronze.relation == "auto_cdc":
-        pipelines.create_streaming_table(name=bronze.name)
+    if staged is not None:
+        valid = by_kind["valid"]
+
+        @pipelines.temporary_view(name=valid.name)
+        def _valid() -> Any:
+            return _typed_sequence(_filtered(_reader().table(staged.name), PASSED), config)
+
+        pipelines.create_streaming_table(name=bronze.name, **_table_options(config, "bronze"))
         if config.load_method == "database_table":
             pipelines.create_auto_cdc_from_snapshot_flow(
                 target=bronze.name,
@@ -332,14 +353,10 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
             )
         else:
             pipelines.create_auto_cdc_flow(**graph.auto_cdc)
-    else:
-        bronze_kind = pipelines.materialized_view if config.is_batch else pipelines.table
 
-        @bronze_kind(name=bronze.name)
-        def _bronze() -> Any:
-            # The pass predicate already ran in the valid view. Reading it again scans the source twice.
-            reader = spark.read if config.is_batch else spark.readStream
-            return reader.table(valid.name)
+    @persisted(name=quarantine.name, **_table_options(config, "quarantine"))
+    def _quarantine() -> Any:
+        return _filtered(_reader().table(quarantine.detail["source"]), FAILED)
 
     if config.load_method == "autoloader":
 
@@ -349,12 +366,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
                 return frame.selectExpr(*projection_exprs(config, source="file"))
             return frame
 
-        registered = _raw
-        for name, expression in reversed(graph.expectations):
-            decorator = pipelines.expect(name, expression)
-            if callable(decorator):
-                registered = decorator(registered)
-        pipelines.table(name=raw.name)(registered)
+        pipelines.table(name=raw.name, **_table_options(config, "raw"))(_raw)
 
 
 class UnityMetadata:

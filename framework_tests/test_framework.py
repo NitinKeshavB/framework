@@ -420,7 +420,7 @@ def test_pipeline_wiring_uses_auto_cdc_only_when_dedup_is_on():
         config=config_from_document(_billing()),
     )
     kinds = [dataset.kind for dataset in graph.datasets]
-    assert kinds == ["raw", "valid", "quarantine", "bronze"]
+    assert kinds == ["raw", "staged", "valid", "bronze", "quarantine"]
     assert graph.auto_cdc["stored_as_scd_type"] == 1
     assert pipelines.cdc[0]["keys"] == ["invoice_id"]
     assert "cloudFiles.schemaLocation" not in spark.options
@@ -563,6 +563,7 @@ def test_column_metadata_versions_type_comment_and_tags():
         "framework_dev.billing_bronze.invoices.invoice_id",
         "framework_dev.billing_bronze.invoices.amount",
         "framework_dev.billing_bronze.invoices.updated_at",
+        "framework_dev.billing_bronze.invoices._dq_failed_rules",
     ]
     raw_names = {
         row["full_name"]
@@ -576,7 +577,7 @@ def test_column_metadata_versions_type_comment_and_tags():
         for row in object_rows(config)
         if row["parent_full_name"] == "framework_dev.billing_quarantine.invoices_qrntn"
     }
-    assert "framework_dev.billing_quarantine.invoices_qrntn.failed_rules" in quarantine_names
+    assert "framework_dev.billing_quarantine.invoices_qrntn._dq_failed_rules" in quarantine_names
     amount = json.loads(rows[1]["config_json"])
     assert amount == {
         "classification": "confidential",
@@ -623,7 +624,7 @@ def test_column_metadata_versions_type_comment_and_tags():
         row["full_name"]
         for row in ledger_rows
         if row["parent_full_name"] == "framework_dev.ledger_bronze.entries"
-    ] == []
+    ] == ["framework_dev.ledger_bronze.entries._dq_failed_rules"]
     assert [
         row["full_name"]
         for row in ledger_rows
@@ -1001,9 +1002,12 @@ def test_a_delivery_reads_every_pipeline_document_once():
     )
     assert calls == [["billing_invoices", "ledger_entries"]]
     assert [graph.pipeline_id for graph in graphs] == ["billing_invoices", "ledger_entries"]
-    # Auto Loader lists files once. The batch bronze hop reads the valid view, not the raw table again.
+    # Auto Loader lists files once. The batch quarantine reads bronze, not the raw table again.
     assert spark.readStream.loads == 1
-    assert spark.read.tables.count("ledger_entries_valid") == 1
+    assert spark.read.tables == [
+        "framework_dev.ledger_raw.entries",
+        "framework_dev.ledger_bronze.entries",
+    ]
 
 
 def test_step_lookup_prunes_by_owner_and_event_date():
@@ -1257,6 +1261,10 @@ class _FakePipelines:
 
     def expect(self, name, expression):
         self.expectations.append((name, expression))
+        return lambda func: func
+
+    def expect_all(self, constraints):
+        self.expectations.extend(constraints.items())
         return lambda func: func
 
     def create_streaming_table(self, **kwargs):

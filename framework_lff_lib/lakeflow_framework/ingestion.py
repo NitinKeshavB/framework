@@ -51,6 +51,10 @@ GENERATED_DIRS = ("pipelines", "resources")
 # Specs do not name a catalog. Jobs pass the environment's catalog; checks here use a stand-in.
 PLACEHOLDER_CATALOG = "catalog"
 WHEEL = "../../framework_lff_lib/dist/*.whl"
+# Serverless environment for job tasks: version 4 runs Python 3.12.
+ENVIRONMENT_VERSION = "4"
+# Scheduled and file-triggered batch loads have no deadline, so they take the cheaper mode.
+PERFORMANCE_TARGET = "STANDARD"
 # How long a job waits for the collector to register its pipelines before the run fails.
 REGISTRY_WAIT_SECONDS = 900
 EVENTS = "/Volumes/${var.catalog}/framework_meta/framework_events"
@@ -407,9 +411,10 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
     job["environments"] = [
         {
             "environment_key": "framework_env",
-            "spec": {"environment_version": "2", "dependencies": [WHEEL]},
+            "spec": {"environment_version": ENVIRONMENT_VERSION, "dependencies": [WHEEL]},
         }
     ]
+    job["performance_target"] = PERFORMANCE_TARGET
     job["tasks"] = tasks
     return {"resources": {"jobs": {name: job}}}
 

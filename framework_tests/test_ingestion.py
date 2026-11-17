@@ -176,6 +176,9 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
     tasks = _tasks(bundle)
     assert tasks["sync"]["spark_python_task"]["parameters"].count("--out") == 1
+    job = _job(bundle)
+    assert job["performance_target"] == "STANDARD"
+    assert job["environments"][0]["spec"]["environment_version"] == "4"
     synced = tasks["sync"]["spark_python_task"]["parameters"]
     awaited = tasks["await_registry"]["spark_python_task"]["parameters"]
     specs = [item for item in synced if item.endswith(".yaml")]
@@ -517,7 +520,8 @@ class _Frame:
         self.reader.wheres.append(where)
         return self
 
-    def selectExpr(self, *_parts: str) -> "_Frame":
+    def selectExpr(self, *parts: str) -> "_Frame":
+        self.reader.selects.append(parts)
         return self
 
 
@@ -526,6 +530,7 @@ class _Reader:
         self.options: dict[str, str] = {}
         self.loads = 0
         self.wheres: list[str] = []
+        self.selects: list[tuple[str, ...]] = []
 
     def format(self, name: str) -> "_Reader":
         self.format_name = name
@@ -571,6 +576,9 @@ class _Pipelines:
 
     def materialized_view(self, **kwargs):
         return self._decorate(kwargs["name"])
+
+    def expect_all(self, _constraints):
+        return lambda func: func
 
     def create_streaming_table(self, **kwargs):
         self.names.append(kwargs["name"])
@@ -625,9 +633,10 @@ def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) 
     build_pipeline("billing_invoices", spark=spark, pipelines=pipelines, config=config)
     assert spark.readStream.loads == 1
     assert spark.readStream.format_name == "cloudFiles"
-    assert "billing_invoices_landing" in pipelines.names
-    assert any("amount >= 0" in where for where in spark.readStream.wheres)
-    assert any(where.startswith("NOT (") for where in spark.readStream.wheres)
+    assert "billing_invoices_staged" in pipelines.names
+    rules = [part for parts in spark.readStream.selects for part in parts if "amount >= 0" in part]
+    assert rules == [rules[0]] and rules[0].endswith(" AS _dq_failed_rules")
+    assert spark.readStream.wheres == ["size(_dq_failed_rules) = 0", "size(_dq_failed_rules) > 0"]
 
     _add_table(bundle, "credits", "billing")
     configs = [table.config for table in load_sources(bundle)[0].tables]

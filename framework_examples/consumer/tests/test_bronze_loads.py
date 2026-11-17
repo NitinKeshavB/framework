@@ -27,7 +27,13 @@ def test_billing_publishes_raw_to_bronze():
     assert config.table_name("raw") == "framework_dev.billing_raw.invoices"
     assert config.table_name("bronze") == "framework_dev.billing_bronze.invoices"
     assert config.table_name("quarantine") == "framework_dev.billing_quarantine.invoices_qrntn"
-    assert [dataset.kind for dataset in graph.datasets] == ["raw", "valid", "quarantine", "bronze"]
+    assert [dataset.kind for dataset in graph.datasets] == [
+        "raw",
+        "staged",
+        "valid",
+        "bronze",
+        "quarantine",
+    ]
     assert graph.auto_cdc["keys"] == ["invoice_id"]
     assert graph.auto_cdc["sequence_by"] == "updated_at"
     assert "cloudFiles.schemaLocation" not in graph.datasets[0].detail["options"]

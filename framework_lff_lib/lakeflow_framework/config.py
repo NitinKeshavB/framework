@@ -18,6 +18,10 @@ LOAD_METHODS = ("autoloader", "copy_into", "ctas", "volume_files", "database_tab
 RAWLESS_METHODS = ("volume_files", "database_table")
 # Kept and tested, but a spec cannot use them until they are run end to end on serverless.
 FROZEN_METHODS = ("autoloader", "copy_into", "ctas")
+FILE_EVENT_METHODS = ("autoloader", "volume_files")
+# Liquid clustering takes up to four keys, and none of these types.
+MAX_CLUSTER_KEYS = 4
+UNCLUSTERABLE = ("boolean", "array", "map", "struct", "binary")
 FILE_KINDS = ("sftp_files", "sharepoint_files")
 DATABASE_KIND = "database"
 DATABASE_MODES = ("snapshot", "merge")
@@ -118,6 +122,8 @@ class PipelineConfig:
     max_files_per_trigger: int | None = None
     path_glob: str | None = None
     json_multiline: bool = False
+    file_events: bool = False
+    cluster_by: list[str] = field(default_factory=list)
     job_name: str | None = None
     domain: str = ""
     data_domain: str = ""
@@ -213,6 +219,7 @@ class PipelineConfig:
             _put(source, "max_files_per_trigger", self.max_files_per_trigger)
             _put(source, "path_glob", self.path_glob)
             _put(source, "multiline", True if self.json_multiline else None)
+            _put(source, "file_events", True if self.file_events else None)
             if self.fixed_columns:
                 source["fixed_columns"] = [
                     {"name": column.name, "start": column.start, "length": column.length}
@@ -255,6 +262,8 @@ class PipelineConfig:
         _put(document, "job_name", self.job_name)
         _put(document, "delivery", self.delivery or None)
         _put(document["raw_to_bronze"], "watermark_column", self.watermark_column)
+        if self.cluster_by:
+            document["raw_to_bronze"]["bronze"]["cluster_by"] = list(self.cluster_by)
         return document
 
     def content_hash(self) -> str:
@@ -576,6 +585,14 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         errors.append(f"{label}: multiline must be true or false")
         multiline = False
 
+    file_events = source.get("file_events", False)
+    if not isinstance(file_events, bool):
+        errors.append(f"{label}: file_events must be true or false")
+        file_events = False
+    elif file_events and load_method not in FILE_EVENT_METHODS:
+        errors.append(f"{label}: file_events applies only to files read by Auto Loader")
+    cluster_by = _cluster_by(bronze_target.get("cluster_by"), columns, label, errors)
+
     max_files = source.get("max_files_per_trigger")
     if max_files is not None:
         try:
@@ -633,6 +650,8 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         max_files_per_trigger=int(max_files) if max_files is not None else None,
         path_glob=_optional_text(source.get("path_glob")),
         json_multiline=multiline,
+        file_events=file_events,
+        cluster_by=cluster_by,
         job_name=_optional_text(document.get("job_name")),
         domain=domain,
         data_domain=data_domain,
@@ -976,6 +995,19 @@ def _columns(value: Any, defaults: TableTags | None, label: str, errors: list[st
         classification, pii = _column_tags(item, name, defaults, label, errors)
         columns.append(Column(name, type_name, description, classification, pii))
     return columns
+
+
+def _cluster_by(value: Any, columns: list[Column], label: str, errors: list[str]) -> list[str]:
+    if value is None:
+        return []
+    names = _name_list(value, "bronze.cluster_by", label, errors)
+    if len(names) > MAX_CLUSTER_KEYS:
+        errors.append(f"{label}: bronze.cluster_by takes at most {MAX_CLUSTER_KEYS} columns")
+    types = {column.name: column.type_name.lower() for column in columns}
+    for name in names:
+        if types.get(name, "").startswith(UNCLUSTERABLE):
+            errors.append(f"{label}: bronze.cluster_by cannot use {types[name]} column '{name}'")
+    return names
 
 
 def _column_description(item: Mapping[str, Any], name: str, label: str, errors: list[str]) -> str:

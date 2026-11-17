@@ -2,6 +2,7 @@ resources:
   jobs:
     framework_ddl:
       name: framework_ddl
+      performance_target: STANDARD
       tasks:
         - task_key: apply_ddl
           environment_key: framework_env
@@ -13,7 +14,7 @@ resources:
       environments:
         - environment_key: framework_env
           spec:
-            environment_version: "2"
+            environment_version: "4"
             dependencies:
               - ../../framework_lff_lib/dist/*.whl
       queue:
@@ -33,12 +34,13 @@ resources:
       environments:
         - environment_key: framework_env
           spec:
-            environment_version: "2"
+            environment_version: "4"
             dependencies:
               - ../../framework_lff_lib/dist/*.whl
 
     framework_optimize:
       name: framework_optimize
+      performance_target: STANDARD
       schedule:
         quartz_cron_expression: "0 0 3 * * ?"
         timezone_id: UTC
@@ -52,6 +54,6 @@ resources:
       environments:
         - environment_key: framework_env
           spec:
-            environment_version: "2"
+            environment_version: "4"
             dependencies:
               - ../../framework_lff_lib/dist/*.whl

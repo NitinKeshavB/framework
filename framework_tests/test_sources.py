@@ -80,8 +80,8 @@ def _config(tmp_path: Path, source: str, name: str, spec: str, catalog="framewor
 
 
 class _Reader:
-    def __init__(self):
-        self.options, self.format_name = {}, None
+    def __init__(self, spark):
+        self.spark, self.options, self.format_name = spark, {}, None
 
     def format(self, name):
         self.format_name = name
@@ -93,26 +93,36 @@ class _Reader:
 
     def load(self, path):
         self.loads = getattr(self, "loads", 0) + 1
+        self.spark.reads.append((self.spark.building, "files", path))
         return {"format": self.format_name, "path": path, "options": dict(self.options)}
 
     def table(self, name):
+        self.spark.reads.append((self.spark.building, "table", name))
         return {"table": name}
 
 
 class _Spark:
+    """Records each read with the dataset whose function made it."""
+
     def __init__(self):
-        self.readStream, self.read = _Reader(), _Reader()
+        self.reads, self.building = [], None
+        self.readStream, self.read = _Reader(self), _Reader(self)
 
 
 class _Pipelines:
-    def __init__(self):
+    def __init__(self, spark=None):
+        self.spark = spark
         self.names, self.cdc, self.snapshot_cdc, self.expectations, self.kinds = [], [], [], [], {}
+        self.options = {}
 
     def _decorator(self, kind, kwargs):
         self.names.append(kwargs["name"])
         self.kinds[kwargs["name"]] = kind
+        self.options[kwargs["name"]] = kwargs
 
         def decorate(func):
+            if self.spark is not None:
+                self.spark.building = kwargs["name"]
             func()
             return func
 
@@ -131,8 +141,14 @@ class _Pipelines:
         self.expectations.append(name)
         return lambda func: func
 
+    def expect_all(self, constraints):
+        self.expectations.extend(constraints)
+        return lambda func: func
+
     def create_streaming_table(self, **kwargs):
         self.names.append(kwargs["name"])
+        self.kinds[kwargs["name"]] = "streaming_table"
+        self.options[kwargs["name"]] = kwargs
 
     def create_auto_cdc_flow(self, **kwargs):
         self.cdc.append(kwargs)
@@ -149,8 +165,12 @@ def test_volume_spec_reads_the_raw_volume_and_has_no_raw_table(tmp_path: Path) -
     with pytest.raises(ValueError):
         config.table_name("raw")
     graph = assemble(config)
-    assert [dataset.kind for dataset in graph.datasets] == ["valid", "quarantine", "bronze"]
+    assert [dataset.kind for dataset in graph.datasets] == ["bronze", "quarantine"]
     assert graph.datasets[0].detail["source"] == config.path
+    assert graph.datasets[1].detail == {
+        "source": "framework_dev.files_bronze.things",
+        "where": "size(_dq_failed_rules) > 0",
+    }
 
 
 def test_database_spec_reads_the_foreign_catalog(tmp_path: Path) -> None:
@@ -159,15 +179,16 @@ def test_database_spec_reads_the_foreign_catalog(tmp_path: Path) -> None:
     assert config.source_reference() == "db_federated.dbo.things"
     assert config.is_batch and not config.uses_auto_cdc
     graph = assemble(config)
-    assert [dataset.relation for dataset in graph.datasets] == ["temporary_view", "batch", "batch"]
+    assert [dataset.relation for dataset in graph.datasets] == ["batch", "batch"]
 
 
-def test_merge_mode_uses_snapshot_cdc_on_the_keys(tmp_path: Path) -> None:
+def test_merge_mode_stages_once_then_uses_snapshot_cdc_on_the_keys(tmp_path: Path) -> None:
     extra = "  primary_keys: [thing_id]\n"
     spec = _database_spec(mode="merge").replace("  columns:", extra + "  columns:")
     config = _config(tmp_path, DATABASE_SOURCE, "db_things.yaml", spec)
     assert config.uses_auto_cdc
-    spark, pipelines = _Spark(), _Pipelines()
+    spark = _Spark()
+    pipelines = _Pipelines(spark)
     build_pipeline("db_things", spark=spark, pipelines=pipelines, config=config)
     assert pipelines.snapshot_cdc == [
         {
@@ -178,27 +199,69 @@ def test_merge_mode_uses_snapshot_cdc_on_the_keys(tmp_path: Path) -> None:
         }
     ]
     assert not pipelines.cdc
+    assert pipelines.kinds["db_things_staged"] == "materialized_view"
+    assert pipelines.options["db_things_staged"]["private"] is True
+    assert pipelines.options["framework_dev.db_bronze.things"]["cluster_by"] == ["thing_id"]
+    foreign = [read for read in spark.reads if read[2] == "db_federated.dbo.things"]
+    assert foreign == [("db_things_staged", "table", "db_federated.dbo.things")]
+    assert ("framework_dev.db_quarantine.things_qrntn", "table", "db_things_staged") in spark.reads
 
 
 def test_snapshot_mode_replaces_bronze_with_a_materialized_view(tmp_path: Path) -> None:
     config = _config(tmp_path, DATABASE_SOURCE, "db_things.yaml", _database_spec())
-    pipelines = _Pipelines()
-    build_pipeline("db_things", spark=_Spark(), pipelines=pipelines, config=config)
+    spark = _Spark()
+    pipelines = _Pipelines(spark)
+    build_pipeline("db_things", spark=spark, pipelines=pipelines, config=config)
     assert pipelines.kinds["framework_dev.db_bronze.things"] == "materialized_view"
     assert pipelines.kinds["framework_dev.db_quarantine.things_qrntn"] == "materialized_view"
+    assert spark.reads == [
+        ("framework_dev.db_bronze.things", "table", "db_federated.dbo.things"),
+        ("framework_dev.db_quarantine.things_qrntn", "table", "framework_dev.db_bronze.things"),
+    ]
 
 
-def test_volume_files_register_streaming_tables_without_a_raw_table(tmp_path: Path) -> None:
+def test_volume_files_read_the_volume_once_and_quarantine_reads_bronze(tmp_path: Path) -> None:
     config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
-    spark, pipelines = _Spark(), _Pipelines()
+    spark = _Spark()
+    pipelines = _Pipelines(spark)
     build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config)
-    assert pipelines.kinds["framework_dev.files_bronze.things"] == "table"
-    assert pipelines.kinds["framework_dev.files_quarantine.things_qrntn"] == "table"
-    assert not any(name.endswith("_raw.things") for name in pipelines.names)
-    assert not pipelines.expectations
+    bronze, quarantine = (
+        "framework_dev.files_bronze.things",
+        "framework_dev.files_quarantine.things_qrntn",
+    )
+    assert pipelines.kinds == {bronze: "table", quarantine: "table"}
+    assert spark.reads == [
+        (bronze, "files", config.path),
+        (quarantine, "table", bronze),
+    ]
+    assert pipelines.expectations == ["cast_thing_id", "schema_conformance"]
     assert spark.readStream.format_name == "cloudFiles"
     assert spark.readStream.options["cloudFiles.format"] == "csv"
-    assert spark.readStream.loads == 1
+    assert spark.readStream.options["cloudFiles.schemaHints"] == "`thing_id` string"
+    assert spark.readStream.options["cloudFiles.useNotifications"] == "false"
+    assert "cloudFiles.useManagedFileEvents" not in spark.readStream.options
+    assert pipelines.options[bronze]["cluster_by_auto"] is True
+    assert pipelines.options[bronze]["table_properties"]["quality"] == "bronze"
+    assert "files_things" in pipelines.options[bronze]["comment"]
+
+
+def test_file_events_and_cluster_keys_come_from_the_spec(tmp_path: Path) -> None:
+    source = "  raw_path: things/\n  format: csv\n  file_events: true\n"
+    spec = _volume_spec(source=source).replace(
+        "table: things}", "table: things, cluster_by: [thing_id]}"
+    )
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", spec)
+    spark = _Spark()
+    pipelines = _Pipelines(spark)
+    build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config)
+    assert spark.readStream.options["cloudFiles.useManagedFileEvents"] == "true"
+    assert "cloudFiles.useNotifications" not in spark.readStream.options
+    assert pipelines.options["framework_dev.files_bronze.things"]["cluster_by"] == ["thing_id"]
+    assert config_from_document(config.canonical()).cluster_by == ["thing_id"]
+
+    too_many = spec.replace("cluster_by: [thing_id]", "cluster_by: [a, b, c, d, e]")
+    with pytest.raises(ConfigValidationError, match="at most 4"):
+        _config(tmp_path, FILE_SOURCE, "files_things.yaml", too_many)
 
 
 def test_registry_rows_skip_the_raw_layer_and_round_trip(tmp_path: Path) -> None:

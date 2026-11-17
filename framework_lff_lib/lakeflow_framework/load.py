@@ -20,6 +20,8 @@ SPARK_FORMAT = {
     "excel": "excel",
 }
 RESCUE_FORMATS = {"csv", "delimited", "json", "text"}
+# Formats whose columns land as strings or inferred types. Parquet and Avro carry their own types.
+HINT_FORMATS = {"csv", "delimited", "json"}
 COPY_FORMAT = {
     "csv": "CSV",
     "delimited": "CSV",
@@ -57,8 +59,16 @@ class AutoLoader(LoadStrategy):
             if config.columns or config.fixed_columns
             else "true",
             "cloudFiles.allowOverwrites": "false",
-            "cloudFiles.useNotifications": "false",
         }
+        # Without file events Auto Loader lists the directory. Turn them on only once the external
+        # location behind the path has file events enabled.
+        if config.file_events:
+            options["cloudFiles.useManagedFileEvents"] = "true"
+        else:
+            options["cloudFiles.useNotifications"] = "false"
+        hints = schema_hints(config)
+        if hints:
+            options["cloudFiles.schemaHints"] = hints
         options["cloudFiles.maxFilesPerTrigger"] = str(
             config.max_files_per_trigger or DEFAULT_MAX_FILES_PER_TRIGGER
         )
@@ -132,6 +142,14 @@ class Ctas(LoadStrategy):
         reader = _read_files(config)
         projection = _projection(config, source="file")
         return [f"CREATE OR REPLACE TABLE {target} AS SELECT {projection} FROM {reader}"]
+
+
+def schema_hints(config: PipelineConfig) -> str:
+    """Declared column types for Auto Loader. A value that does not parse goes to _rescued_data."""
+
+    if config.file_format not in HINT_FORMATS:
+        return ""
+    return ", ".join(f"`{column.name}` {column.type_name}" for column in config.columns)
 
 
 def _sql_string(value: str) -> str:

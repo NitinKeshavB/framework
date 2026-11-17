@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from lakeflow_framework.config import PipelineConfig
 from lakeflow_framework.load import RESCUE_FORMATS
 
+# Each rule is evaluated once, into this column. Pass, fail, and expectations all read it.
+DQ_COLUMN = "_dq_failed_rules"
+PASSED = f"size({DQ_COLUMN}) = 0"
+FAILED = f"size({DQ_COLUMN}) > 0"
+
 
 @dataclass(frozen=True)
 class CompiledRule:
@@ -46,6 +51,12 @@ def failed_rules_sql(rules: list[CompiledRule]) -> str:
         f"named_struct('rule', '{rule.name}', 'ok', {rule.holds()})" for rule in rules
     )
     return "transform(filter(array(" + structs + "), entry -> NOT entry.ok), entry -> entry.rule)"
+
+
+def expectations(rules: list[CompiledRule]) -> dict[str, str]:
+    """One warn expectation per rule, read from DQ_COLUMN so the rule is not evaluated again."""
+
+    return {rule.name: f"NOT array_contains({DQ_COLUMN}, '{rule.name}')" for rule in rules}
 
 
 def pass_sql(rules: list[CompiledRule]) -> str:
