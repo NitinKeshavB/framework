@@ -22,6 +22,10 @@ def compile_rules(config: PipelineConfig) -> list[CompiledRule]:
     rules = [CompiledRule(rule.name, rule.expression, "declared") for rule in config.rules]
     for key in config.primary_keys:
         rules.append(CompiledRule(f"not_null_{key}", f"{key} IS NOT NULL", "key"))
+    sequence = config.watermark_column
+    if config.dedup and sequence and sequence not in config.primary_keys:
+        # Auto CDC cannot order a row whose sequence value is null.
+        rules.append(CompiledRule(f"not_null_{sequence}", f"{sequence} IS NOT NULL", "key"))
     for column in config.columns:
         expression = (
             f"TRY_CAST({column.name} AS {column.type_name}) IS NOT NULL OR {column.name} IS NULL"

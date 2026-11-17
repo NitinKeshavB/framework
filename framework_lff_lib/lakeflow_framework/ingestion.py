@@ -349,9 +349,8 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         run_cli(
             "await_registry",
             ["sync"],
-            ["await-registry", "--catalog", "${var.catalog}"]
-            + ["--timeout-seconds", str(REGISTRY_WAIT_SECONDS)]
-            + [item for config in configs for item in ("--pipeline", config.pipeline_id)],
+            ["await-registry", *spec_paths, "--catalog", "${var.catalog}"]
+            + ["--timeout-seconds", str(REGISTRY_WAIT_SECONDS)],
         ),
     ]
     last = "await_registry"

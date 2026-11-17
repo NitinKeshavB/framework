@@ -82,9 +82,11 @@ def main(argv: list[str] | None = None) -> int:
     step.add_argument("--parent-run-id")
     step.add_argument("--recon-json")
 
-    waiting = commands.add_parser("await-registry")
+    waiting = commands.add_parser(
+        "await-registry", help="wait until the registry holds the version of each spec synced"
+    )
+    waiting.add_argument("paths", nargs="+", type=Path, help="the same spec files sync was given")
     waiting.add_argument("--catalog", required=True)
-    waiting.add_argument("--pipeline", action="append", required=True, dest="pipelines")
     waiting.add_argument("--timeout-seconds", type=float, default=300)
 
     batch = commands.add_parser("batch-sql")
@@ -165,11 +167,17 @@ def main(argv: list[str] | None = None) -> int:
 
             from lakeflow_framework.collector import await_registered
 
+            configs = validate_configs(_yaml_files(args.paths), catalog=args.catalog)
+            expected = {
+                row["full_name"]: row["content_hash"]
+                for row in definition_rows(configs)
+                if row["object_kind"] == "pipeline"
+            }
+            if not expected:
+                raise ConfigValidationError(["await-registry was given no pipeline specs"])
             spark = SparkSession.builder.getOrCreate()
-            await_registered(
-                spark, args.pipelines, args.catalog, timeout_seconds=args.timeout_seconds
-            )
-            print(f"registry has {', '.join(args.pipelines)}")
+            await_registered(spark, expected, args.catalog, timeout_seconds=args.timeout_seconds)
+            print(f"registry has the synced {', '.join(expected)}")
             return 0
         if args.command == "step":
             recon = json.loads(args.recon_json) if args.recon_json else None

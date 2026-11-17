@@ -72,6 +72,7 @@ def _billing(**overrides):
             "columns": [
                 {"name": "invoice_id", "type": "string"},
                 {"name": "amount", "type": "decimal(18,2)"},
+                {"name": "updated_at", "type": "timestamp"},
             ],
             "rules": [{"name": "amount_non_negative", "expression": "amount >= 0"}],
         },
@@ -276,6 +277,33 @@ def test_validation_reports_every_error():
     assert "unresolved" in text
 
 
+def test_dedup_needs_a_declared_type_to_sequence_on():
+    document = _billing()
+    document["raw_to_bronze"]["columns"].pop()
+    with pytest.raises(ConfigValidationError, match="watermark_column 'updated_at'"):
+        config_from_document(document)
+
+
+def test_the_valid_view_casts_the_sequence_column_for_auto_cdc():
+    from lakeflow_framework.pipeline import _typed_sequence
+
+    class Frame:
+        columns = ["invoice_id", "updated_at", "_source_file"]
+
+        def selectExpr(self, *expressions):
+            return list(expressions)
+
+    config = config_from_document(_billing())
+    assert config.sequence_type == "timestamp"
+    assert _typed_sequence(Frame(), config) == [
+        "`invoice_id`",
+        "CAST(`updated_at` AS timestamp) AS `updated_at`",
+        "`_source_file`",
+    ]
+    unsequenced = Frame()
+    assert _typed_sequence(unsequenced, config_from_document(_ledger())) is unsequenced
+
+
 def test_two_pipelines_cannot_share_a_table(tmp_path: Path):
     first = tmp_path / "a.yaml"
     second = tmp_path / "b.yaml"
@@ -396,6 +424,9 @@ def test_pipeline_wiring_uses_auto_cdc_only_when_dedup_is_on():
     assert pipelines.cdc[0]["keys"] == ["invoice_id"]
     assert "cloudFiles.schemaLocation" not in spark.options
     assert any(name == "billing_invoices" or name.endswith("invoices") for name in pipelines.names)
+
+    rules = {rule.name: rule.expression for rule in compile_rules(config_from_document(_billing()))}
+    assert rules["not_null_updated_at"] == "updated_at IS NOT NULL"
 
     ledger = assemble(config_from_document(_ledger()))
     assert ledger.auto_cdc is None
@@ -526,6 +557,7 @@ def test_column_metadata_versions_type_comment_and_tags():
     assert [row["full_name"] for row in rows] == [
         "framework_dev.billing_bronze.invoices.invoice_id",
         "framework_dev.billing_bronze.invoices.amount",
+        "framework_dev.billing_bronze.invoices.updated_at",
     ]
     raw_names = {
         row["full_name"]
@@ -604,7 +636,7 @@ def test_column_tags_inherit_the_bronze_table_unless_overridden():
     document["raw_to_bronze"]["columns"][0]["description"] = "  Source invoice id  "
     document["raw_to_bronze"]["columns"][0]["pii"] = []
     config = config_from_document(document)
-    invoice_id, amount = config.columns
+    invoice_id, amount, _updated_at = config.columns
     assert invoice_id.description == "Source invoice id"
     assert invoice_id.classification == "confidential"
     assert invoice_id.pii == []
@@ -712,60 +744,64 @@ def test_cli_writes_a_step_file_with_recon(tmp_path: Path, capsys: pytest.Captur
     assert payload["recon"]["rejected"] == 1
 
 
-def test_await_registry_polls_until_the_pipeline_row_exists():
+def _registry_polls(*answers: list[dict]):
+    """A Spark double whose registry lookups return each answer in turn, then the last again."""
+
     calls = {"n": 0}
 
     class Frame:
         def collect(self):
             calls["n"] += 1
-            if calls["n"] == 1:
-                return []
-            return [{"full_name": "billing_invoices"}]
+            return answers[min(calls["n"], len(answers)) - 1]
 
     class Spark:
         def sql(self, text):
             assert "framework_dev.framework_meta.v_object_current" in text
+            assert "content_hash" in text
             return Frame()
 
-    clock = {"t": 0.0}
+    return Spark(), calls
 
-    def now():
-        return clock["t"]
+
+def _wait(spark, expected: dict[str, str], timeout_seconds: float = 30) -> None:
+    clock = {"t": 0.0}
 
     def pause(seconds):
         clock["t"] += seconds
 
     await_registered(
-        Spark(),
-        ["billing_invoices"],
+        spark,
+        expected,
         "framework_dev",
-        timeout_seconds=30,
+        timeout_seconds=timeout_seconds,
         pause_seconds=5,
         sleep=pause,
-        clock=now,
+        clock=lambda: clock["t"],
     )
+
+
+def test_await_registry_polls_until_the_synced_version_arrives():
+    spark, calls = _registry_polls([], [{"full_name": "billing_invoices", "content_hash": "new"}])
+    _wait(spark, {"billing_invoices": "new"})
     assert calls["n"] == 2
 
 
+def test_await_registry_does_not_accept_an_outdated_spec():
+    outdated = [{"full_name": "billing_invoices", "content_hash": "old"}]
+    current = [{"full_name": "billing_invoices", "content_hash": "new"}]
+    spark, calls = _registry_polls(outdated, outdated, current)
+    _wait(spark, {"billing_invoices": "new"})
+    assert calls["n"] == 3
+
+    spark, _ = _registry_polls(outdated)
+    with pytest.raises(MetadataNotFound, match="synced version of billing_invoices"):
+        _wait(spark, {"billing_invoices": "new"}, timeout_seconds=10)
+
+
 def test_await_registry_fails_when_the_row_never_arrives():
-    class Frame:
-        def collect(self):
-            return []
-
-    class Spark:
-        def sql(self, _text):
-            return Frame()
-
+    spark, _ = _registry_polls([])
     with pytest.raises(MetadataNotFound):
-        await_registered(
-            Spark(),
-            ["billing_invoices"],
-            "framework_dev",
-            timeout_seconds=0,
-            pause_seconds=5,
-            sleep=lambda _seconds: None,
-            clock=lambda: 0,
-        )
+        _wait(spark, {"billing_invoices": "new"}, timeout_seconds=0)
 
 
 def test_a_table_version_stays_open_when_only_the_job_name_changes():

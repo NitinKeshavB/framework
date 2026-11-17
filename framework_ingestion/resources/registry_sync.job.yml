@@ -19,4 +19,4 @@ resources:
           spec:
             environment_version: "2"
             dependencies:
-              - ../../framework_src/dist/*.whl
+              - ../../framework_lff_lib/dist/*.whl

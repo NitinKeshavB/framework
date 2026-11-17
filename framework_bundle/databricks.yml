@@ -34,9 +34,11 @@ targets:
       root_path: /Workspace/Shared/aztech_framework
     variables:
       catalog: aal_dev_fdh
+    # Each entry names exactly one user or group.
     permissions:
       - user_name: adm_ye9z286@allianzms.onmicrosoft.com
-        user_name: nitinkeshav.bolla@allianz.com.au
-        group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
         level: CAN_MANAGE
-        
+      - user_name: nitinkeshav.bolla@allianz.com.au
+        level: CAN_MANAGE
+      - group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
+        level: CAN_MANAGE

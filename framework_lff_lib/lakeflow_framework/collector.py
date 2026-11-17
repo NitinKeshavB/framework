@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
@@ -131,22 +131,32 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
 
 def await_registered(
     spark,
-    pipeline_ids: list[str],
+    expected: Mapping[str, str],
     catalog: str,
     timeout_seconds: float = 300,
     pause_seconds: float = 5,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    pending = list(pipeline_ids)
+    """Wait until each pipeline's current registry row has the content hash this run synced.
+
+    A row with the right name but an older hash is an outdated spec, so it does not count.
+    """
+
+    pending = list(expected)
     deadline = clock() + timeout_seconds
     while pending:
-        found = _names(spark.sql(registered_sql(pending, catalog)))
-        pending = [pipeline_id for pipeline_id in pending if pipeline_id not in found]
+        found = {
+            str(row["full_name"]): str(row["content_hash"])
+            for row in _rows(spark.sql(registered_sql(pending, catalog)))
+        }
+        pending = [name for name in pending if found.get(name) != expected[name]]
         if not pending:
             return
         if clock() >= deadline:
-            raise MetadataNotFound("registry is missing " + ", ".join(pending))
+            raise MetadataNotFound(
+                "registry does not have the synced version of " + ", ".join(pending)
+            )
         sleep(pause_seconds)
 
 
@@ -334,10 +344,6 @@ def _rows(frame: Any) -> list[dict]:
     for row in collected:
         rows.append(row if isinstance(row, dict) else row.asDict())
     return rows
-
-
-def _names(frame: Any) -> set[str]:
-    return {str(row["full_name"]) for row in _rows(frame)}
 
 
 def _event_time(column: str) -> str:

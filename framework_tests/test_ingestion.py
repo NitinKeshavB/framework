@@ -177,8 +177,12 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
     tasks = _tasks(bundle)
     assert tasks["sync"]["spark_python_task"]["parameters"].count("--out") == 1
+    synced = tasks["sync"]["spark_python_task"]["parameters"]
     awaited = tasks["await_registry"]["spark_python_task"]["parameters"]
-    assert awaited.count("--pipeline") == 2
+    specs = [item for item in synced if item.endswith(".yaml")]
+    assert len(specs) == 2
+    assert [item for item in awaited if item.endswith(".yaml")] == specs
+    assert awaited[awaited.index("--catalog") + 1] == "${var.catalog}"
     assert awaited[awaited.index("--timeout-seconds") + 1] == "900"
     assert "pipeline_task" in tasks["refresh_pipeline"]
     failed_after = {item["task_key"] for item in tasks["record_failure"]["depends_on"]}

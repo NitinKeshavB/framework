@@ -576,7 +576,7 @@ def registered_sql(pipeline_ids: list[str], catalog: str) -> str:
     if not pipeline_ids or any(not _SAFE_TOKEN.match(pipeline_id) for pipeline_id in pipeline_ids):
         raise ValueError("pipeline id is required")
     return (
-        f"SELECT full_name FROM {catalog}.framework_meta.v_object_current "
+        f"SELECT full_name, content_hash FROM {catalog}.framework_meta.v_object_current "
         f"WHERE object_kind = 'pipeline' AND full_name IN ({_sql_in(pipeline_ids)})"
     )
 

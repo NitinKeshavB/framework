@@ -28,7 +28,7 @@ The job writes small JSON files at each step. It does not write the registry tab
 
 1. **mark_running** writes `RUNNING` first, so a refresh during the load already shows the run. The step is filed as `object_kind = workflow` and `full_name = <job_name>`.
 2. **sync** validates every spec and writes one definition file per workflow, pipeline, dataflow, flow, securable, link, and column. The file name carries the document hash, so an unchanged spec overwrites the same file and is not a new history row.
-3. **await_registry** waits until the collector has loaded those pipelines into `v_object_current`.
+3. **await_registry** waits until `v_object_current` has the content hash that sync just recorded for each pipeline. A row with an older hash means the spec is out of date, so the job keeps waiting.
 4. **batch_load** runs only for `cloud_files` tables that use `copy_into` or `ctas`.
 5. **refresh_pipeline** runs the Lakeflow pipeline. `build_pipeline` reads each spec back from the registry. A missing row is an error.
 6. **record_success** writes `SUCCEEDED` and can carry counts (`--recon-json`). **record_failure** writes `FAILED` if any earlier task fails, including a failed success step.
@@ -50,7 +50,7 @@ The graph depends on the kind. Quarantine and bronze are filtered by the quality
 | Cloud files, `copy_into` | `COPY INTO` a raw table (`force = false`) before the pipeline | Streaming table | Streaming table |
 | Cloud files, `ctas` | `CREATE OR REPLACE TABLE` raw | Materialized view | Materialized view |
 
-Excel works with Auto Loader and CTAS but not `copy_into`. `dedup: true` needs `primary_keys` and `watermark_column`, and uses `stored_as_scd_type` integer `1`: the latest row for each key wins. Keys also generate not-null rules when dedup is off.
+Excel works with Auto Loader and CTAS but not `copy_into`. `dedup: true` needs `primary_keys` and `watermark_column`, and uses `stored_as_scd_type` integer `1`: the latest row for each key wins. The watermark must be in `columns` with its type. Files land it as a string, so the valid view casts it before Auto CDC orders on it, and a null or uncastable watermark goes to quarantine. Keys also generate not-null rules when dedup is off.
 
 ## Data quality
 

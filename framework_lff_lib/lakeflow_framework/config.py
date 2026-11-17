@@ -152,6 +152,17 @@ class PipelineConfig:
     def uses_auto_cdc(self) -> bool:
         return self.dedup or (self.load_method == "database_table" and self.source_mode == "merge")
 
+    @property
+    def sequence_type(self) -> str | None:
+        """The declared type of the column a dedup load sequences on. Files land it as a string."""
+
+        if not self.dedup:
+            return None
+        for column in self.columns:
+            if column.name == self.watermark_column:
+                return column.type_name
+        return None
+
     def source_reference(self) -> str:
         """The database table a ``database_table`` load reads, as catalog.schema.table."""
 
@@ -525,6 +536,11 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     notify_failure, notify_success = _notify(document, technical_owner, label, errors)
     tags = _tags(document, raw_target, bronze_target, quarantine, has_raw, label, errors)
     columns = _columns(raw_to_bronze.get("columns"), tags.get("bronze"), label, errors)
+    if dedup and watermark and str(watermark) not in {column.name for column in columns}:
+        errors.append(
+            f"{label}: dedup sequences on watermark_column '{watermark}', "
+            "so it must be in columns with its type"
+        )
     rules = _rules(raw_to_bronze.get("rules"), label, errors)
     fixed_columns = _fixed_columns(source.get("fixed_columns"), label, errors)
     if file_format == "fixed_width" and not fixed_columns:

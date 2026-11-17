@@ -62,12 +62,11 @@ resources:
           python_file: ../src/run_cli.py
           parameters:
           - await-registry
+          - ${workspace.file_path}/sources/abs/fdh/abs_accounting.yaml
           - --catalog
           - ${var.catalog}
           - --timeout-seconds
           - '900'
-          - --pipeline
-          - abs_accounting
       - task_key: refresh_pipeline
         depends_on:
         - task_key: await_registry

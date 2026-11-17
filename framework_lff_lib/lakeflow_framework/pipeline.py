@@ -229,6 +229,23 @@ def _filtered(frame: Any, where: str, extra: str | None = None) -> Any:
     return result.selectExpr("*", extra) if extra else result
 
 
+def _typed_sequence(frame: Any, config: PipelineConfig) -> Any:
+    """Cast the sequence column to its declared type, so Auto CDC does not order strings.
+
+    The valid filter has already passed its cast and not-null rules, so the cast cannot fail.
+    """
+
+    sequence, type_name = config.watermark_column, config.sequence_type
+    if not type_name or not hasattr(frame, "columns"):
+        return frame
+    return frame.selectExpr(
+        *(
+            f"CAST(`{name}` AS {type_name}) AS `{name}`" if name == sequence else f"`{name}`"
+            for name in frame.columns
+        )
+    )
+
+
 def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) -> None:
     by_kind = {dataset.kind: dataset for dataset in graph.datasets}
     raw = by_kind.get("raw")
@@ -292,7 +309,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
         else:
             frame = _lineage(_read_origin())
         if hasattr(frame, "filter"):
-            return frame.filter(pass_where)
+            return _typed_sequence(frame.filter(pass_where), config)
         return {"view": valid.name, "where": pass_where, "frame": frame}
 
     quarantine_kind = pipelines.materialized_view if config.is_batch else pipelines.table
