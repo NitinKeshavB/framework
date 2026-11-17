@@ -42,7 +42,7 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
     scope = _scope(config)
 
     def row(kind: str, name: str, parent: str | None, relation: str | None, payload: Any):
-        return _framework_object(kind, name, scope, parent, relation, payload, recorded)
+        return framework_object(kind, name, scope, parent, relation, payload, recorded)
 
     rules = [
         {"name": rule.name, "expression": rule.expression, "origin": rule.origin}
@@ -95,9 +95,15 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
 
 
 def workflow_rows(
-    configs: list[PipelineConfig], recorded_at: str | None = None
+    configs: list[PipelineConfig],
+    recorded_at: str | None = None,
+    details: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """One workflow per job, listing every pipeline in that delivery."""
+    """One workflow per job, listing every pipeline in that delivery.
+
+    ``details`` adds what the generator knows about each job: its trigger or schedule and the
+    source it belongs to.
+    """
 
     recorded = recorded_at or _now()
     grouped: dict[str, list[PipelineConfig]] = {}
@@ -107,25 +113,29 @@ def workflow_rows(
     rows: list[dict[str, Any]] = []
     for job_name, group in sorted(grouped.items()):
         requesters = sorted({item.requested_by for item in group if item.requested_by})
-        payload = {
+        payload: dict[str, Any] = {
             "pipeline_ids": sorted({item.pipeline_id for item in group}),
             "requested_by": requesters,
         }
+        if details and job_name in details:
+            payload.update(details[job_name])
         scope = dict(_scope(group[0]))
         if len(requesters) != 1:
             scope["requested_by"] = None
-        rows.append(_framework_object("workflow", job_name, scope, None, None, payload, recorded))
+        rows.append(framework_object("workflow", job_name, scope, None, None, payload, recorded))
     return rows
 
 
-def definition_rows(configs: list[PipelineConfig]) -> list[dict[str, Any]]:
+def definition_rows(
+    configs: list[PipelineConfig], workflow_details: Mapping[str, Mapping[str, Any]] | None = None
+) -> list[dict[str, Any]]:
     """Every definition row for these configs, each version once."""
 
     seen: set[tuple[str, str, str]] = set()
     rows: list[dict[str, Any]] = []
     for config in configs:
         rows.extend(new_object_rows(object_rows(config), seen))
-    rows.extend(new_object_rows(workflow_rows(configs), seen))
+    rows.extend(new_object_rows(workflow_rows(configs, details=workflow_details), seen))
     return rows
 
 
@@ -249,6 +259,9 @@ def _table_record(config: PipelineConfig, layer: str) -> dict[str, Any]:
         "technical_owner": config.technical_owner,
         "classification": tags.classification,
         "pii": ", ".join(tags.pii),
+        "pipeline_id": config.pipeline_id,
+        "job_name": config.job_name,
+        "load_method": config.load_method,
     }
 
 
@@ -274,7 +287,7 @@ def _scope(config: PipelineConfig) -> dict[str, str | None]:
     }
 
 
-def _framework_object(
+def framework_object(
     kind: str,
     full_name: str,
     scope: Mapping[str, str | None],
@@ -358,15 +371,22 @@ LEDGER_COLUMNS = (
 )
 
 OWNER_KINDS = ("source_system", "project")
-# Definitions the collector refuses to hand to a second owner. Flows, links, workflows, and
+# Definitions registry_sync refuses to hand to a second owner. Flows, links, workflows, and
 # columns follow their pipeline or table.
-OWNED_KINDS = ("pipeline", "table", "streaming_table", "materialized_view")
+OWNED_KINDS = (
+    "source_system",
+    "schema",
+    "pipeline",
+    "table",
+    "streaming_table",
+    "materialized_view",
+)
+# Validity columns object_registry stores for each version. registry_sync sets them.
+SCD_COLUMNS = ("valid_from", "valid_to", "is_current", "is_deleted")
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
-_SAFE_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_SAFE_INSTANT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def new_object_rows(
@@ -487,41 +507,6 @@ def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
     )
 
 
-def recorded_versions_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
-    """History rows for these exact versions. A retry matches hash and recorded_at."""
-
-    _require_catalog(catalog)
-    names, kinds, owners = _object_keys(rows)
-    hashes = sorted({str(row["content_hash"]) for row in rows})
-    instants = sorted({str(row["recorded_at"]) for row in rows})
-    if any(not _SAFE_HASH.match(value) for value in hashes):
-        raise ValueError("content hash is required")
-    if any(not _SAFE_INSTANT.match(value) for value in instants):
-        raise ValueError("recorded_at is required")
-    quoted_times = ", ".join(
-        f"to_timestamp('{instant}', 'yyyy-MM-dd''T''HH:mm:ss''Z''')" for instant in instants
-    )
-    return (
-        "SELECT object_kind, full_name, content_hash, "
-        "date_format(recorded_at, 'yyyy-MM-dd''T''HH:mm:ss''Z''') AS recorded_at "
-        f"FROM {catalog}.framework_meta.object_registry "
-        f"WHERE owner IN ({_sql_in(owners)}) "
-        f"AND object_kind IN ({_sql_in(kinds)}) AND full_name IN ({_sql_in(names)}) "
-        f"AND content_hash IN ({_sql_in(hashes)}) AND recorded_at IN ({quoted_times})"
-    )
-
-
-def object_keys_sql(catalog: str, content_hashes: list[str]) -> str:
-    _require_catalog(catalog)
-    hashes = [value for value in content_hashes if _SAFE_HASH.match(value)]
-    if not hashes:
-        raise ValueError("content hash is required")
-    return (
-        f"SELECT object_kind, full_name, content_hash FROM {catalog}.framework_meta.object_registry "
-        f"WHERE content_hash IN ({_sql_in(hashes)})"
-    )
-
-
 def owners_sql(catalog: str, full_names: list[str]) -> str:
     """Current owner of each named table or pipeline, from the registry."""
 
@@ -613,6 +598,10 @@ def step_keys_sql(
         f"SELECT run_id, step_no, status FROM {catalog}.framework_meta.run_ledger "
         f"WHERE {' AND '.join(filters)}"
     )
+
+
+def utc_now() -> str:
+    return _now()
 
 
 def _now() -> str:

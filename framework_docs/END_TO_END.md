@@ -82,13 +82,15 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 ## The registry
 
-Four registry tables in `<catalog>.framework_meta`. `object_registry` and `run_ledger` are the history and stay insert-only. `object_current` and `run_current` hold one row per key so a lookup does not window that history. `registry_sync` writes them all at deploy. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
+Four registry tables in `<catalog>.framework_meta`. `object_registry` is SCD Type 2: every version of every definition, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. `run_ledger` holds events and stays insert-only. `object_current` and `run_current` hold one row per key for lookups. `registry_sync` writes them all at deploy, and the deploy fails if it fails, so the deployed configuration is always in the tables. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
 
 `object_registry` catalogs every definition the job syncs. Each row keeps the definition as `config_json`, the text its `content_hash` covers, and as `config`, the same document parsed to `VARIANT`; the views read `config:path`. `framework_ddl` adds `config` to tables created before it existed and fills it on `object_current`. Older history rows are read through `parse_json(config_json)`.
 
 | Kind | What it is |
 | --- | --- |
-| `workflow` | The delivery job. `config_json` lists every `pipeline_id` and every requester. |
+| `source_system` | One `source.yaml`: domain, owner email, source kind, engine, foreign catalog, raw volume, and each delivery with its schedule or trigger and job name. |
+| `schema` | A `<catalog>.<schema>` the source reads or writes, with its layers and the tags set on it. |
+| `workflow` | The delivery job. `config_json` lists every `pipeline_id`, every requester, the source system and kind, and the delivery's schedule or trigger. |
 | `pipeline` | One table load. Holds the canonical spec and compiled quality rules. |
 | `dataflow` | Raw path or table, bronze, and quarantine for that load. |
 | `flow` | One layer: raw (volume path or table), bronze, or quarantine. |
@@ -96,7 +98,7 @@ Four registry tables in `<catalog>.framework_meta`. `object_registry` and `run_l
 | `link` | Edge from the pipeline to a securable. |
 | `column` | One column of a securable, with type, description, classification, and PII. |
 
-A new row is written when that object's own hash changes, so a job rename versions the pipeline and workflow and leaves an unchanged table or column alone. `parent_full_name` and `relation` (`owns`, `contains`, `reads`, `writes`, `rejects_to`, `column_of`) are the edges. The layout is drawn in [ARCHITECTURE.md](ARCHITECTURE.md#registry-logical).
+A new version is written when that object's own hash changes. The job name is a table tag, so a job rename versions the workflow, the pipeline, and its tables, and leaves an unchanged column alone. `parent_full_name` and `relation` (`owns`, `contains`, `reads`, `writes`, `rejects_to`, `column_of`) are the edges. The layout is drawn in [ARCHITECTURE.md](ARCHITECTURE.md#registry-logical).
 
 Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `owner` is its name. Bronze rows are owned by the source system. `requested_by` is the team that asked for the table and `delivery` is how its source delivers. They are for the maps and do not affect ownership.
 
@@ -111,12 +113,14 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | View | What it answers |
 | --- | --- |
 | `v_object_current` | The current definition for every object, read from `object_current`. This is what the pipeline loads. |
-| `v_object_history` | Every version, with `valid_from` / `valid_to`. A point in time is `valid_from <= t AND (valid_to IS NULL OR valid_to > t)`. |
-| `v_workflows` | Each delivery job, its pipeline ids, and every requester. |
+| `v_object_history` | Every version, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. A point in time is `valid_from <= t AND (valid_to IS NULL OR valid_to > t) AND NOT is_deleted`. |
+| `v_source_systems` | Each current source system as its `source.yaml` declares it, with its deliveries. |
+| `v_schemas` | Each schema a source uses, its layers, and the tags set on it. |
+| `v_workflows` | Each delivery job, its pipeline ids, every requester, its source, and its schedule or trigger. |
 | `v_pipelines` | Owner, requester, delivery, domain, team, technical owner, mail lists. |
 | `v_dataflows` | Raw path or table, bronze, and quarantine for each table load. |
 | `v_flows` | Each layer flow with relation, path, or table. |
-| `v_tables` | Classification and PII on each securable. |
+| `v_tables` | Each securable's domain, team, technical owner, classification, PII, layer, pipeline, job, and load method. |
 | `v_columns`, `v_column_history` | Current and past columns of raw, bronze, and quarantine. |
 | `v_lineage` | Latest link per parent, child, and relation. |
 | `v_process` | Every step of every run. |
@@ -125,7 +129,7 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
 | `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
 | `v_bronze_tables` | Every bronze table and its owner. The table health step reads it. |
-| `v_metadata_drift` | Each declared tag or column comment that Unity Catalog (`<catalog>.information_schema`) lacks or holds differently. Empty once `registry_sync` has run after the tables exist. |
+| `v_metadata_drift` | Each declared schema, table, or column tag, or column comment, that Unity Catalog (`<catalog>.information_schema`) lacks or holds differently. `securable` says which. Empty once `registry_sync` has run after the schemas and tables exist. |
 
 Example: the latest status for every billing job.
 
@@ -180,9 +184,9 @@ Each table clusters on at most three keys. `framework_ddl` moves tables created 
 
 All set `delta.autoOptimize.optimizeWrite`, and the registry tables also set `autoCompact`: they are written once per deploy, so compacting after that commit is cheap. `framework_ddl` turns it on for tables created while it was off. Predictive optimization, once the catalog owner enables it, also compacts these tables in the background. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
-`v_object_history` partitions by `owner_kind`, `owner`, `object_kind`, and `full_name`. A query that filters `owner` is applied before that window. Filtering only `valid_from` cannot be, because that would change which row comes next. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
+`v_object_history` reads `valid_from` and `valid_to` from `object_registry`, so a filter on `owner` or on the dates prunes files directly. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
 
-`registry_sync` appends a definition when `object_current` has no row or a different hash, then replaces that object's row in `object_current`. Deploys of one bundle run one at a time, so the last deploy wins. A retried deploy does not append the same version twice. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
+`registry_sync` writes a version when `object_current` has no row or a different hash. One `MERGE` closes the current version (`valid_to`, `is_current = false`) and inserts the new one; then the object's row in `object_current` is replaced. A retried deploy finds the same hash current and writes nothing to the history. A definition the bundle no longer deploys is retired: its version is closed, a deletion version (`is_deleted = true`) becomes current, and it leaves `object_current`. Retirement covers every `source_system`-owned object in the catalog, so only `framework_ingestion` may register source systems there; a deploy with no definitions retires nothing. Deploys of one bundle run one at a time, so the last deploy wins. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
 
 To see the registry as it was at a moment:
 
@@ -192,9 +196,21 @@ FROM framework_meta.v_object_history
 WHERE owner = 'billing'
   AND valid_from <= TIMESTAMP '2026-11-08 00:00:00'
   AND (valid_to IS NULL OR valid_to > TIMESTAMP '2026-11-08 00:00:00')
+  AND NOT is_deleted
 ```
 
-Collecting the same document again does not insert. Putting an older document back in force does insert, so the days in between still resolve to the version that was active then.
+Deploying the same document again does not insert. Putting an older document back in force does insert, so the days in between still resolve to the version that was active then.
+
+## Unity Catalog tags
+
+`registry_sync` sets the tags at every deploy, after it writes the registry. It reads `information_schema` first and changes only what differs.
+
+- Each schema the source uses: `domain`, `owner`, `owner_email`, `source_kind`, `layer`, `foreign_catalog`, and `engine`, from `source.yaml`.
+- Each table: `classification`, `domain`, `pii`, `data_domain`, `team`, `technical_owner`, `layer`, `pipeline_id`, `job_name`, `load_method`, `owner`, `requested_by`, and `delivery`.
+- Each column: `classification` and `pii`, and `description` as its comment.
+- Each generated job carries `lakeflow_framework_workflow` and the source's `domain`, `owner`, `owner_email`, `source_kind`, `delivery`, `requested_by`, and `data_domain`. The bundle deploy sets these; they are in the generated `<job>.job.yml`.
+
+A schema or table that does not exist yet, because its pipeline has not run, is tagged at the next deploy. A tag the spec no longer gives is unset; other tags are left alone. Owner email addresses are tags, and Databricks stores tags as plain text that may be replicated across regions.
 
 ## Checked on a real workspace
 
@@ -215,7 +231,9 @@ None of the following has run on Databricks. The code assumes them:
 - `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names `table_load_metrics` reads.
 - The system table columns the run views read: `setup_duration_seconds`, `queue_duration_seconds`, and `execution_duration_seconds` on `job_run_timeline`, `tags` on `system.lakeflow.jobs`, and `dlt_update_id` in `usage_metadata`.
 - `ALTER STREAMING TABLE` and `ALTER MATERIALIZED VIEW` with `SET TAGS`, `UNSET TAGS`, and `ALTER COLUMN ... COMMENT` on pipeline-owned tables, and whether a later pipeline update keeps column comments it does not define.
-- `ALTER TABLE ... ADD COLUMNS (config VARIANT)` failing with `FIELD_ALREADY_EXISTS` on a table that has it, which the DDL task skips.
+- `ALTER TABLE ... ADD COLUMNS (config VARIANT)` failing with `FIELD_ALREADY_EXISTS` on a table that has it, which the DDL task skips. The same for the four SCD columns.
+- `ALTER SCHEMA ... SET TAGS` and `UNSET TAGS`, and `information_schema.schemata` and `schema_tags`, run as the deploy identity.
+- The SCD Type 2 `MERGE` with a `UNION ALL` source and a null merge key, `LEFT ANTI JOIN` against a temporary view inside `MERGE`, and `DELETE ... WHERE NOT EXISTS` on `object_current`. The statements parse and behave as intended on DuckDB, not yet on Databricks.
 
 If one fails, record the observed syntax here and change the single strategy or DDL statement. Do not spread a workaround across the bundles.
 

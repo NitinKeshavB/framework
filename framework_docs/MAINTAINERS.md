@@ -43,7 +43,8 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 - Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines.
 - Do not schedule a `VACUUM` that shortens retention.
 - Do not create a table or schema in a spec's name from a pipeline. Schemas and volumes are prepared outside the framework.
-- Do not add a Unity Catalog tag key outside `classification`, `domain`, `owner`, and `pii` without listing it in `unity.py`. It unsets only those keys, so tags set by others stay.
+- Add a Unity Catalog tag key only by listing it in `SCHEMA_TAGS` or `TABLE_RECORD_TAGS` in `unity.py` and in `v_metadata_drift`. `unity.py` unsets only listed keys, so tags set by others stay.
+- Do not write `object_registry` except through `append_definitions` and `retire_definitions`. They keep exactly one current version per `(object_kind, full_name)`; a plain `INSERT` breaks that.
 - Do not drop the `event_log` block, the `lff.specs` and `lff.catalog` settings, or the `lakeflow_framework_workflow` tag from generated pipelines and jobs. The pipeline, `table_load_metrics`, and the run views depend on them.
 
 ## Adding a source kind

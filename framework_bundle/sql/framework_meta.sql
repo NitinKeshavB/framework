@@ -1,7 +1,14 @@
--- Registry for Lakeflow workflows, pipelines, flows, securables, ownership refusals, and
--- table health. ${catalog} is replaced by the DDL task. History tables are insert-only.
+-- Registry for Lakeflow source systems, schemas, workflows, pipelines, flows, securables,
+-- ownership refusals, and table health. ${catalog} is replaced by the DDL task.
 -- registry_sync is the only writer of definitions. It runs at deploy, so these tables change
--- once per deploy, not once per job run. object_current and run_current hold one row per key
+-- once per deploy, not once per job run.
+--
+-- object_registry is SCD Type 2. Each version has valid_from, valid_to, and is_current. A
+-- changed definition closes its current version and adds a new one. A definition removed
+-- from the bundle closes its current version and adds a deletion version (is_deleted true)
+-- that stays current until the definition comes back. Nothing in it is updated except
+-- valid_to and is_current, and nothing is deleted. run_ledger and table_health are events
+-- and stay insert-only. object_current and run_current hold one row per key
 -- so a lookup does not window the history. The backfill below runs only while the current
 -- table is empty. Job run outcomes are not stored here. v_job_runs and v_job_status in
 -- system_views.sql read them from the system tables. Row counts are in table_load_metrics.
@@ -30,7 +37,11 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
   content_hash STRING,
   source STRING,
   recorded_at TIMESTAMP,
-  config VARIANT
+  config VARIANT,
+  valid_from TIMESTAMP,
+  valid_to TIMESTAMP,
+  is_current BOOLEAN,
+  is_deleted BOOLEAN
 )
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
@@ -135,6 +146,44 @@ TBLPROPERTIES (
 ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (config VARIANT);
 
 ALTER TABLE ${catalog}.framework_meta.object_current ADD COLUMNS (config VARIANT);
+
+-- The SCD Type 2 columns, one statement each so each is skipped on its own once it exists.
+ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (valid_from TIMESTAMP);
+
+ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (valid_to TIMESTAMP);
+
+ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (is_current BOOLEAN);
+
+ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (is_deleted BOOLEAN);
+
+-- Versions written before those columns existed get them from the order they were recorded
+-- in. A version is valid until the next one. Only rows without valid_from change, so this
+-- does nothing once every row has it.
+MERGE INTO ${catalog}.framework_meta.object_registry t
+USING (
+  SELECT
+    object_kind,
+    full_name,
+    recorded_at,
+    content_hash,
+    LEAD(recorded_at) OVER (
+      PARTITION BY object_kind, full_name
+      ORDER BY recorded_at, content_hash
+    ) AS valid_to
+  FROM (
+    SELECT DISTINCT object_kind, full_name, recorded_at, content_hash
+    FROM ${catalog}.framework_meta.object_registry
+  ) versions
+) s
+ON t.object_kind = s.object_kind
+  AND t.full_name = s.full_name
+  AND t.recorded_at = s.recorded_at
+  AND t.content_hash = s.content_hash
+WHEN MATCHED AND t.valid_from IS NULL THEN UPDATE SET
+  t.valid_from = t.recorded_at,
+  t.valid_to = s.valid_to,
+  t.is_current = s.valid_to IS NULL,
+  t.is_deleted = false;
 
 -- Liquid clustering keys can change in place. New writes and OPTIMIZE use the new keys.
 ALTER TABLE ${catalog}.framework_meta.object_registry CLUSTER BY (owner, object_kind, full_name);
@@ -315,6 +364,10 @@ SELECT
   delivery,
   config:pipeline_ids::ARRAY<STRING> AS pipeline_ids,
   config:requested_by::ARRAY<STRING> AS requesters,
+  config:source_system::STRING AS source_system,
+  config:source_kind::STRING AS source_kind,
+  config:delivery_detail.schedule::STRING AS schedule,
+  config:delivery_detail.trigger::STRING AS delivery_trigger,
   content_hash,
   recorded_at
 FROM ${catalog}.framework_meta.v_object_current
@@ -379,7 +432,13 @@ SELECT
   config:team::STRING AS team,
   config:technical_owner::STRING AS technical_owner,
   config:classification::STRING AS classification,
-  config:pii::STRING AS pii
+  config:pii::STRING AS pii,
+  object_kind,
+  delivery,
+  config:layer::STRING AS layer,
+  config:pipeline_id::STRING AS pipeline_id,
+  config:job_name::STRING AS job_name,
+  config:load_method::STRING AS load_method
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
 
@@ -395,8 +454,9 @@ WHERE object_kind IN ('pipeline', 'table', 'streaming_table', 'materialized_view
 GROUP BY object_kind, full_name
 HAVING count(DISTINCT concat(owner_kind, ':', owner)) > 1;
 
--- Every object kind keeps its versions here. valid_to is the next version's recorded_at.
--- A version was active during [valid_from, valid_to). A null valid_to is still active.
+-- Every version of every object. A version was active during [valid_from, valid_to). A
+-- null valid_to is still active. A deletion version (is_deleted) says the definition was
+-- removed from its bundle at valid_from.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_history AS
 SELECT
   object_kind,
@@ -408,33 +468,44 @@ SELECT
   parent_full_name,
   relation,
   config_json,
-  config,
+  coalesce(config, parse_json(config_json)) AS config,
   content_hash,
   source,
   valid_from,
   valid_to,
-  valid_to IS NULL AS is_current
-FROM (
-  SELECT
-    object_kind,
-    full_name,
-    owner_kind,
-    owner,
-    requested_by,
-    delivery,
-    parent_full_name,
-    relation,
-    config_json,
-    coalesce(config, parse_json(config_json)) AS config,
-    content_hash,
-    source,
-    recorded_at AS valid_from,
-    LEAD(recorded_at) OVER (
-      PARTITION BY owner_kind, owner, object_kind, full_name
-      ORDER BY recorded_at, content_hash
-    ) AS valid_to
-  FROM ${catalog}.framework_meta.object_registry
-) versions;
+  is_current,
+  is_deleted
+FROM ${catalog}.framework_meta.object_registry;
+
+-- Each source system as its source.yaml declares it.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_source_systems AS
+SELECT
+  full_name AS source_system,
+  config:domain::STRING AS domain,
+  config:owner_email::STRING AS owner_email,
+  config:source_kind::STRING AS source_kind,
+  config:engine::STRING AS engine,
+  config:foreign_catalog::STRING AS foreign_catalog,
+  config:raw_volume AS raw_volume,
+  config:deliveries AS deliveries,
+  config:requested_by::ARRAY<STRING> AS requesters,
+  content_hash,
+  recorded_at
+FROM ${catalog}.framework_meta.v_object_current
+WHERE object_kind = 'source_system';
+
+-- Each schema a source system reads or writes, with the tags registry_sync sets on it.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_schemas AS
+SELECT
+  full_name AS schema_name,
+  owner_kind,
+  owner,
+  config:layers::ARRAY<STRING> AS layers,
+  config:tags AS tags,
+  content_hash,
+  recorded_at
+FROM ${catalog}.framework_meta.v_object_current
+WHERE object_kind = 'schema';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_columns AS
 SELECT
@@ -480,12 +551,41 @@ WHERE object_kind = 'flow'
   AND config:layer::STRING = 'bronze';
 
 -- Declared tags and column comments that Unity Catalog does not hold, or holds differently.
--- Empty once registry_sync has run after the tables exist. Only tables that exist are
--- compared, and only the tags this framework sets.
+-- Empty once registry_sync has run after the schemas and tables exist. Only schemas and
+-- tables that exist are compared, and only the tags this framework sets. securable is
+-- schema, table, or column. table_name is the schema's name on a schema row.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_metadata_drift AS
 WITH existing AS (
   SELECT lower(concat_ws('.', table_catalog, table_schema, table_name)) AS table_name
   FROM ${catalog}.information_schema.tables
+),
+existing_schemas AS (
+  SELECT lower(concat_ws('.', catalog_name, schema_name)) AS schema_name
+  FROM ${catalog}.information_schema.schemata
+),
+declared_schemas AS (
+  SELECT lower(full_name) AS schema_name, owner_kind, owner, item, nullif(declared, '') AS declared
+  FROM ${catalog}.framework_meta.object_current
+  LATERAL VIEW explode(map(
+    'domain', config:tags.domain::STRING,
+    'owner', config:tags.owner::STRING,
+    'owner_email', config:tags.owner_email::STRING,
+    'source_kind', config:tags.source_kind::STRING,
+    'layer', config:tags.layer::STRING,
+    'foreign_catalog', config:tags.foreign_catalog::STRING,
+    'engine', config:tags.engine::STRING
+  )) items AS item, declared
+  WHERE object_kind = 'schema'
+),
+applied_schemas AS (
+  SELECT
+    lower(concat_ws('.', catalog_name, schema_name)) AS schema_name,
+    tag_name AS item,
+    tag_value AS applied
+  FROM ${catalog}.information_schema.schema_tags
+  WHERE tag_name IN (
+    'domain', 'owner', 'owner_email', 'source_kind', 'layer', 'foreign_catalog', 'engine'
+  )
 ),
 declared_tables AS (
   SELECT lower(full_name) AS table_name, owner_kind, owner, item, nullif(declared, '') AS declared
@@ -493,8 +593,17 @@ declared_tables AS (
   LATERAL VIEW explode(map(
     'classification', config:classification::STRING,
     'domain', config:domain::STRING,
+    'pii', config:pii::STRING,
+    'data_domain', config:data_domain::STRING,
+    'team', config:team::STRING,
+    'technical_owner', config:technical_owner::STRING,
+    'layer', config:layer::STRING,
+    'pipeline_id', config:pipeline_id::STRING,
+    'job_name', config:job_name::STRING,
+    'load_method', config:load_method::STRING,
     'owner', owner,
-    'pii', config:pii::STRING
+    'requested_by', requested_by,
+    'delivery', delivery
   )) items AS item, declared
   WHERE object_kind IN ('table', 'streaming_table', 'materialized_view')
 ),
@@ -504,7 +613,10 @@ applied_tables AS (
     tag_name AS item,
     tag_value AS applied
   FROM ${catalog}.information_schema.table_tags
-  WHERE tag_name IN ('classification', 'domain', 'owner', 'pii')
+  WHERE tag_name IN (
+    'classification', 'domain', 'pii', 'data_domain', 'team', 'technical_owner', 'layer',
+    'pipeline_id', 'job_name', 'load_method', 'owner', 'requested_by', 'delivery'
+  )
 ),
 declared_columns AS (
   SELECT
@@ -540,6 +652,21 @@ applied_columns AS (
   WHERE comment IS NOT NULL
 )
 SELECT
+  'schema' AS securable,
+  d.schema_name AS table_name,
+  CAST(NULL AS STRING) AS column_name,
+  d.owner_kind,
+  d.owner,
+  d.item,
+  d.declared,
+  a.applied
+FROM declared_schemas d
+JOIN existing_schemas e ON e.schema_name = d.schema_name
+LEFT JOIN applied_schemas a ON a.schema_name = d.schema_name AND a.item = d.item
+WHERE NOT (d.declared <=> a.applied)
+UNION ALL
+SELECT
+  'table' AS securable,
   d.table_name,
   CAST(NULL AS STRING) AS column_name,
   d.owner_kind,
@@ -553,6 +680,7 @@ LEFT JOIN applied_tables a ON a.table_name = d.table_name AND a.item = d.item
 WHERE NOT (d.declared <=> a.applied)
 UNION ALL
 SELECT
+  'column' AS securable,
   d.table_name,
   d.column_name,
   d.owner_kind,

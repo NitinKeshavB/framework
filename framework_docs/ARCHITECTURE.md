@@ -28,9 +28,9 @@ Each module imports only the ones listed:
 | `pipeline` | `config`, `load`, `quality` | `assemble` builds the dataset graph; `build_pipelines` reads the specs in `lff.specs` and registers the graph with `pyspark.pipelines` |
 | `metadata` | `config`, `quality` | Registry rows, step payloads for ownership refusals, and the registry SQL lookups |
 | `registry` | `metadata` | The only registry writer: definitions with the ownership check, and the DDL |
-| `unity` | `config`, `metadata` | Applies table and column tags and column comments to Unity Catalog |
+| `unity` | nothing | Applies schema, table, and column tags and column comments to Unity Catalog |
 | `health` | nothing | Records `DESCRIBE DETAIL` and `DESCRIBE HISTORY` figures per bronze table |
-| `ingestion` | `config` | Reads `source.yaml` and specs, generates pipelines, jobs, and `SOURCE_MAP.md` |
+| `ingestion` | `config`, `metadata`, `unity` | Reads `source.yaml` and specs, generates pipelines, jobs, and `SOURCE_MAP.md`, and builds the deploy's registry rows |
 | `projects` | `config`, `ingestion` | Validates `project.yaml` and writes the project maps |
 | `cli` | all of them, most on first use | `lakeflow-framework` commands, called by `run.sh` and the job tasks |
 
@@ -49,11 +49,17 @@ flowchart LR
   generate --> map[SOURCE_MAP.md]
   deploy[bundle:deploy] --> registrySync[registry_sync job]
   spec --> registrySync
-  registrySync --> registry[(object_registry and object_current)]
-  registrySync --> uc[(Unity Catalog tags and column comments)]
+  registrySync --> registry[(object_registry SCD Type 2 and object_current)]
+  registrySync --> uc[(Unity Catalog schema, table, and column tags and column comments)]
 ```
 
-One delivery of one source system is one pipeline and one job, named `<source_system>_<delivery>`. `framework_bundle` deploys first and runs `framework_ddl` and then `framework_system_views`. `framework_ingestion` deploys next and runs `registry_sync`, the only writer of definitions. It writes every deployed spec into the registry and applies the specs' tags and column comments in Unity Catalog.
+One delivery of one source system is one pipeline and one job, named `<source_system>_<delivery>`. `framework_bundle` deploys first and runs `framework_ddl` and then `framework_system_views`. `framework_ingestion` deploys next and runs `registry_sync`, the only writer of definitions. At every deploy it:
+
+1. Writes every source system, schema, workflow, pipeline, dataflow, flow, table, link, and column the bundle defines. A new or changed definition gets a new version in `object_registry`, and the version it replaces is closed.
+2. Retires what the bundle no longer defines. Each such object gets a deletion version and leaves `object_current`.
+3. Sets the tags on each schema, table, and column, and each column comment, in Unity Catalog. It changes only what differs.
+
+`run.sh deploy` fails when `registry_sync` fails, so a deploy whose metadata did not load is a failed deploy. The generated job also carries tags: the `lakeflow_framework_workflow` tag the run views join on, and the source's `domain`, `owner`, `owner_email`, `source_kind`, `delivery`, `requested_by`, and `data_domain`.
 
 ### A delivery run
 
@@ -104,7 +110,7 @@ flowchart LR
 
 | Table | Schema | Written by | Grain | Kind |
 | --- | --- | --- | --- | --- |
-| `object_registry` | `framework_meta` | `registry_sync` | One version of one definition | Delta, insert-only |
+| `object_registry` | `framework_meta` | `registry_sync` | One version of one definition | Delta, SCD Type 2 |
 | `object_current` | `framework_meta` | `registry_sync` | One row per `(object_kind, full_name)` | Delta, merged |
 | `run_ledger` | `framework_meta` | `registry_sync` | One ownership refusal, or a job step from before steps moved to the system tables | Delta, insert-only |
 | `run_current` | `framework_meta` | `registry_sync` | One row per `(owner_kind, owner, object_kind, full_name)` | Delta, merged |
@@ -120,7 +126,7 @@ The registry tables change once per deploy, `table_health` once a day, and the m
 
 ### Registry, physical
 
-History is insert-only. A version is `(object_kind, full_name, recorded_at)`. A ledger step is `(run_id, step_no, status)`; an ownership refusal has `run_id = ownership-<first 16 characters of the hash>` and `step_name = ownership_check`. The tables do not declare those as primary keys. The definition active at time `t` is the version with `valid_from <= t` and `valid_to` null or later, in `v_object_history`.
+`object_registry` is SCD Type 2 on `(object_kind, full_name)`. Each version has `valid_from`, `valid_to`, `is_current`, and `is_deleted`. A definition has exactly one current version. When a deploy changes it, one `MERGE` sets the old version's `valid_to` and `is_current = false` and inserts the new one, so a retried deploy cannot leave the history half written. When a deploy no longer defines it, the current version is closed and a deletion version (`is_deleted = true`) becomes current. If the definition comes back, the deletion version is closed in turn. Rows are never deleted, and only `valid_to` and `is_current` are ever updated. `run_ledger` and `table_health` are events and stay insert-only. A version is `(object_kind, full_name, valid_from)`. A ledger step is `(run_id, step_no, status)`; an ownership refusal has `run_id = ownership-<first 16 characters of the hash>` and `step_name = ownership_check`. The tables do not declare those as primary keys. The definition active at time `t` is the version with `valid_from <= t` and `valid_to` null or later, in `v_object_history`.
 
 ```mermaid
 erDiagram
@@ -142,6 +148,10 @@ erDiagram
     string source
     timestamp recorded_at
     variant config
+    timestamp valid_from
+    timestamp valid_to
+    boolean is_current
+    boolean is_deleted
   }
   object_current {
     string object_kind
@@ -195,7 +205,7 @@ erDiagram
   }
 ```
 
-`object_current` and `run_current` have every column of their history table; the diagram shows the keys and the columns most queries use.
+`object_current` has every column of `object_registry` except the four SCD columns: it is the current, non-deleted version of each definition. `run_current` has every column of `run_ledger`. The diagram shows the keys and the columns most queries use. Rows written before the SCD columns existed get them from `framework_ddl`, in the order they were recorded.
 
 | Table | Clustered by |
 | --- | --- |
@@ -263,6 +273,8 @@ Every box is a row in `object_registry`, except `RUN_STEP`, which is an ownershi
 
 ```mermaid
 erDiagram
+  SOURCE_SYSTEM ||--|{ SCHEMA : contains
+  SOURCE_SYSTEM ||--|{ WORKFLOW : "one per delivery"
   WORKFLOW |o--o{ PIPELINE : owns
   PIPELINE ||--o{ RUN_STEP : "ownership refusals"
   PIPELINE ||--|| DATAFLOW : contains
@@ -275,18 +287,20 @@ erDiagram
 
 | Kind | `full_name` | Parent | `relation` | What `config` holds |
 | --- | --- | --- | --- | --- |
-| `workflow` | `job_name` | none | none | Every `pipeline_id` in that job, and every requester |
+| `source_system` | source system name | none | none | `source.yaml`: domain, owner email, source kind, engine, foreign catalog, raw volume, and each delivery with its schedule or trigger and job name |
+| `schema` | `<catalog>.<schema>` | the source system | `contains` | The layers the source writes there, and the tags `registry_sync` sets on the schema |
+| `workflow` | `job_name` | none | none | Every `pipeline_id` in that job, every requester, the source system and kind, and the delivery's schedule or trigger |
 | `pipeline` | `pipeline_id` | `job_name` when set | `owns` | Canonical spec and compiled rules |
 | `dataflow` | `pipeline_id` | the pipeline | `contains` | Raw layer, bronze table, and quarantine table |
 | `flow` | `<pipeline_id>.raw`, `.bronze`, `.quarantine` | the dataflow | `reads`, `writes`, or `rejects_to` | Volume path, or table name and layer |
-| `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, domain, data domain, team, technical owner, classification, PII |
+| `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, domain, data domain, team, technical owner, classification, PII, `pipeline_id`, job name, and load method |
 | `link` | `<pipeline_id>-><table>` | pipeline | `writes` or `rejects_to` | Child table name |
 | `column` | `<table>.<column>` | table name | `column_of` | Ordinal, type, description, classification, PII |
 | `run_ledger` step | the refused pipeline or table | none | none | `ownership_check`, `FAILED`, and the holder in `failure_reason` |
 
 A file source whose raw layer is a volume still has a `raw` flow. That flow records the volume path and has no securable. A `cloud_files` raw flow has a securable, because its raw layer is a Delta table. A database load has no raw flow. Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
 
-Each object is hashed on its own document, so a job rename versions the pipeline and the workflow but not a table or column whose own fields did not change. A column hash covers ordinal, data type, description, classification, and PII. The column name is the key, so a rename is a different column.
+Each object is hashed on its own document. A job rename versions the workflow, the pipeline, and its tables, because the job name is a table tag. It does not version a column whose own fields did not change. A column hash covers ordinal, data type, description, classification, and PII. The column name is the key, so a rename is a different column.
 
 ### Data tables
 
@@ -298,7 +312,15 @@ What each table the pipeline writes holds, beyond the spec's `columns`:
 | bronze | The same lineage columns, without `_dq_failed_rules` | Rows with no failed rule; with Auto CDC, the latest row per key by the watermark |
 | quarantine | The same lineage columns and `failed_rules` | Rows with at least one failed rule |
 
-Every published table gets a comment, `table_properties` (`quality` = its layer, and `lakeflow_framework.pipeline_id`), and liquid clustering. At deploy, `registry_sync` sets the Unity Catalog tags `classification`, `domain`, `owner`, and `pii` on each table, `classification` and `pii` on each column, and each column's `description` as its comment.
+Every published table gets a comment, `table_properties` (`quality` = its layer, and `lakeflow_framework.pipeline_id`), and liquid clustering. At deploy, `registry_sync` sets these Unity Catalog tags:
+
+| On | Tags | From |
+| --- | --- | --- |
+| each schema the source uses | `domain`, `owner` (the source system), `owner_email`, `source_kind`, `layer`, `foreign_catalog`, `engine` | `source.yaml`, and the layers its specs write there |
+| each table | `classification`, `domain`, `pii`, `data_domain`, `team`, `technical_owner`, `layer`, `pipeline_id`, `job_name`, `load_method`, `owner`, `requested_by`, `delivery` | the table spec, joined with `source.yaml` |
+| each column | `classification`, `pii`, and `description` as the comment | the spec's `columns` |
+
+A tag with no value is not set, and one the spec no longer gives is unset. Tags the framework does not own are left alone. A value is trimmed and cut to 255 characters, within the Unity Catalog limit. A schema or table that does not exist yet is skipped and tagged at the next deploy.
 
 ### Metrics, physical
 
@@ -351,6 +373,8 @@ erDiagram
 flowchart TD
   object_registry --> v_object_history
   object_current --> v_object_current
+  v_object_current --> v_source_systems
+  v_object_current --> v_schemas
   object_current --> v_lineage
   object_current --> v_ownership_conflicts
   object_current --> v_bronze_tables
@@ -380,7 +404,7 @@ flowchart TD
 
 `framework_meta.sql` creates every view on the left of the system tables; `system_views.sql` creates `v_job_runs`, `v_job_task_runs`, `v_job_status`, `v_pipeline_updates`, and `v_observed_lineage`, in their own job because they need system table grants. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_ownership_refusals` lists every definition `registry_sync` refused, and `v_run_current` the latest ledger step per object.
 
-`v_object_history` windows by `owner_kind`, `owner`, `object_kind`, and `full_name`. Filter those columns, and `owner` in particular, or the window reads every version in the table. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row.
+`v_object_history` reads the SCD columns from `object_registry`; it does not window. Filter `owner`, the first clustering key, to read less. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row. `v_source_systems` and `v_schemas` list the current source systems and the schemas they use, with their tags. `v_metadata_drift` covers schema, table, and column tags, with `securable` saying which.
 
 How the views join the system tables:
 
@@ -389,7 +413,7 @@ How the views join the system tables:
 | `v_job_runs`, `v_job_task_runs` | `system.lakeflow.jobs.tags['lakeflow_framework_workflow']` = `job_name`, then `job_id` and `run_id`; cost on `usage_metadata.job_id` and `job_run_id` |
 | `v_pipeline_updates` | pipeline name = `job_name`, with or without the `[...] ` deploy prefix; cost on `usage_metadata.dlt_pipeline_id` and `dlt_update_id` |
 | `v_observed_lineage` | `table_lineage.target_table_full_name` = the dataflow's bronze or quarantine table |
-| `v_metadata_drift` | `information_schema` table and column names = the registry table and column names, lower-cased |
+| `v_metadata_drift` | `information_schema` schema, table, and column names = the registry names, lower-cased |
 
 ## Design choices
 
@@ -411,7 +435,11 @@ How the views join the system tables:
 
 **The registry records intent; the platform records what happened.** Definitions and owners are in the registry, written once per deploy. Row counts come from the event logs, run durations and cost from `system.lakeflow` and `system.billing`, and observed lineage from `system.access`. The views join the two.
 
-**Unity Catalog holds the governance metadata.** The spec is the source; `registry_sync` writes it to Unity Catalog at every deploy and changes only what differs. `v_metadata_drift` shows anything that disagrees.
+**Unity Catalog holds the governance metadata.** The spec and `source.yaml` are the source; `registry_sync` writes them to Unity Catalog at every deploy and changes only what differs. `v_metadata_drift` shows anything that disagrees.
+
+**Definitions are SCD Type 2; events are not.** A definition has a life: it is created, changed, and removed, and `object_registry` keeps every state with when it held. A refusal or a health reading happens once, so `run_ledger` and `table_health` only append.
+
+**One bundle retires one owner kind.** `registry_sync` retires every `source_system`-owned object in the catalog that `framework_ingestion` no longer defines. That is right while `framework_ingestion` is the only bundle that registers source systems in a catalog. A second bundle that registers source systems into the same catalog, or two developers deploying different branches into one dev catalog, would retire each other's definitions.
 
 **Auto Loader options are a fixed map.** A format allow-list, `max_files_per_trigger` (1000 when the spec omits it), JSON `multiline` only when the spec sets it, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`. CSV, delimited text, and JSON get `cloudFiles.schemaHints` from `columns`, and `source.file_events: true` sets `cloudFiles.useManagedFileEvents`.
 

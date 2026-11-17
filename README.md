@@ -87,7 +87,8 @@ Query `<catalog>.framework_meta`:
 | `v_dataflows` | Raw path or table, bronze, and quarantine for each table load |
 | `v_flows` | Raw, bronze, and quarantine flows, with relation and path or table |
 | `v_tables` | Owner, requester, classification, and PII on each table |
-| `v_object_history` | Every version of a pipeline, workflow, flow, table, link, or column, with `valid_from` and `valid_to`. Filter it to see the system at a moment. |
+| `v_object_history` | Every version of a source system, schema, workflow, pipeline, flow, table, link, or column, with `valid_from`, `valid_to`, `is_current`, and `is_deleted` (SCD Type 2). Filter it to see the system at a moment. |
+| `v_source_systems`, `v_schemas` | Each source system as `source.yaml` declares it, and the schemas it uses with their tags. |
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
 | `v_job_status` | Each job with its latest run from the system tables: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` |
@@ -100,7 +101,7 @@ Query `<catalog>.framework_meta`:
 | `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
 | `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source |
 
-Filter by `owner`. History is insert-only.
+Filter by `owner`. Definitions are SCD Type 2: a changed spec closes its old version, a removed spec gets a deletion version, and nothing is deleted. Events (`run_ledger`, `table_health`) are insert-only.
 
 ```sql
 -- latest status for every job owned by billing

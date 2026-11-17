@@ -15,6 +15,7 @@ from lakeflow_framework.load import get_strategy
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
     OBJECT_COLUMNS,
+    SCD_COLUMNS,
     current_objects_sql,
     ddl_statements,
     ingest_steps,
@@ -537,7 +538,8 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "config:pipeline_ids::ARRAY<STRING>" in text
     assert "framework_meta.table_health" in text
     history = text.split("v_object_history", 1)[1]
-    assert "PARTITION BY owner_kind, owner, object_kind, full_name" in history
+    assert "is_deleted" in history.split(";")[0] and "LEAD(" not in history.split(";")[0]
+    assert "WHEN MATCHED AND t.valid_from IS NULL" in text
     assert "CREATE BLOOMFILTER INDEX" not in text
     assert "v_columns" in text
     assert "v_column_history" in text
@@ -550,7 +552,7 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert [statement.split()[1] for statement in updates] == [
         "framework_dev.framework_meta.object_current"
     ]
-    assert _column_list(text, "object_registry") == [*OBJECT_COLUMNS, "config"]
+    assert _column_list(text, "object_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
     assert _column_list(text, "run_ledger") == list(LEDGER_COLUMNS)
 
 
@@ -735,7 +737,7 @@ def test_a_step_file_written_with_counts_still_lands():
     assert row["recon_json"] == '{"source_count": 10}'
 
 
-def test_a_table_version_stays_open_when_only_the_job_name_changes():
+def test_a_renamed_job_versions_the_table_tag_but_not_its_columns():
     original = object_rows(config_from_document(_billing(job_name="finance_billing")))
     renamed = object_rows(config_from_document(_billing(job_name="finance_billing_retry")))
 
@@ -746,9 +748,13 @@ def test_a_table_version_stays_open_when_only_the_job_name_changes():
             if row["object_kind"] == kind and row["full_name"] == name
         )
 
-    assert hashes(original, "streaming_table", "framework_dev.billing_bronze.invoices") == hashes(
+    # job_name is a table tag, so the table gets a new version. Its columns do not.
+    assert hashes(original, "streaming_table", "framework_dev.billing_bronze.invoices") != hashes(
         renamed, "streaming_table", "framework_dev.billing_bronze.invoices"
     )
+    original_columns = sorted(r["content_hash"] for r in original if r["object_kind"] == "column")
+    renamed_columns = sorted(r["content_hash"] for r in renamed if r["object_kind"] == "column")
+    assert original_columns and original_columns == renamed_columns
     assert hashes(original, "pipeline", "billing_invoices") != hashes(
         renamed, "pipeline", "billing_invoices"
     )
@@ -757,11 +763,11 @@ def test_a_table_version_stays_open_when_only_the_job_name_changes():
 def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
     inserted: list[list[dict]] = []
 
-    def fake_insert(_spark, _table, rows, _columns, **_kwargs):
+    def fake_merge(_spark, _table, rows):
         inserted.append(rows)
         return len(rows)
 
-    monkeypatch.setattr("lakeflow_framework.registry._insert", fake_insert)
+    monkeypatch.setattr("lakeflow_framework.registry._scd2_merge", fake_merge)
     row = {
         "object_kind": "pipeline",
         "full_name": "billing_invoices",
@@ -879,7 +885,11 @@ def test_collector_records_a_failed_check_instead_of_writing_another_owners_tabl
                 )
             return Frame([])
 
+    def fake_merge(_spark, table, rows):
+        return fake_insert(_spark, table, rows, None)
+
     monkeypatch.setattr("lakeflow_framework.registry._insert", fake_insert)
+    monkeypatch.setattr("lakeflow_framework.registry._scd2_merge", fake_merge)
     taken = _owned_row(owner="erp", content_hash="d" * 64)
     fine = _owned_row(
         full_name="framework_dev.erp_bronze.orders", owner="erp", content_hash="e" * 64
@@ -978,46 +988,37 @@ def test_step_lookup_prunes_by_owner_and_event_date():
     assert "to_timestamp" in _cast("recorded_at", ("recorded_at",), (), ())
 
 
-def test_a_retried_definition_repairs_the_current_row_without_a_second_history_row(monkeypatch):
-    inserted: list[list[dict]] = []
-    merged: list[list[dict]] = []
+def test_one_merge_closes_the_changed_version_and_inserts_the_new_one():
+    from lakeflow_framework.registry import scd2_merge_sql
 
-    def fake_insert(_spark, _table, rows, *_args, **_kwargs):
-        inserted.append(rows)
-        return len(rows)
+    sql = scd2_merge_sql("c.framework_meta.object_registry", "SELECT * FROM staged")
+    assert sql.startswith("MERGE INTO c.framework_meta.object_registry t")
+    # A retry after object_current failed finds the same hash current: nothing is closed and
+    # nothing is inserted, so history gets no second row.
+    assert "WHERE r.content_hash <> s.content_hash OR coalesce(r.is_deleted, false)" in sql
+    assert "WHEN MATCHED AND (t.content_hash <> u.content_hash" in sql
+    assert "UPDATE SET t.valid_to = u.recorded_at, t.is_current = false" in sql
+    assert "valid_from, valid_to, is_current, is_deleted) VALUES" in sql
+    assert "u.recorded_at, NULL, true, false)" in sql
+    assert "QUALIFY row_number()" in sql
 
-    def fake_merge(_spark, _table, rows, *_args, **_kwargs):
-        merged.append(rows)
 
-    monkeypatch.setattr("lakeflow_framework.registry._insert", fake_insert)
-    monkeypatch.setattr("lakeflow_framework.registry._merge_current", fake_merge)
-    row = _owned_row()
+def test_a_removed_definition_gets_a_deletion_version_and_leaves_object_current():
+    from lakeflow_framework.registry import retire_definitions, retire_statements
 
-    class Frame:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def collect(self):
-            return self.rows
-
-    class Spark:
-        def sql(self, statement):
-            if "object_registry" in statement and "content_hash" in statement:
-                return Frame(
-                    [
-                        {
-                            "object_kind": row["object_kind"],
-                            "full_name": row["full_name"],
-                            "content_hash": row["content_hash"],
-                            "recorded_at": row["recorded_at"],
-                        }
-                    ]
-                )
-            return Frame([])
-
-    assert append_definitions(Spark(), [row], set(), "framework_dev") == 0
-    assert inserted == []
-    assert merged == [[row]]
+    close, delete = retire_statements("c", "_deployed", "source_system")
+    assert "LEFT ANTI JOIN _deployed d" in close
+    assert "r.owner_kind = 'source_system'" in close
+    assert "NOT coalesce(r.is_deleted, false)" in close
+    assert "u.recorded_at, NULL, true, true)" in close
+    assert delete.startswith("DELETE FROM c.framework_meta.object_current c")
+    assert "c.owner_kind = 'source_system'" in delete
+    with pytest.raises(ValueError, match="no definitions"):
+        retire_definitions(object(), [], "c")
+    with pytest.raises(ValueError, match="owner_kind"):
+        retire_definitions(object(), [_owned_row()], "c", owner_kind="x' OR 1=1")
+    with pytest.raises(ValueError, match="catalog"):
+        retire_statements("not a catalog", "_deployed", "source_system")
 
 
 def test_ddl_skips_a_column_the_table_already_has_and_raises_other_errors():
@@ -1033,7 +1034,7 @@ def test_ddl_skips_a_column_the_table_already_has_and_raises_other_errors():
                 raise RuntimeError(self.failure)
 
     apply_ddl(Spark("[FIELD_ALREADY_EXISTS] Cannot add column config"), "framework_dev")
-    assert sum("ADD COLUMNS" in statement for statement in ran) == 2
+    assert sum("ADD COLUMNS" in statement for statement in ran) == 6
     assert any("v_bronze_tables" in statement for statement in ran)
     with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
         apply_ddl(Spark("PERMISSION_DENIED"), "framework_dev")
@@ -1053,14 +1054,14 @@ def test_definitions_written_from_python_parse_config_to_variant():
         def sql(self, statement):
             statements.append(statement)
 
-    from lakeflow_framework.registry import OBJECT_DERIVED, _insert, _merge_current
+    from lakeflow_framework.registry import OBJECT_DERIVED, _merge_current, _scd2_merge
 
     row = _owned_row()
-    _insert(Spark(), "t", [row], OBJECT_COLUMNS, derived=OBJECT_DERIVED)
+    _scd2_merge(Spark(), "t", [row])
     _merge_current(Spark(), "c", [row], OBJECT_COLUMNS, ("object_kind",), derived=OBJECT_DERIVED)
     insert, merge = statements
-    assert insert.startswith("INSERT INTO t (object_kind, ")
-    assert "recorded_at, config) SELECT" in insert
+    assert insert.startswith("MERGE INTO t t USING")
+    assert "recorded_at, config, valid_from" in insert
     assert "parse_json(config_json) AS config" in insert
     assert "t.config = s.config" in merge
 

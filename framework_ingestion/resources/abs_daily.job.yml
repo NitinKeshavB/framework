@@ -5,6 +5,13 @@ resources:
       name: abs_daily
       tags:
         lakeflow_framework_workflow: abs_daily
+        domain: finance
+        owner: abs
+        owner_email: sonia.rajeev@allianz.com.au
+        source_kind: sftp_files
+        delivery: daily
+        requested_by: fdh
+        data_domain: gl_accounting
       email_notifications:
         on_failure:
         - nitinkeshav.bolla@allianz.com.au

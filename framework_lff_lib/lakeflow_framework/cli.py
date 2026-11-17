@@ -126,10 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "apply-metadata":
             from pyspark.sql import SparkSession
 
+            from lakeflow_framework.metadata import definition_rows
             from lakeflow_framework.unity import apply_metadata
 
             configs = validate_configs(_yaml_files(args.paths), catalog=args.catalog)
-            applied = apply_metadata(SparkSession.builder.getOrCreate(), configs, args.catalog)
+            rows = definition_rows(configs)
+            applied = apply_metadata(SparkSession.builder.getOrCreate(), rows, args.catalog)
             print(f"applied {len(applied)} metadata change(s)")
             return 0
         configs = validate_configs(_yaml_files(args.paths))

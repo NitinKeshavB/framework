@@ -1,8 +1,9 @@
-"""Apply each spec's table tags, column tags, and column comments to Unity Catalog.
+"""Apply schema tags, table tags, column tags, and column comments to Unity Catalog.
 
-The registry rows are the declared metadata. A job task runs this after the pipeline refresh,
-when the tables exist. It reads what Unity Catalog already holds and changes only what
-differs, so an unchanged spec costs three lookups and no ALTER statements.
+The registry rows are the declared metadata. registry_sync runs this at deploy, after the
+definitions are written. It reads what Unity Catalog already holds and changes only what
+differs, so an unchanged deploy costs five lookups and no ALTER statements. A schema, table,
+or column that does not exist yet is skipped and applied on the next deploy.
 """
 
 from __future__ import annotations
@@ -12,11 +13,31 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from lakeflow_framework.config import PipelineConfig
-from lakeflow_framework.metadata import object_rows
-
-# The tags this framework owns. Other tags on the same tables are left alone.
-TABLE_TAGS = ("classification", "domain", "owner", "pii")
+# The tags this framework owns. Other tags on the same schemas, tables, and columns stay.
+SCHEMA_TAGS = (
+    "domain",
+    "owner",
+    "owner_email",
+    "source_kind",
+    "layer",
+    "foreign_catalog",
+    "engine",
+)
+# Table record fields that become tags, besides owner, requested_by, and delivery, which are
+# registry columns.
+TABLE_RECORD_TAGS = (
+    "classification",
+    "domain",
+    "pii",
+    "data_domain",
+    "team",
+    "technical_owner",
+    "layer",
+    "pipeline_id",
+    "job_name",
+    "load_method",
+)
+TABLE_TAGS = (*TABLE_RECORD_TAGS, "owner", "requested_by", "delivery")
 COLUMN_TAGS = ("classification", "pii")
 ALTER_KEYWORD = {
     "table": "TABLE",
@@ -28,6 +49,7 @@ _SAFE_PART = re.compile(r"^[A-Za-z0-9_-]+$")
 
 @dataclass
 class Declared:
+    schema_tags: dict[str, dict[str, str]] = field(default_factory=dict)
     kinds: dict[str, str] = field(default_factory=dict)
     table_tags: dict[str, dict[str, str]] = field(default_factory=dict)
     column_tags: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
@@ -38,56 +60,77 @@ class Declared:
 
 @dataclass
 class Applied:
+    schema_tags: dict[str, dict[str, str]] = field(default_factory=dict)
     table_tags: dict[str, dict[str, str]] = field(default_factory=dict)
     column_tags: dict[tuple[str, str], dict[str, str]] = field(default_factory=dict)
     comments: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
-def declared_metadata(configs: Iterable[PipelineConfig]) -> Declared:
+def declared_metadata(rows: Iterable[dict[str, Any]]) -> Declared:
+    """The tags and comments the registry rows declare."""
+
     declared = Declared()
-    for config in configs:
-        for row in object_rows(config):
-            record = json.loads(row["config_json"])
-            if row["object_kind"] in ALTER_KEYWORD:
-                table = row["full_name"].lower()
-                declared.kinds[table] = row["object_kind"]
-                declared.table_tags[table] = _present(
-                    {
-                        "classification": record.get("classification"),
-                        "domain": record.get("domain"),
-                        "owner": row["owner"],
-                        "pii": record.get("pii"),
-                    }
-                )
-            elif row["object_kind"] == "column":
-                key = (str(row["parent_full_name"]).lower(), str(record["name"]).lower())
-                declared.spelled[key] = str(record["name"])
-                declared.column_tags[key] = _present(
-                    {"classification": record.get("classification"), "pii": record.get("pii")}
-                )
-                if record.get("description"):
-                    declared.comments[key] = str(record["description"])
+    for row in rows:
+        record = json.loads(row["config_json"])
+        if row["object_kind"] == "schema":
+            declared.schema_tags[row["full_name"].lower()] = _present(record.get("tags") or {})
+        elif row["object_kind"] in ALTER_KEYWORD:
+            table = row["full_name"].lower()
+            declared.kinds[table] = row["object_kind"]
+            declared.table_tags[table] = _present(
+                {
+                    **{tag: record.get(tag) for tag in TABLE_RECORD_TAGS},
+                    "owner": row["owner"],
+                    "requested_by": row.get("requested_by"),
+                    "delivery": row.get("delivery"),
+                }
+            )
+        elif row["object_kind"] == "column":
+            key = (str(row["parent_full_name"]).lower(), str(record["name"]).lower())
+            declared.spelled[key] = str(record["name"])
+            declared.column_tags[key] = _present(
+                {"classification": record.get("classification"), "pii": record.get("pii")}
+            )
+            if record.get("description"):
+                declared.comments[key] = str(record["description"])
     return declared
 
 
-def lookup_sql(catalog: str, tables: Iterable[str]) -> dict[str, str]:
-    """The information_schema reads for these tables: table tags, column tags, and columns."""
+def lookup_sql(catalog: str, tables: Iterable[str], schemas: Iterable[str] = ()) -> dict[str, str]:
+    """The information_schema reads: schemas and their tags, table tags, column tags, columns."""
 
     names = sorted({name.lower() for name in tables})
+    schema_names = sorted({name.lower() for name in schemas})
     if not _SAFE_PART.match(catalog or ""):
         raise ValueError("catalog is required")
-    if not names:
-        raise ValueError("no tables to look up")
+    if not names and not schema_names:
+        raise ValueError("no schemas or tables to look up")
     for name in names:
         _quoted(name)
-    listed = ", ".join(f"'{name}'" for name in names)
+    for name in schema_names:
+        _quoted_schema(name)
+    # A query needs a non-empty IN list, and '' matches no real name.
+    listed = ", ".join(f"'{name}'" for name in names) or "''"
+    schemas_listed = ", ".join(f"'{name}'" for name in schema_names) or "''"
     schema = f"{catalog}.information_schema"
+    schema_tags = ", ".join(f"'{tag}'" for tag in SCHEMA_TAGS)
 
     def full(catalog_column: str, schema_column: str) -> str:
         return f"lower(concat_ws('.', {catalog_column}, {schema_column}, table_name))"
 
     tags = ", ".join(f"'{tag}'" for tag in TABLE_TAGS)
     return {
+        "schemas": (
+            f"SELECT lower(concat_ws('.', catalog_name, schema_name)) AS schema_name "
+            f"FROM {schema}.schemata "
+            f"WHERE lower(concat_ws('.', catalog_name, schema_name)) IN ({schemas_listed})"
+        ),
+        "schema_tags": (
+            f"SELECT lower(concat_ws('.', catalog_name, schema_name)) AS schema_name, "
+            f"tag_name, tag_value FROM {schema}.schema_tags "
+            f"WHERE lower(concat_ws('.', catalog_name, schema_name)) IN ({schemas_listed}) "
+            f"AND tag_name IN ({schema_tags})"
+        ),
         "table_tags": (
             f"SELECT {full('catalog_name', 'schema_name')} AS table_name, tag_name, tag_value "
             f"FROM {schema}.table_tags "
@@ -109,9 +152,13 @@ def lookup_sql(catalog: str, tables: Iterable[str]) -> dict[str, str]:
 
 
 def applied_metadata(rows: dict[str, list[dict[str, Any]]]) -> tuple[Applied, set]:
-    """What Unity Catalog holds, and the (table, column) pairs that exist."""
+    """What Unity Catalog holds, and what exists: (table, column) pairs and schema names."""
 
     applied = Applied()
+    for row in rows.get("schema_tags", []):
+        applied.schema_tags.setdefault(row["schema_name"], {})[row["tag_name"]] = _text(
+            row["tag_value"]
+        )
     for row in rows["table_tags"]:
         applied.table_tags.setdefault(row["table_name"], {})[row["tag_name"]] = _text(
             row["tag_value"]
@@ -125,6 +172,7 @@ def applied_metadata(rows: dict[str, list[dict[str, Any]]]) -> tuple[Applied, se
         existing.add(key)
         if row.get("comment"):
             applied.comments[key] = str(row["comment"])
+    existing.update(("schema", row["schema_name"]) for row in rows.get("schemas", []))
     return applied, existing
 
 
@@ -136,6 +184,15 @@ def plan_statements(declared: Declared, applied: Applied, existing: set) -> list
 
     tables = {table for table, _column in existing}
     statements: list[str] = []
+    for schema in sorted(declared.schema_tags):
+        if ("schema", schema) not in existing:
+            continue
+        statements += _tag_changes(
+            f"ALTER SCHEMA {_quoted_schema(schema)}",
+            declared.schema_tags[schema],
+            applied.schema_tags.get(schema, {}),
+            SCHEMA_TAGS,
+        )
     for table in sorted(declared.kinds):
         if table not in tables:
             continue
@@ -156,11 +213,13 @@ def plan_statements(declared: Declared, applied: Applied, existing: set) -> list
     return statements
 
 
-def apply_metadata(spark, configs: list[PipelineConfig], catalog: str) -> list[str]:
-    declared = declared_metadata(configs)
-    if not declared.kinds:
+def apply_metadata(spark, rows: list[dict[str, Any]], catalog: str) -> list[str]:
+    """Make Unity Catalog hold the tags and comments ``rows`` declare. Returns the statements."""
+
+    declared = declared_metadata(rows)
+    if not declared.kinds and not declared.schema_tags:
         return []
-    queries = lookup_sql(catalog, declared.kinds)
+    queries = lookup_sql(catalog, declared.kinds, declared.schema_tags)
     rows = {name: _rows(spark.sql(statement)) for name, statement in queries.items()}
     applied, existing = applied_metadata(rows)
     statements = plan_statements(declared, applied, existing)
@@ -184,13 +243,30 @@ def _tag_changes(
 
 
 def _present(values: dict[str, Any]) -> dict[str, str]:
-    return {key: str(value) for key, value in values.items() if value not in (None, "", [])}
+    present = {key: tag_value(value) for key, value in values.items()}
+    return {key: value for key, value in present.items() if value}
+
+
+def tag_value(value: Any) -> str:
+    """A value Unity Catalog and job tags accept: trimmed and at most 255 characters."""
+
+    if value is None:
+        return ""
+    text = ", ".join(map(str, value)) if isinstance(value, (list, tuple)) else str(value)
+    return text.strip()[:255].strip()
 
 
 def _quoted(full_name: str) -> str:
     parts = full_name.split(".")
     if len(parts) != 3 or not all(_SAFE_PART.match(part) for part in parts):
         raise ValueError(f"not a catalog.schema.table name: {full_name}")
+    return ".".join(f"`{part}`" for part in parts)
+
+
+def _quoted_schema(full_name: str) -> str:
+    parts = full_name.split(".")
+    if len(parts) != 2 or not all(_SAFE_PART.match(part) for part in parts):
+        raise ValueError(f"not a catalog.schema name: {full_name}")
     return ".".join(f"`{part}`" for part in parts)
 
 

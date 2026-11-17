@@ -35,6 +35,7 @@ from lakeflow_framework.config import (
     read_mapping,
     validate_configs,
 )
+from lakeflow_framework.unity import tag_value
 
 MAP_NAME = "SOURCE_MAP.md"
 SOURCE_FILE = "source.yaml"
@@ -136,21 +137,129 @@ def load_sources(
     return systems
 
 
-def deployed_configs(bundle: Path, catalog: str) -> list[PipelineConfig]:
-    """Every spec this bundle deploys, named in ``catalog``."""
-
-    if not catalog or not re.fullmatch(r"[A-Za-z0-9_-]+", catalog):
-        raise ConfigValidationError(["catalog is required"])
-    systems = load_sources(bundle, catalog=catalog)
-    return [table.config for system in systems for table in system.tables]
-
-
 def registry_rows(bundle: Path, catalog: str) -> list[dict[str, Any]]:
-    """Every definition this bundle deploys. registry_sync writes them at deploy."""
+    """Every definition this bundle deploys. registry_sync writes them at deploy.
+
+    Besides each table's rows: one row per source system with its source.yaml, one per schema
+    the source writes, and each job's trigger in its workflow row.
+    """
 
     from lakeflow_framework.metadata import definition_rows
 
-    return definition_rows(deployed_configs(bundle, catalog))
+    systems = _deployed_systems(bundle, catalog)
+    configs = [table.config for system in systems for table in system.tables]
+    rows = definition_rows(configs, workflow_details=workflow_details(systems))
+    return source_rows(systems, catalog) + rows
+
+
+def source_rows(systems: list[SourceSystem], catalog: str) -> list[dict[str, Any]]:
+    """A ``source_system`` row per source and a ``schema`` row per schema it reads or writes."""
+
+    from lakeflow_framework.metadata import framework_object, utc_now
+
+    recorded = utc_now()
+    rows: list[dict[str, Any]] = []
+    for system in systems:
+        scope = {
+            "owner_kind": "source_system",
+            "owner": system.name,
+            "requested_by": None,
+            "delivery": None,
+        }
+        rows.append(
+            framework_object(
+                "source_system", system.name, scope, None, None, source_record(system), recorded
+            )
+        )
+        for schema, layers in sorted(source_schemas(system, catalog).items()):
+            record = {"catalog": catalog, "layers": layers, "tags": schema_tags(system, layers)}
+            rows.append(
+                framework_object("schema", schema, scope, system.name, "contains", record, recorded)
+            )
+    return rows
+
+
+def source_record(system: SourceSystem) -> dict[str, Any]:
+    return {
+        "source_system": system.name,
+        "domain": system.domain,
+        "owner_email": system.owner,
+        "source_kind": system.kind,
+        "raw_volume": dict(system.raw_volume) or None,
+        "foreign_catalog": system.foreign_catalog or None,
+        "engine": system.engine or None,
+        "deliveries": {
+            name: {**detail, "job_name": f"{system.name}_{name}"}
+            for name, detail in sorted(system.deliveries.items())
+        },
+        "requested_by": sorted(
+            {table.requested_by for table in system.tables if table.requested_by}
+        ),
+    }
+
+
+def source_schemas(system: SourceSystem, catalog: str) -> dict[str, list[str]]:
+    """``catalog.schema`` to the layers it holds, for every schema this source uses."""
+
+    layers: dict[str, set[str]] = {}
+    if system.raw_volume.get("schema"):
+        layers.setdefault(f"{catalog}.{system.raw_volume['schema']}", set()).add("raw")
+    for table in system.tables:
+        config = table.config
+        for layer in config.layers:
+            schema = {
+                "raw": config.raw_schema,
+                "bronze": config.bronze_schema,
+                "quarantine": config.quarantine_schema,
+            }[layer]
+            if schema:
+                layers.setdefault(f"{catalog}.{schema}", set()).add(layer)
+    return {schema: sorted(found) for schema, found in layers.items()}
+
+
+def schema_tags(system: SourceSystem, layers: list[str]) -> dict[str, str]:
+    """The Unity Catalog tags a source's schema carries. Values are strings."""
+
+    tags = {
+        "domain": system.domain,
+        "owner": system.name,
+        "owner_email": system.owner,
+        "source_kind": system.kind,
+        "layer": ", ".join(layers),
+        "foreign_catalog": system.foreign_catalog,
+        "engine": system.engine,
+    }
+    return {key: value for key, value in tags.items() if value}
+
+
+def workflow_details(systems: list[SourceSystem]) -> dict[str, dict[str, Any]]:
+    """What each generated job is, beyond its pipelines: source, delivery, and trigger."""
+
+    details: dict[str, dict[str, Any]] = {}
+    for system in systems:
+        for delivery, detail in system.deliveries.items():
+            details[f"{system.name}_{delivery}"] = {
+                "source_system": system.name,
+                "domain": system.domain,
+                "owner_email": system.owner,
+                "source_kind": system.kind,
+                "delivery_detail": dict(detail),
+            }
+    return details
+
+
+def deployed_configs(bundle: Path, catalog: str) -> list[PipelineConfig]:
+    """Every spec this bundle deploys, named in ``catalog``."""
+
+    return [
+        table.config for system in _deployed_systems(bundle, catalog) for table in system.tables
+    ]
+
+
+def _deployed_systems(bundle: Path, catalog: str) -> list[SourceSystem]:
+    if not catalog or not re.fullmatch(r"[A-Za-z0-9_-]+", catalog):
+        raise ConfigValidationError(["catalog is required"])
+    return load_sources(bundle, catalog=catalog)
 
 
 def render_map(systems: list[SourceSystem]) -> str:
@@ -349,7 +458,7 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
     tasks.append(refresh)
 
     # Deployed names carry a dev or prod prefix, so the run views join system tables on this tag.
-    job: dict[str, Any] = {"name": name, "tags": {WORKFLOW_TAG: name}}
+    job: dict[str, Any] = {"name": name, "tags": job_tags(system, delivery, configs)}
     notes = email_notifications(configs)
     if notes:
         job["email_notifications"] = {**notes, "no_alert_for_skipped_runs": True}
@@ -372,6 +481,22 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
     job["performance_target"] = PERFORMANCE_TARGET
     job["tasks"] = tasks
     return {"resources": {"jobs": {name: job}}}
+
+
+def job_tags(system: SourceSystem, delivery: str, configs: list[PipelineConfig]) -> dict[str, str]:
+    """Job tags: the workflow tag the run views join on, and the job's source details."""
+
+    tags = {
+        WORKFLOW_TAG: f"{system.name}_{delivery}",
+        "domain": system.domain,
+        "owner": system.name,
+        "owner_email": system.owner,
+        "source_kind": system.kind,
+        "delivery": delivery,
+        "requested_by": ", ".join(sorted({c.requested_by for c in configs if c.requested_by})),
+        "data_domain": ", ".join(sorted({c.data_domain for c in configs if c.data_domain})),
+    }
+    return {key: tag_value(value) for key, value in tags.items() if tag_value(value)}
 
 
 def _yaml(document: dict[str, Any]) -> str:

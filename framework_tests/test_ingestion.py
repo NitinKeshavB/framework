@@ -169,7 +169,15 @@ def test_resource_keys_are_unique_and_the_job_refreshes_its_pipeline(bundle: Pat
         "schema": "framework_meta",
         "name": "billing_daily_event_log",
     }
-    assert _job(bundle)["tags"] == {"lakeflow_framework_workflow": "billing_daily"}
+    tags = _job(bundle)["tags"]
+    assert tags["lakeflow_framework_workflow"] == "billing_daily"
+    assert {key: tags[key] for key in ("owner", "domain", "delivery", "data_domain")} == {
+        "owner": "billing",
+        "domain": "finance",
+        "delivery": "daily",
+        "data_domain": "invoices",
+    }
+    assert set(tags) >= {"owner_email", "source_kind", "requested_by"}
 
 
 def test_check_fails_when_a_table_is_added_without_regenerating(bundle: Path) -> None:
@@ -677,6 +685,26 @@ def test_registry_rows_use_the_deployed_catalog() -> None:
     assert all(name.startswith("aal_dev_fdh.") for name in tables)
     with pytest.raises(ConfigValidationError):
         registry_rows(SAMPLE, "not a catalog")
+
+
+def test_registry_rows_carry_each_source_its_schemas_and_its_job_triggers() -> None:
+    import json
+
+    rows = registry_rows(SAMPLE, "aal_dev_fdh")
+    by_kind: dict[str, list[dict]] = {}
+    for row in rows:
+        by_kind.setdefault(row["object_kind"], []).append(row)
+    (source,) = [row for row in by_kind["source_system"] if row["full_name"] == "billing"]
+    record = json.loads(source["config_json"])
+    assert record["domain"] == "finance" and record["owner_email"]
+    assert record["deliveries"]["daily"]["job_name"] == "billing_daily"
+    schemas = {row["full_name"]: row for row in by_kind["schema"] if row["owner"] == "billing"}
+    assert "aal_dev_fdh.billing_bronze" in schemas
+    bronze = json.loads(schemas["aal_dev_fdh.billing_bronze"]["config_json"])
+    assert bronze["tags"]["owner"] == "billing" and "bronze" in bronze["tags"]["layer"]
+    assert schemas["aal_dev_fdh.billing_bronze"]["parent_full_name"] == "billing"
+    (workflow,) = [row for row in by_kind["workflow"] if row["full_name"] == "billing_daily"]
+    assert json.loads(workflow["config_json"])["delivery_detail"]
 
 
 def test_deploy_updates_the_registry(tmp_path: Path) -> None:

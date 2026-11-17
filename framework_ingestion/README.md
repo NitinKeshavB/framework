@@ -63,7 +63,7 @@ The spec's `raw_to_bronze` section holds the bronze table, keys, columns, and qu
 
 ## One delivery, one pipeline, one job
 
-A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline, and the pipeline reads the delivery's deployed spec files, listed in its `lff.specs` setting. Deploy writes the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `table_load_metrics`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
+A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline, and the pipeline reads the delivery's deployed spec files, listed in its `lff.specs` setting. Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `table_load_metrics`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
 
 ## Add a table to a source system
 
@@ -87,7 +87,7 @@ That is all. The generator validates every source and spec, then rewrites the ma
 ./run.sh bundle:deploy framework_ingestion dev <profile>
 ```
 
-Deploy uploads the bundle, then runs `registry_sync`. That job writes every spec into `framework_meta` under the target catalog, then sets the tags and column comments in Unity Catalog. A table whose pipeline has not run yet is tagged on the next deploy. The framework bundle must already be deployed, because that deploy creates the registry.
+Deploy uploads the bundle, then runs `registry_sync`; the deploy fails if it fails. That job writes every source system, schema, job, and spec into `framework_meta` under the target catalog as SCD Type 2 versions, retires anything removed from the bundle, then sets the schema, table, and column tags and the column comments in Unity Catalog. A schema or table whose pipeline has not run yet is tagged on the next deploy. This bundle must be the only one that registers source systems in its catalog, because a deploy retires every source system object it does not define. The framework bundle must already be deployed, because that deploy creates the registry.
 
 ## Prerequisites
 
