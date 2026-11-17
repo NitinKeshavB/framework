@@ -9,7 +9,7 @@ What is built, what phase 1 covers, and what has not been verified.
 | Platform bundle | Registry DDL in `framework_bundle/sql/framework_meta.sql`, daily `OPTIMIZE` and table health, and the `framework_metrics` pipeline over every ingestion event log. Ownership columns and checks. |
 | Ingestion kinds | `sftp_files` and `sharepoint_files` (raw volume to bronze), `database` (PostgreSQL, Azure SQL, SQL Server, DB2 through a foreign catalog, to bronze), and the original `cloud_files` path, which is frozen: the code is kept but validation rejects `autoloader`, `copy_into`, and `ctas` until they run end to end on serverless |
 | Config-driven output | One pipeline and one job per delivery, plus `SOURCE_MAP.md`, generated from `source.yaml` and the table specs. The job is one `refresh_pipeline` task; the pipeline reads its deployed specs from `lff.specs`. |
-| Registry | Source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column definitions, kept as SCD Type 2 with deletion versions for removed specs. Written once per deploy by `registry_sync`. Views for definitions, lineage, and history. Load metrics in `table_load_metrics`, and job status, task, and pipeline runs with cost from the system tables. |
+| Registry | Source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column definitions, kept as SCD Type 2 with deletion versions for removed specs. Written once per deploy by `registry_sync`. Views for definitions, lineage, and history. Load metrics in `table_load_metrics`. Job, task, and pipeline runs from the Jobs API and the event logs, hourly, with no system table grants. Cost and observed lineage from the system tables when a target turns `system_views` on. |
 | Unity Catalog metadata | `registry_sync` at each deploy sets schema tags from `source.yaml`, table tags from the spec and its source, column tags, and column comments, changing only what differs. Generated jobs carry the source's tags. `v_metadata_drift` and `v_observed_lineage` compare the registry with Unity Catalog and `system.access`. |
 | Ownership | Bronze is owned by its source system. `requested_by` and `delivery` are recorded. `registry_sync` refuses a second owner. `v_ownership_conflicts` is empty when the rules hold. |
 | Curation structure | `framework_curation/<domain>/<project>/project.yaml` with silver, gold, and data products, reference and ownership checks, `PROJECT_MAP.md` and `PROJECTS_INDEX.md` |
@@ -58,6 +58,6 @@ Listed in [END_TO_END.md](END_TO_END.md#checked-on-a-real-workspace). The first 
 - Specs carry no catalog; jobs pass the environment's.
 - Silver, gold, and data-product transforms are phase 1, not MVP.
 - Each source is read once, into a private staging table. Bronze holds only clean rows; quarantine keeps the failing rows with `failed_rules`.
-- Row counts come from pipeline event logs, run outcomes and cost from the system tables. The registry holds definitions, owners, and job steps.
+- Row counts and pipeline update states come from pipeline event logs, job runs from the Jobs API, and cost, where granted, from the system tables. The registry holds definitions, owners, and job steps.
 - Unity Catalog tags are plain tags, and column comments are applied with `ALTER` by `registry_sync` at deploy.
-- A delivery job only refreshes its pipeline. Definitions are written at deploy, and run outcomes come from the system tables.
+- A delivery job only refreshes its pipeline. Definitions are written at deploy, and run outcomes are copied hourly by `framework_runs`.

@@ -7,7 +7,7 @@ How the framework is put together: the folders, the code, every table it writes,
 Folders at the repository root start with `framework_`.
 
 - `framework_lff_lib` is the wheel. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`.
-- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, the `framework_metrics` pipeline, and the daily `framework_optimize` job (compaction and table health).
+- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, the `framework_metrics` pipeline, the hourly `framework_runs` job (job runs and pipeline updates), and the daily `framework_optimize` job (compaction and table health).
 - `framework_ingestion` is source to bronze: source systems, table specs, and the pipelines and jobs generated from them.
 - `framework_curation/<domain>/<project>` is one bundle per project for silver, gold, and data products.
 - `framework_examples/ingestion` is the set of specs to copy for each source kind. `framework_examples/consumer` is the original single-bundle example and is reference only.
@@ -30,6 +30,7 @@ Each module imports only the ones listed:
 | `registry` | `metadata` | The only registry writer: definitions with the ownership check, and the DDL |
 | `unity` | nothing | Applies schema, table, and column tags and column comments to Unity Catalog |
 | `health` | nothing | Records `DESCRIBE DETAIL` and `DESCRIBE HISTORY` figures per bronze table |
+| `runs` | nothing | Records job runs from the Jobs API and pipeline updates from the event logs |
 | `ingestion` | `config`, `metadata`, `unity` | Reads `source.yaml` and specs, generates pipelines, jobs, and `SOURCE_MAP.md`, and builds the deploy's registry rows |
 | `projects` | `config`, `ingestion` | Validates `project.yaml` and writes the project maps |
 | `cli` | all of them, most on first use | `lakeflow-framework` commands, called by `run.sh` and the job tasks |
@@ -53,7 +54,7 @@ flowchart LR
   registrySync --> uc[(Unity Catalog schema, table, and column tags and column comments)]
 ```
 
-One delivery of one source system is one pipeline and one job, named `<source_system>_<delivery>`. `framework_bundle` deploys first and runs `framework_ddl` and then `framework_system_views`. `framework_ingestion` deploys next and runs `registry_sync`, the only writer of definitions. At every deploy it:
+One delivery of one source system is one pipeline and one job, named `<source_system>_<delivery>`. `framework_bundle` deploys first and runs `framework_ddl`, then `framework_system_views`, which does nothing unless the target sets `system_views` to `true`. `framework_ingestion` deploys next and runs `registry_sync`, the only writer of definitions. At every deploy it:
 
 1. Writes every source system, schema, workflow, pipeline, dataflow, flow, table, link, and column the bundle defines. A new or changed definition gets a new version in `object_registry`, and the version it replaces is closed.
 2. Retires what the bundle no longer defines. Each such object gets a deletion version and leaves `object_current`.
@@ -71,10 +72,10 @@ flowchart TD
   specs["deployed spec files (lff.specs)"] --> refresh
   refresh --> tables[(staged, bronze, and quarantine tables)]
   refresh --> eventLog[("&lt;job&gt;_event_log")]
-  refresh --> systemTables[(system.lakeflow and system.billing)]
+  trigger --> jobsApi[(Jobs API run history)]
 ```
 
-The job is one task, plus `batch_load` for frozen `cloud_files` methods. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry. Its outcome lands in the system tables and its row counts in its event log.
+The job is one task, plus `batch_load` for frozen `cloud_files` methods. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry. Its outcome is in the Jobs API and its update states and row counts in its event log; `framework_runs` copies both into `framework_meta` every hour.
 
 ### Inside one pipeline: source to bronze and quarantine
 
@@ -97,8 +98,13 @@ flowchart LR
   metricsPipeline --> flowEvents[(flow_events)]
   flowEvents --> loadMetrics[(table_load_metrics)]
   registry[(object_current)] --> loadMetrics
-  systemTables[(system.lakeflow, system.billing, system.access)] --> runViews[v_job_runs, v_job_task_runs, v_pipeline_updates, v_observed_lineage]
+  jobsApi[(Jobs API)] --> runsJob[framework_runs, hourly]
+  eventLogs --> runsJob
+  runsJob --> runTables[(job_runs, job_task_runs, pipeline_updates)]
+  runTables --> runViews[v_job_runs, v_job_task_runs, v_job_status, v_pipeline_updates]
   registry --> runViews
+  systemTables[("system.billing, system.access (optional)")] --> costViews[v_job_costs, v_pipeline_costs, v_observed_lineage]
+  runTables --> costViews
   optimize[framework_optimize, daily] --> health[(table_health)]
   registry --> metadataDrift[v_metadata_drift]
   infoSchema[(catalog information_schema)] --> metadataDrift
@@ -115,6 +121,9 @@ flowchart LR
 | `run_ledger` | `framework_meta` | `registry_sync` | One ownership refusal, or a job step from before steps moved to the system tables | Delta, insert-only |
 | `run_current` | `framework_meta` | `registry_sync` | One row per `(owner_kind, owner, object_kind, full_name)` | Delta, merged |
 | `table_health` | `framework_meta` | `framework_optimize` | One bronze table per day | Delta, append |
+| `job_runs` | `framework_meta` | `framework_runs` | One run of a framework job | Delta, merged on `(job_id, run_id)` |
+| `job_task_runs` | `framework_meta` | `framework_runs` | One task run of a job run | Delta, merged on `(job_run_id, task_run_id)` |
+| `pipeline_updates` | `framework_meta` | `framework_runs` | One update of an ingestion pipeline | Delta, merged on `(pipeline_id, update_id)` |
 | `<job>_event_log` | `framework_meta` | each ingestion pipeline | One pipeline event | Event log table |
 | `flow_events` | `framework_meta` | `framework_metrics` | One `flow_definition` or `flow_progress` event | Streaming table |
 | `table_load_metrics` | `framework_meta` | `framework_metrics` | One job, pipeline, update, and flow | Materialized view |
@@ -122,7 +131,7 @@ flowchart LR
 | bronze, `<schema>.<table>` | `<source>_bronze` | ingestion pipeline | One passing row, or one row per key with Auto CDC | Streaming table or materialized view |
 | quarantine, `<table>_qrntn` | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |
 
-The registry tables change once per deploy, `table_health` once a day, and the metrics tables once an hour. A delivery run writes only its own data tables and event log. The framework creates nothing outside `framework_meta` except the tables its pipelines publish. Schemas, volumes, and foreign catalogs exist before a deploy. The `framework_events` volume that older versions created is no longer used; drop it by hand once nothing reads it.
+The registry tables change once per deploy, `table_health` once a day, and the metrics and run tables once an hour. A delivery run writes only its own data tables and event log. The framework creates nothing outside `framework_meta` except the tables its pipelines publish. Schemas, volumes, and foreign catalogs exist before a deploy. The `framework_events` volume that older versions created is no longer used; drop it by hand once nothing reads it.
 
 ### Registry, physical
 
@@ -219,53 +228,51 @@ Every registry table sets `delta.autoOptimize.optimizeWrite` and `delta.autoOpti
 
 `config` is `config_json` parsed to `VARIANT`; `content_hash` is computed over `config_json`, so both are kept. In `run_ledger` and `run_current`, `parent_run_id`, `step_no`, `started_at`, and `ended_at` are only set on job steps from before runs moved to the system tables, and `recon_json` is no longer written. The columns stay so those rows still read.
 
-### Runs, from the system tables
+### Runs, from the Jobs API and the event logs
 
-Run outcomes, durations, and cost are not copied into the registry. The views in `system_views.sql` join the current workflow definitions to the system tables:
+Run outcomes do not need the system tables. `framework_runs` copies them hourly:
 
 ```mermaid
 erDiagram
-  v_workflows ||--o{ jobs : "job_name = tags lakeflow_framework_workflow"
-  jobs ||--o{ job_run_timeline : "workspace_id, job_id"
-  job_run_timeline ||--o{ job_task_run_timeline : "job_id, run_id"
-  job_run_timeline ||--o{ job_usage : "usage_metadata job_id, job_run_id"
-  v_workflows ||--o{ pipelines : "job_name = name without deploy prefix"
-  pipelines ||--o{ pipeline_update_timeline : "workspace_id, pipeline_id"
-  pipeline_update_timeline ||--o{ pipeline_usage : "usage_metadata dlt_pipeline_id, dlt_update_id"
-  job_usage }o--|| list_prices : "sku_name, cloud, usage_unit, time"
-  pipeline_usage }o--|| list_prices : "sku_name, cloud, usage_unit, time"
-  v_workflows {
+  v_workflows ||--o{ job_runs : "job_name = tags lakeflow_framework_workflow"
+  job_runs ||--o{ job_task_runs : "job_run_id = run_id"
+  v_workflows ||--o{ pipeline_updates : "job_name = event log name without _event_log"
+  pipeline_updates ||--o{ table_load_metrics : "pipeline_id, update_id"
+  job_runs ||--o| job_costs : "job_id, run_id (optional)"
+  pipeline_updates ||--o| pipeline_costs : "pipeline_id, update_id (optional)"
+  job_runs {
     string job_name
-    string owner_kind
-    string owner
-    array pipeline_ids
-  }
-  jobs {
-    string workspace_id
-    string job_id
-    string name
-    map tags
-  }
-  job_run_timeline {
     string job_id
     string run_id
-    timestamp period_start_time
+    timestamp started_at
+    timestamp ended_at
+    string status
     string result_state
     string termination_code
+    double run_seconds
   }
-  pipelines {
-    string workspace_id
-    string pipeline_id
-    string name
+  job_task_runs {
+    string job_run_id
+    string task_run_id
+    string task_key
+    string status
   }
-  pipeline_update_timeline {
+  pipeline_updates {
+    string job_name
     string pipeline_id
     string update_id
-    string result_state
+    timestamp started_at
+    timestamp ended_at
+    string state
+    string status
   }
 ```
 
-`jobs`, `job_run_timeline`, `job_task_run_timeline`, `pipelines`, and `pipeline_update_timeline` are in `system.lakeflow`. `job_usage` and `pipeline_usage` are rows of `system.billing.usage`, and `list_prices` is `system.billing.list_prices`. `v_job_status` takes the latest `v_job_runs` row per `job_name`. `table_load_metrics.pipeline_id` joins `v_pipeline_updates.pipeline_id`, and `update_id` joins too, so a load's row counts sit next to its cost.
+- **Job runs.** The `job_runs` task lists the workspace's jobs through the Jobs API and keeps those whose `lakeflow_framework_workflow` tag names a registered workflow. It lists their runs with tasks from two days before the latest recorded start, or 30 days back on the first pass, and reads again any run still `RUNNING`. Rows are merged on their keys, so a run is updated when it ends. `status` is `RUNNING`, `SUCCEEDED`, `SKIPPED`, or `FAILED`. The identity that runs the job needs `CAN_VIEW` on the delivery jobs, which the deploying identity has.
+- **Pipeline updates.** The `pipeline_updates` task reads the `update_progress` events in every `<job>_event_log`. An update with an event in the window is read whole. `state` is the last update state, and `status` is `SUCCEEDED`, `FAILED`, `CANCELED`, or `RUNNING`.
+- **Cost, optional.** `system_views.sql` joins `job_runs` and `pipeline_updates` to `system.billing.usage` and `list_prices` as `v_job_costs` and `v_pipeline_costs`. It needs `SELECT` on `system.billing` and runs only when the target sets `system_views` to `true`. `v_observed_lineage` there needs `system.access`.
+
+A run that started and ended between two passes is still listed: the window starts before the latest recorded start. Runs older than the Jobs API keeps (60 days) are only in `job_runs` if `framework_runs` saw them in time.
 
 ### Registry, logical
 
@@ -365,7 +372,7 @@ erDiagram
   }
 ```
 
-`job_name` comes from the event log's table name, `<job>_event_log`. `pipeline_id` is the Databricks pipeline id, which joins to `v_pipeline_updates`. `dataflow` is the spec's `pipeline_id`, which joins to the registry. Rule counts are on the `staged` row, because the rules are checked there.
+`job_name` comes from the event log's table name, `<job>_event_log`. `pipeline_id` is the Databricks pipeline id, which joins to `v_pipeline_updates` with `update_id`. `dataflow` is the spec's `pipeline_id`, which joins to the registry. Rule counts are on the `staged` row, because the rules are checked there.
 
 ## Views
 
@@ -393,25 +400,30 @@ flowchart TD
   v_workflows --> v_job_status
   v_job_runs --> v_job_status
   v_workflows --> v_job_runs
+  job_runs --> v_job_runs
+  job_task_runs --> v_job_task_runs
+  pipeline_updates --> v_pipeline_updates
   v_workflows --> v_pipeline_updates
-  v_job_runs --> v_job_task_runs
+  v_job_runs --> v_job_costs
+  v_pipeline_updates --> v_pipeline_costs
   object_current --> v_observed_lineage
-  system_tables[system tables] --> v_job_runs
-  system_tables --> v_job_task_runs
-  system_tables --> v_pipeline_updates
+  system_tables["system.billing, system.access (optional)"] --> v_job_costs
+  system_tables --> v_pipeline_costs
   system_tables --> v_observed_lineage
 ```
 
-`framework_meta.sql` creates every view on the left of the system tables; `system_views.sql` creates `v_job_runs`, `v_job_task_runs`, `v_job_status`, `v_pipeline_updates`, and `v_observed_lineage`, in their own job because they need system table grants. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_ownership_refusals` lists every definition `registry_sync` refused, and `v_run_current` the latest ledger step per object.
+`framework_meta.sql` creates every view except three; `system_views.sql` creates `v_job_costs`, `v_pipeline_costs`, and `v_observed_lineage`, in their own job because they need system table grants. That job runs them only when the target sets `system_views` to `true`. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_ownership_refusals` lists every definition `registry_sync` refused, and `v_run_current` the latest ledger step per object.
 
 `v_object_history` reads the SCD columns from `object_registry`; it does not window. Filter `owner`, the first clustering key, to read less. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row. `v_source_systems` and `v_schemas` list the current source systems and the schemas they use, with their tags. `v_metadata_drift` covers schema, table, and column tags, with `securable` saying which.
 
-How the views join the system tables:
+How the views join their sources:
 
 | View | Joined on |
 | --- | --- |
-| `v_job_runs`, `v_job_task_runs` | `system.lakeflow.jobs.tags['lakeflow_framework_workflow']` = `job_name`, then `job_id` and `run_id`; cost on `usage_metadata.job_id` and `job_run_id` |
-| `v_pipeline_updates` | pipeline name = `job_name`, with or without the `[...] ` deploy prefix; cost on `usage_metadata.dlt_pipeline_id` and `dlt_update_id` |
+| `v_job_runs`, `v_job_task_runs` | `job_runs.job_name` (the job's `lakeflow_framework_workflow` tag) = `v_workflows.job_name` |
+| `v_pipeline_updates` | `pipeline_updates.job_name` (the event log's name) = `v_workflows.job_name` |
+| `v_job_costs` | `system.billing.usage` `usage_metadata.job_id` and `job_run_id` = `job_runs.job_id` and `run_id` |
+| `v_pipeline_costs` | `usage_metadata.dlt_pipeline_id` and `dlt_update_id` = `pipeline_updates.pipeline_id` and `update_id` |
 | `v_observed_lineage` | `table_lineage.target_table_full_name` = the dataflow's bronze or quarantine table |
 | `v_metadata_drift` | `information_schema` schema, table, and column names = the registry names, lower-cased |
 
@@ -433,7 +445,9 @@ How the views join the system tables:
 
 **Quality rules are functions from config to SQL.** The template does not know how a not-null rule was produced.
 
-**The registry records intent; the platform records what happened.** Definitions and owners are in the registry, written once per deploy. Row counts come from the event logs, run durations and cost from `system.lakeflow` and `system.billing`, and observed lineage from `system.access`. The views join the two.
+**The registry records intent; the platform records what happened.** Definitions and owners are in the registry, written once per deploy. Row counts and pipeline update states come from the event logs, job runs from the Jobs API, and, where the grants exist, cost from `system.billing` and observed lineage from `system.access`. The views join them.
+
+**Nothing required reads a system table.** Grants on `system.*` are given by a metastore admin and are often not available to a delivery team. Run status works without them; only cost and observed lineage are optional extras.
 
 **Unity Catalog holds the governance metadata.** The spec and `source.yaml` are the source; `registry_sync` writes them to Unity Catalog at every deploy and changes only what differs. `v_metadata_drift` shows anything that disagrees.
 

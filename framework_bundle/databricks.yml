@@ -17,6 +17,11 @@ artifacts:
 variables:
   catalog:
     default: aal_dev_fdh
+  system_views:
+    description: >-
+      true creates the cost and observed lineage views over system.billing and system.access.
+      Set it on a target only once the deploying identity has SELECT on both.
+    default: "false"
 
 targets:
   dev:

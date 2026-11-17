@@ -20,19 +20,60 @@ resources:
       queue:
         enabled: true
 
-    # Needs SELECT on system.lakeflow and system.billing, so it is apart from framework_ddl:
-    # without those grants the registry still deploys.
+    # Cost and observed lineage from the system tables. Needs SELECT on system.billing and
+    # system.access, so it is apart from framework_ddl and off unless the target sets
+    # system_views to true. When off, the condition task skips the DDL and the run succeeds.
     framework_system_views:
       name: framework_system_views
       performance_target: STANDARD
       tasks:
+        - task_key: system_views_enabled
+          condition_task:
+            op: EQUAL_TO
+            left: "${var.system_views}"
+            right: "true"
         - task_key: apply_system_views
+          depends_on:
+            - task_key: system_views_enabled
+              outcome: "true"
           environment_key: framework_env
           spark_python_task:
             python_file: ../src/apply_ddl.py
             parameters:
               - ${var.catalog}
               - ${workspace.file_path}/sql/system_views.sql
+      environments:
+        - environment_key: framework_env
+          spec:
+            environment_version: "4"
+            dependencies:
+              - ../../framework_lff_lib/dist/*.whl
+      queue:
+        enabled: true
+
+    # Job runs from the Jobs API and pipeline updates from the event logs, hourly. Needs no
+    # system table grants: the run_as identity needs CAN_VIEW on the delivery jobs.
+    framework_runs:
+      name: framework_runs
+      performance_target: STANDARD
+      schedule:
+        quartz_cron_expression: "0 15 * * * ?"
+        timezone_id: UTC
+      tasks:
+        - task_key: job_runs
+          environment_key: framework_env
+          spark_python_task:
+            python_file: ../src/record_runs.py
+            parameters:
+              - ${var.catalog}
+              - job_runs
+        - task_key: pipeline_updates
+          environment_key: framework_env
+          spark_python_task:
+            python_file: ../src/record_runs.py
+            parameters:
+              - ${var.catalog}
+              - pipeline_updates
       environments:
         - environment_key: framework_env
           spec:

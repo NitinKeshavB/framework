@@ -26,10 +26,10 @@ Generated files start with a marker line. `generate` rewrites them, deletes ones
 
 Definitions change only when specs change, and specs change only at deploy, so the registry is written then.
 
-1. `bundle:deploy framework_bundle` runs `framework_ddl`, which creates or migrates `framework_meta`, then `framework_system_views`.
+1. `bundle:deploy framework_bundle` runs `framework_ddl`, which creates or migrates `framework_meta` and the run tables and views, then `framework_system_views`, which creates the cost and observed lineage views only when the target sets `system_views` to `true`.
 2. `bundle:deploy framework_ingestion` regenerates, uploads the bundle, and runs `registry_sync`. Its one task validates every spec under the target catalog and:
-   - writes each workflow, pipeline, dataflow, flow, securable, link, and column into `object_registry` and `object_current`. An unchanged definition is not a new history row. A table or pipeline another owner holds is refused and recorded as a `FAILED` `ownership_check` row in `run_ledger`;
-   - sets each table's `classification`, `domain`, `owner`, and `pii` tags, and each column's `classification` and `pii` tags and its `description` as the column comment, in Unity Catalog. It reads `information_schema` first, changes only what differs, and unsets a framework tag the spec dropped. Tags other than those four are left alone. A table that does not exist yet, because its pipeline has not run, is skipped and tagged on the next deploy. These are plain tags. Making them governed needs an account admin to create a tag policy for the four keys; `pii` holds the labels joined with `, `, so its allowed values must list each combination in use.
+   - writes each source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column into `object_registry` and `object_current`, and retires what the bundle no longer defines. An unchanged definition is not a new history row. A table or pipeline another owner holds is refused and recorded as a `FAILED` `ownership_check` row in `run_ledger`;
+   - sets the schema, table, and column tags and column comments in Unity Catalog, listed under [Unity Catalog tags](#unity-catalog-tags). It reads `information_schema` first, changes only what differs, and unsets a framework tag the spec dropped. Other tags are left alone. These are plain tags. Making them governed needs an account admin to create a tag policy for the keys; `pii` holds the labels joined with `, `, so its allowed values must list each combination in use.
 
 If `registry_sync` fails, the deploy command fails.
 
@@ -39,7 +39,7 @@ A delivery job is one task, **refresh_pipeline**. A `cloud_files` table that use
 
 The pipeline reads its specs from the deployed bundle. The generated pipeline sets `lff.specs` to the workspace paths of its spec files and `lff.catalog` to the target catalog, and `build_pipelines` validates those files with `validate_configs`. A pipeline id missing from `lff.specs` is an error. A pipeline without `lff.specs` falls back to reading `framework_meta.v_object_current`.
 
-Whether a run succeeded, how long it took, and what it cost come from the system tables, in `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row and rule counts come from the pipeline event log, in `table_load_metrics`.
+Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log, which the hourly `framework_runs` job copies into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row and rule counts come from the event log, in `table_load_metrics`. Cost needs the optional system views.
 
 ## How each kind loads
 
@@ -125,7 +125,7 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_lineage` | Latest link per parent, child, and relation. |
 | `v_process` | Every step of every run. |
 | `v_run_current` | Latest ownership refusal per object, and the last step of jobs from before steps moved to the system tables. |
-| `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. Created by `framework_system_views`. |
+| `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. Current to within an hour, the `framework_runs` schedule. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
 | `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
 | `v_bronze_tables` | Every bronze table and its owner. The table health step reads it. |
@@ -140,25 +140,26 @@ WHERE owner = 'billing'
 ORDER BY job_name
 ```
 
-System tables are the source for job runs, run duration, cost, and observed lineage. The registry keeps what the system tables do not: the owner, the requester, the flow graph, and the declared columns. Analysts query `framework_meta` only.
+The Jobs API and the event logs are the source for job runs and pipeline updates, and the system tables, where granted, for cost and observed lineage. The registry adds the owner, the requester, the flow graph, and the declared columns. Analysts query `framework_meta` only.
 
 ## Metrics
 
-Pipeline event logs give row and rule counts, the system tables give run outcomes, cost, and observed lineage, and `DESCRIBE` gives table size. Everything lands in, or is viewed from, `framework_meta`:
+Pipeline event logs give row and rule counts and pipeline update states, the Jobs API gives job runs, the system tables, when granted, give cost and observed lineage, and `DESCRIBE` gives table size. Everything lands in, or is viewed from, `framework_meta`:
 
 | Table or view | Built by | What it holds |
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
 | `table_load_metrics` | The `framework_metrics` pipeline, hourly | One row per job, pipeline, update, flow, and table: rows written, upserted, deleted, and dropped, each expectation's passed and failed counts, the last backlog bytes and files, status, and duration |
-| `v_job_runs` | `framework_system_views` (`system_views.sql`) | Each job run from `system.lakeflow.job_run_timeline`: result state, termination code, setup, queue, and execution seconds, and DBUs and list cost from `system.billing.usage` |
-| `v_job_task_runs` | The same | Each task run from `job_task_run_timeline`: result state and termination code |
-| `v_pipeline_updates` | The same | Each pipeline update from `pipeline_update_timeline`, with its DBUs and list cost |
-| `v_observed_lineage` | `framework_system_views` | What `system.access.table_lineage` saw each bronze and quarantine table read, next to the declared raw source: `declared`, `undeclared`, or `not_observed`. The registry's link and flow rows stay the declared intent. |
+| `job_runs`, `v_job_runs` | `framework_runs`, hourly, from the Jobs API | Each run of a framework job: status, result state, termination code, trigger, setup, queue, execution, and run seconds, and the run page URL |
+| `job_task_runs`, `v_job_task_runs` | The same | Each task run: task key, status, result state, and termination code |
+| `pipeline_updates`, `v_pipeline_updates` | `framework_runs`, from the `update_progress` events in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
+| `v_job_costs`, `v_pipeline_costs` | `framework_system_views`, only when `system_views` is `true` | DBUs and list cost per job run and per pipeline update, from `system.billing.usage` and `list_prices` |
+| `v_observed_lineage` | `framework_system_views`, only when `system_views` is `true` | What `system.access.table_lineage` saw each bronze and quarantine table read, next to the declared raw source: `declared`, `undeclared`, or `not_observed`. The registry's link and flow rows stay the declared intent. |
 | `table_health` | `framework_optimize`, daily | Each bronze table's file count and size (`DESCRIBE DETAIL`), and its last load commit with its operation metrics (`DESCRIBE HISTORY`, skipping `OPTIMIZE` and `VACUUM`) |
 
 `framework_metrics` lists the `*_event_log` tables on every update and streams their `flow_definition` and `flow_progress` events into `flow_events`, one append flow per log, so a new delivery is picked up on the next hourly run. Quality rules are checked on the private staging table, so the expectation counts are on the row whose `layer` is `staged`; its `dataflow` is the spec's `pipeline_id`, as on the bronze row.
 
-Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). The run views match a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline on its name with or without that prefix. The system tables cover the account, so each row carries `workspace_id`. Cost is usage at list price. The identity that runs `framework_system_views` needs `SELECT` on `system.lakeflow`, `system.billing`, and `system.access`. Deploy runs it after `framework_ddl` and only warns if it fails, so the registry deploys without those grants. Anyone who can read `framework_meta` can read these views, cost included.
+Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). `framework_runs` matches a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline update on the name of the event log it is in. It needs no system table grants: the identity that runs it needs `CAN_VIEW` on the delivery jobs, which the deploying identity has. The Jobs API keeps 60 days of runs, and `job_runs` keeps them after that.
 
 ```sql
 -- last week's loads of one table, with the rows that failed each rule
@@ -169,6 +170,19 @@ ORDER BY started_at DESC
 ```
 
 A delivery run does not touch the registry, so the number of jobs running at once is limited only by the workspace's pipeline quota.
+
+### Cost and observed lineage, optional
+
+These need grants a metastore admin gives: `USE CATALOG` on `system`, and `USE SCHEMA` and `SELECT` on `system.billing` for cost and `system.access` for lineage. `system.lakeflow` is not used. Once they are granted to the deploying identity, set the bundle variable on that target and deploy `framework_bundle` again:
+
+```yaml
+targets:
+  dev:
+    variables:
+      system_views: "true"
+```
+
+`framework_system_views` then creates `v_job_costs`, `v_pipeline_costs`, and `v_observed_lineage`. While `system_views` is `false`, its condition task skips the DDL and the run succeeds. Cost is usage at list price. Anyone who can read `framework_meta` can read these views, cost included.
 
 ## Physical layout
 
@@ -229,7 +243,10 @@ None of the following has run on Databricks. The code assumes them:
 - Reading `${workspace.file_path}` spec files from a serverless pipeline, and `spark.conf.get` of `lff.specs` inside it.
 - Workspace concurrency if many pipelines run together.
 - `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names `table_load_metrics` reads.
-- The system table columns the run views read: `setup_duration_seconds`, `queue_duration_seconds`, and `execution_duration_seconds` on `job_run_timeline`, `tags` on `system.lakeflow.jobs`, and `dlt_update_id` in `usage_metadata`.
+- `databricks-sdk` on serverless environment version 4 without listing it as a dependency, `WorkspaceClient()` with the job's own credentials, and `jobs.list` returning `settings.tags` without `expand_tasks`.
+- The Jobs API run fields `framework_runs` reads: `state.life_cycle_state` and `result_state`, `status.termination_details.code`, `setup_duration`, `queue_duration`, `execution_duration`, and `run_duration`.
+- `details:update_progress.state` on the published event log, and `dlt_update_id` in `usage_metadata` for the optional cost view.
+- A condition task with a bundle variable as its left operand, and a job whose only other task is excluded finishing as succeeded.
 - `ALTER STREAMING TABLE` and `ALTER MATERIALIZED VIEW` with `SET TAGS`, `UNSET TAGS`, and `ALTER COLUMN ... COMMENT` on pipeline-owned tables, and whether a later pipeline update keeps column comments it does not define.
 - `ALTER TABLE ... ADD COLUMNS (config VARIANT)` failing with `FIELD_ALREADY_EXISTS` on a table that has it, which the DDL task skips. The same for the four SCD columns.
 - `ALTER SCHEMA ... SET TAGS` and `UNSET TAGS`, and `information_schema.schemata` and `schema_tags`, run as the deploy identity.

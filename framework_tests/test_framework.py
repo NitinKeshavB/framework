@@ -516,7 +516,7 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "v_pipelines" in text
     assert "v_dataflows" in text
     assert "v_flows" in text
-    assert "v_job_status" not in text
+    assert "system.lakeflow" not in text
     assert "framework_events" not in text
     assert "v_tables" in text
     assert "v_object_history" in text

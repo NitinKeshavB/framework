@@ -69,7 +69,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 ## Deploy order
 
-1. `./run.sh bundle:deploy framework_bundle <target> <profile>`. After the upload it runs `framework_ddl`, so the registry tables and views exist when the command returns. It then runs `framework_system_views`, which needs `SELECT` on `system.lakeflow`, `system.billing`, and `system.access`; without those grants it warns and the deploy still succeeds.
+1. `./run.sh bundle:deploy framework_bundle <target> <profile>`. After the upload it runs `framework_ddl`, so the registry tables and views exist when the command returns. It then runs `framework_system_views`, which does nothing unless the target sets `system_views` to `true`; see [cost and observed lineage](framework_docs/END_TO_END.md#cost-and-observed-lineage-optional). Nothing else needs system table grants.
 2. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry and applies the specs' tags and column comments in Unity Catalog. It is the only writer of definitions.
 3. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
 
@@ -91,15 +91,16 @@ Query `<catalog>.framework_meta`:
 | `v_source_systems`, `v_schemas` | Each source system as `source.yaml` declares it, and the schemas it uses with their tags. |
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
-| `v_job_status` | Each job with its latest run from the system tables: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` |
-| `v_run_current`, `v_process` | Ownership refusals, and job steps from before runs moved to the system tables |
+| `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, current to within an hour |
+| `v_run_current`, `v_process` | Ownership refusals, and job steps from before delivery jobs stopped writing them |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 | `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
 | `table_load_metrics` | Rows written, upserted, deleted, and dropped, expectation counts, backlog, and duration per pipeline update, flow, and table |
-| `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run state, termination code, durations, and list cost from the system tables |
+| `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations, from the Jobs API and the event logs |
+| `v_job_costs`, `v_pipeline_costs` | DBUs and list cost per run and update. Only when `system_views` is `true` |
 | `table_health` | Daily file count, size, and last load commit of each bronze table |
 | `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
-| `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source |
+| `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source. Only when `system_views` is `true` |
 
 Filter by `owner`. Definitions are SCD Type 2: a changed spec closes its old version, a removed spec gets a deletion version, and nothing is deleted. Events (`run_ledger`, `table_health`) are insert-only.
 

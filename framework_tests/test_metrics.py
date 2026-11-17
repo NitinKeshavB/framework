@@ -197,42 +197,35 @@ def test_metrics_pipeline_with_no_event_log_yet_keeps_an_empty_table():
         metrics.register(dp, spark, "bad catalog")
 
 
-def test_run_views_join_system_tables_on_the_workflow_tag_and_pipeline_name():
-    text = "\n".join(
+def test_run_views_need_no_system_tables_and_cost_views_need_only_billing():
+    meta = ddl_statements("framework_dev")
+    text = "\n".join(meta)
+    for view in ("v_job_runs", "v_job_task_runs", "v_job_status", "v_pipeline_updates"):
+        assert f"CREATE OR REPLACE VIEW framework_dev.framework_meta.{view}" in text
+    for table in ("job_runs", "job_task_runs", "pipeline_updates"):
+        assert f"CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.{table}" in text
+    assert "system." not in text.replace("system_views", "")
+    system = "\n".join(
         ddl_statements("framework_dev", (BUNDLE / "sql" / "system_views.sql").read_text("utf-8"))
     )
-    for view in ("v_job_runs", "v_job_task_runs", "v_pipeline_updates"):
-        assert f"CREATE OR REPLACE VIEW framework_dev.framework_meta.{view}" in text
-    for table in (
-        "system.lakeflow.jobs",
-        "system.lakeflow.job_run_timeline",
-        "system.lakeflow.job_task_run_timeline",
-        "system.lakeflow.pipelines",
-        "system.lakeflow.pipeline_update_timeline",
-        "system.billing.usage",
-        "system.billing.list_prices",
-    ):
-        assert table in text
-    assert "tags['lakeflow_framework_workflow']" in text
-    assert "endswith(pipelines.deployed_name, concat('] ', workflow.job_name))" in text
-    for column in ("termination_code", "setup_seconds", "queue_seconds", "execution_seconds"):
-        assert column in text
-    assert "usage_metadata.dlt_pipeline_id" in text and "usage_metadata.job_run_id" in text
+    assert "system.lakeflow" not in system
+    for view in ("v_job_costs", "v_pipeline_costs", "v_observed_lineage"):
+        assert f"CREATE OR REPLACE VIEW framework_dev.framework_meta.{view}" in system
+    for view in ("v_job_runs AS", "v_job_status AS", "v_pipeline_updates AS"):
+        assert view not in system
+    assert "usage_metadata.dlt_pipeline_id" in system and "usage_metadata.job_run_id" in system
 
 
-def test_job_status_is_the_latest_system_table_run_per_workflow():
-    statements = ddl_statements(
-        "framework_dev", (BUNDLE / "sql" / "system_views.sql").read_text("utf-8")
-    )
+def test_job_status_is_the_latest_recorded_run_per_workflow():
+    statements = ddl_statements("framework_dev")
     status = next(s for s in statements if "VIEW framework_dev.framework_meta.v_job_status" in s)
     assert "FROM framework_dev.framework_meta.v_job_runs" in status
     assert "PARTITION BY job_name ORDER BY started_at DESC" in status
-    assert "WHEN run.result_state IS NULL THEN 'RUNNING'" in status
     assert "LEFT JOIN latest run ON run.job_name = workflow.job_name" in status
-    # v_job_runs must exist first, in the same file.
     names = [s.split(" AS", 1)[0] for s in statements]
     runs = next(i for i, name in enumerate(names) if name.endswith("v_job_runs"))
-    assert runs < statements.index(status)
+    workflows = next(i for i, name in enumerate(names) if name.endswith("v_workflows"))
+    assert workflows < runs < statements.index(status)
 
 
 def test_ops_bundle_wires_metrics_system_views_and_table_health():
@@ -240,8 +233,22 @@ def test_ops_bundle_wires_metrics_system_views_and_table_health():
     jobs, pipelines = resources["resources"]["jobs"], resources["resources"]["pipelines"]
     # Missing system table grants must not stop the registry DDL, so the views are their own job.
     assert [task["task_key"] for task in jobs["framework_ddl"]["tasks"]] == ["apply_ddl"]
-    (views,) = jobs["framework_system_views"]["tasks"]
+    # The system views are off unless the target sets system_views: the condition skips them.
+    enabled, views = jobs["framework_system_views"]["tasks"]
+    assert enabled["condition_task"] == {
+        "op": "EQUAL_TO",
+        "left": "${var.system_views}",
+        "right": "true",
+    }
+    assert views["depends_on"] == [{"task_key": "system_views_enabled", "outcome": "true"}]
     assert views["spark_python_task"]["parameters"][1].endswith("sql/system_views.sql")
+    bundle = yaml.safe_load((BUNDLE / "databricks.yml").read_text("utf-8"))
+    assert bundle["variables"]["system_views"]["default"] == "false"
+    runs = {task["task_key"]: task for task in jobs["framework_runs"]["tasks"]}
+    assert set(runs) == {"job_runs", "pipeline_updates"}
+    for part, task in runs.items():
+        assert task["spark_python_task"]["parameters"] == ["${var.catalog}", part]
+    assert "schedule" in jobs["framework_runs"]
     health = {task["task_key"] for task in jobs["framework_optimize"]["tasks"]}
     assert health == {"optimize", "table_health"}
     pipeline = pipelines["framework_metrics_pipeline"]

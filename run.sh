@@ -132,7 +132,7 @@ function bundle:deploy {
             framework_bundle)
                 databricks bundle run framework_ddl -t "$target" "${profile_args[@]}"
                 databricks bundle run framework_system_views -t "$target" "${profile_args[@]}" ||
-                    echo "warning: framework_system_views failed; grant SELECT on system.lakeflow, system.billing, and system.access, then run it again" >&2
+                    echo "warning: framework_system_views failed; grant SELECT on system.billing and system.access, or set system_views to false for this target" >&2
                 ;;
             framework_ingestion)
                 databricks bundle run registry_sync -t "$target" "${profile_args[@]}"

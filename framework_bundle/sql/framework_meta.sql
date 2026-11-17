@@ -10,8 +10,10 @@
 -- valid_to and is_current, and nothing is deleted. run_ledger and table_health are events
 -- and stay insert-only. object_current and run_current hold one row per key
 -- so a lookup does not window the history. The backfill below runs only while the current
--- table is empty. Job run outcomes are not stored here. v_job_runs and v_job_status in
--- system_views.sql read them from the system tables. Row counts are in table_load_metrics.
+-- table is empty. job_runs, job_task_runs, and pipeline_updates are written hourly by
+-- framework_runs from the Jobs API and the pipeline event logs, merged on their run or update
+-- key, so a run that was still going is updated when it ends. They need no system table
+-- grants. Row counts are in table_load_metrics. Cost is in system_views.sql.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
@@ -139,6 +141,75 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.table_health (
 CLUSTER BY (owner, event_date, table_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true'
+);
+
+-- One row per run of a framework job, from the Jobs API. status is RUNNING, SUCCEEDED,
+-- SKIPPED, or FAILED.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs (
+  job_name STRING,
+  deployed_name STRING,
+  workspace_id STRING,
+  job_id STRING,
+  run_id STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  status STRING,
+  life_cycle_state STRING,
+  result_state STRING,
+  termination_code STRING,
+  trigger_type STRING,
+  setup_seconds DOUBLE,
+  queue_seconds DOUBLE,
+  execution_seconds DOUBLE,
+  run_seconds DOUBLE,
+  run_page_url STRING,
+  recorded_at TIMESTAMP
+)
+CLUSTER BY (job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+-- One row per task run of a framework job run.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs (
+  job_name STRING,
+  workspace_id STRING,
+  job_id STRING,
+  job_run_id STRING,
+  task_run_id STRING,
+  task_key STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  status STRING,
+  life_cycle_state STRING,
+  result_state STRING,
+  termination_code STRING,
+  recorded_at TIMESTAMP
+)
+CLUSTER BY (job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+-- One row per update of an ingestion pipeline, from the update_progress events in its event
+-- log. state is the last update state. status is RUNNING, SUCCEEDED, FAILED, or CANCELED.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates (
+  job_name STRING,
+  pipeline_id STRING,
+  pipeline_name STRING,
+  update_id STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  state STRING,
+  status STRING,
+  recorded_at TIMESTAMP
+)
+CLUSTER BY (job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
 );
 
 -- Tables created before config existed get the column here. The DDL task skips this
@@ -694,3 +765,94 @@ LEFT JOIN applied_columns a
   ON a.table_name = d.table_name AND a.column_name = d.column_name AND a.item = d.item
 WHERE NOT (d.declared <=> a.applied)
   AND NOT (d.item = 'comment' AND d.declared IS NULL);
+
+-- Each run of a framework job, with its workflow's owner.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_runs AS
+SELECT
+  run.job_name,
+  run.deployed_name,
+  workflow.owner_kind,
+  workflow.owner,
+  workflow.requested_by,
+  workflow.delivery,
+  run.workspace_id,
+  run.job_id,
+  run.run_id,
+  run.started_at,
+  run.ended_at,
+  run.status,
+  run.life_cycle_state,
+  run.result_state,
+  run.termination_code,
+  run.trigger_type,
+  run.setup_seconds,
+  run.queue_seconds,
+  run.execution_seconds,
+  run.run_seconds,
+  run.run_page_url,
+  run.recorded_at
+FROM ${catalog}.framework_meta.job_runs run
+JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = run.job_name;
+
+-- Each workflow and its latest run. A workflow that has not run has a null status.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_status AS
+WITH latest AS (
+  SELECT *
+  FROM ${catalog}.framework_meta.v_job_runs
+  QUALIFY row_number() OVER (PARTITION BY job_name ORDER BY started_at DESC) = 1
+)
+SELECT
+  workflow.job_name,
+  workflow.owner_kind,
+  workflow.owner,
+  workflow.requested_by,
+  workflow.delivery,
+  workflow.pipeline_ids,
+  workflow.requesters,
+  run.workspace_id,
+  run.job_id,
+  run.run_id,
+  run.status,
+  run.result_state,
+  run.termination_code,
+  run.started_at,
+  run.ended_at,
+  run.run_seconds,
+  run.run_page_url
+FROM ${catalog}.framework_meta.v_workflows workflow
+LEFT JOIN latest run ON run.job_name = workflow.job_name;
+
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_task_runs AS
+SELECT
+  task.job_name,
+  workflow.owner_kind,
+  workflow.owner,
+  task.workspace_id,
+  task.job_id,
+  task.job_run_id,
+  task.task_run_id,
+  task.task_key,
+  task.started_at,
+  task.ended_at,
+  task.status,
+  task.result_state,
+  task.termination_code
+FROM ${catalog}.framework_meta.job_task_runs task
+JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = task.job_name;
+
+-- Each update of a framework pipeline, from its event log.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_pipeline_updates AS
+SELECT
+  pu.job_name,
+  pu.pipeline_name AS deployed_name,
+  workflow.owner_kind,
+  workflow.owner,
+  pu.pipeline_id,
+  pu.update_id,
+  pu.started_at,
+  pu.ended_at,
+  (unix_millis(pu.ended_at) - unix_millis(pu.started_at)) / 1000.0 AS duration_seconds,
+  pu.state,
+  pu.status
+FROM ${catalog}.framework_meta.pipeline_updates pu
+JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;

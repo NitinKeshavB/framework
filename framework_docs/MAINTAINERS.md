@@ -14,11 +14,11 @@ The registry DDL in `framework_bundle/sql/framework_meta.sql` runs on every `fra
 - A table property change is `ALTER TABLE ... SET TBLPROPERTIES`, as `autoCompact` is turned on.
 - A retired view is `DROP VIEW IF EXISTS`.
 
-The DDL task splits the file on `;`, so a SQL comment in it, or in `system_views.sql`, must not contain a semicolon. A test enforces this. The system-table views are in `system_views.sql` and their own `framework_system_views` job, because they need `SELECT` on `system.lakeflow`, `system.billing`, and `system.access`. Deploy only warns if that job fails.
+The DDL task splits the file on `;`, so a SQL comment in it, or in `system_views.sql`, must not contain a semicolon. A test enforces this. The system-table views are in `system_views.sql` and their own `framework_system_views` job, because they need `SELECT` on `system.billing` and `system.access`. The job runs them only when the target sets `system_views` to `true`, and deploy only warns if it fails. Keep everything a team needs to operate, run status included, out of that file: those grants come from a metastore admin.
 
 ## Deploy
 
-Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), then `framework_ingestion` (deploy runs `registry_sync`), then each project. `framework_metrics` (hourly) and `framework_optimize` (daily) are scheduled by the framework bundle. `framework_metrics` finds new `<job>_event_log` tables on its next run, so a new delivery needs no change there.
+Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), then `framework_ingestion` (deploy runs `registry_sync`), then each project. `framework_metrics` (hourly), `framework_runs` (hourly), and `framework_optimize` (daily) are scheduled by the framework bundle. `framework_metrics` finds new `<job>_event_log` tables on its next run, so a new delivery needs no change there.
 
 ```bash
 ./run.sh bundle:deploy framework_bundle <target> <profile>
