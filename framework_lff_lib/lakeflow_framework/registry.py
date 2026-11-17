@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, Mapping
 
@@ -34,10 +35,19 @@ _STEP_TYPES = {
 }
 
 
-def apply_ddl(spark, catalog: str, text: str | None = None) -> None:
-    """Apply registry DDL. ``text`` is the bundle's SQL file when the job runs on a cluster."""
+def apply_ddl(spark, catalog: str, text: str | None = None, force: bool = False) -> int:
+    """Apply registry DDL. ``text`` is the bundle's SQL file when the job runs on a cluster.
 
-    for statement in ddl_statements(catalog, text):
+    Every statement is idempotent, so running them again changes nothing, but it takes minutes.
+    The hash of the SQL last applied is kept in framework_meta.ddl_applied, and a run whose SQL
+    is already applied stops after that one lookup. Returns the number of statements run.
+    """
+
+    statements = ddl_statements(catalog, text)
+    digest = ddl_hash(statements)
+    if not force and _ddl_applied(spark, catalog, digest):
+        return 0
+    for statement in statements:
         if statement.upper().startswith("CREATE BLOOMFILTER"):
             try:
                 spark.sql(statement)
@@ -53,6 +63,29 @@ def apply_ddl(spark, catalog: str, text: str | None = None) -> None:
                     raise
             continue
         spark.sql(statement)
+    spark.sql(
+        f"INSERT INTO {_table(catalog, 'ddl_applied')} (sql_hash, applied_at) "
+        f"VALUES ('{digest}', current_timestamp())"
+    )
+    return len(statements)
+
+
+def ddl_hash(statements: list[str]) -> str:
+    return hashlib.sha256("\n;\n".join(statements).encode("utf-8")).hexdigest()
+
+
+def _ddl_applied(spark, catalog: str, digest: str) -> bool:
+    try:
+        found = _rows(
+            spark.sql(
+                f"SELECT 1 FROM {_table(catalog, 'ddl_applied')} "
+                f"WHERE sql_hash = '{digest}' LIMIT 1"
+            )
+        )
+    except Exception:
+        # The first run, before framework_ddl has created the table.
+        return False
+    return bool(found)
 
 
 def _adds_columns(statement: str) -> bool:

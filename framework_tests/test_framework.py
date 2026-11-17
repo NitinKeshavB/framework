@@ -1040,6 +1040,35 @@ def test_ddl_skips_a_column_the_table_already_has_and_raises_other_errors():
         apply_ddl(Spark("PERMISSION_DENIED"), "framework_dev")
 
 
+def test_ddl_already_applied_runs_only_the_lookup_unless_forced():
+    ran: list[str] = []
+    recorded: set[str] = set()
+
+    class Spark:
+        def sql(self, statement):
+            ran.append(statement)
+            if statement.startswith("INSERT INTO framework_dev.framework_meta.ddl_applied"):
+                recorded.add(statement.split("'")[1])
+            if statement.startswith("SELECT 1 FROM framework_dev.framework_meta.ddl_applied"):
+                found = statement.split("'")[1] in recorded
+                return [{"1": 1}] if found else []
+            return []
+
+    first = apply_ddl(Spark(), "framework_dev")
+    assert first == len(ddl_statements("framework_dev"))
+    assert "ddl_applied" in ran[-1]
+
+    ran.clear()
+    assert apply_ddl(Spark(), "framework_dev") == 0
+    assert len(ran) == 1
+
+    ran.clear()
+    assert apply_ddl(Spark(), "framework_dev", "SELECT 2") == 1
+
+    ran.clear()
+    assert apply_ddl(Spark(), "framework_dev", force=True) == first
+
+
 def test_definitions_written_from_python_parse_config_to_variant():
     statements: list[str] = []
 

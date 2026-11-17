@@ -84,6 +84,8 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 Four registry tables in `<catalog>.framework_meta`. `object_registry` is SCD Type 2: every version of every definition, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. `run_ledger` holds events and stays insert-only. `object_current` and `run_current` hold one row per key for lookups. `registry_sync` writes them all at deploy, and the deploy fails if it fails, so the deployed configuration is always in the tables. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
 
+`framework_ddl` records the hash of the SQL it applied in `framework_meta.ddl_applied`. A deploy that brings the same SQL finds the hash and stops after that one lookup. A deploy that changes the SQL file runs every statement again; they are all idempotent. To reapply unchanged SQL, for example after a view was dropped by hand, delete the rows from `ddl_applied` or run `apply_ddl.py` with `force` as its third argument. `framework_system_views` uses the same table for its own file.
+
 `object_registry` catalogs every definition the job syncs. Each row keeps the definition as `config_json`, the text its `content_hash` covers, and as `config`, the same document parsed to `VARIANT`; the views read `config:path`. `framework_ddl` adds `config` to tables created before it existed and fills it on `object_current`. Older history rows are read through `parse_json(config_json)`.
 
 | Kind | What it is |
@@ -235,7 +237,7 @@ None of the following has run on Databricks. The code assumes them:
 - A streaming view read by name from a downstream streaming table.
 - Auto Loader with `_metadata.file_path` on a volume path.
 - A file-arrival trigger on a Unity Catalog volume path, and `${workspace.file_path}` spec paths on serverless.
-- Serverless `environment_version` 4 with the wheel as a dependency, and `performance_target: STANDARD` on each generated job.
+- Serverless `environment_version` 4 with the wheel as a dependency, and `performance_target: PERFORMANCE_OPTIMIZED` on each generated job and framework job, so runs start in seconds. Phase 2 moves them back to `STANDARD`, which costs less and starts in minutes.
 - Federated tables as a pipeline source, and `merge` as a snapshot flow.
 - COPY INTO as a job statement before the pipeline.
 - Excel `headerRows` and `dataAddress` without `schemaLocation`.

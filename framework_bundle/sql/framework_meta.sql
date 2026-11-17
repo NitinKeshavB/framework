@@ -212,6 +212,13 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
+-- One row per SQL file version apply_ddl has applied, by the hash of its statements. A deploy
+-- whose SQL is already here skips the DDL. Delete the rows to make the next run apply it all.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
+  sql_hash STRING,
+  applied_at TIMESTAMP
+);
+
 -- Tables created before config existed get the column here. The DDL task skips this
 -- statement when the column is already there.
 ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (config VARIANT);

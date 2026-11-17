@@ -2,7 +2,7 @@ resources:
   jobs:
     framework_ddl:
       name: framework_ddl
-      performance_target: STANDARD
+      performance_target: PERFORMANCE_OPTIMIZED
       tasks:
         - task_key: apply_ddl
           environment_key: framework_env
@@ -25,7 +25,7 @@ resources:
     # system_views to true. When off, the condition task skips the DDL and the run succeeds.
     framework_system_views:
       name: framework_system_views
-      performance_target: STANDARD
+      performance_target: PERFORMANCE_OPTIMIZED
       tasks:
         - task_key: system_views_enabled
           condition_task:
@@ -55,7 +55,7 @@ resources:
     # system table grants: the run_as identity needs CAN_VIEW on the delivery jobs.
     framework_runs:
       name: framework_runs
-      performance_target: STANDARD
+      performance_target: PERFORMANCE_OPTIMIZED
       schedule:
         quartz_cron_expression: "0 15 * * * ?"
         timezone_id: UTC
@@ -85,7 +85,7 @@ resources:
 
     framework_optimize:
       name: framework_optimize
-      performance_target: STANDARD
+      performance_target: PERFORMANCE_OPTIMIZED
       schedule:
         quartz_cron_expression: "0 0 3 * * ?"
         timezone_id: UTC
@@ -111,7 +111,7 @@ resources:
 
     framework_metrics:
       name: framework_metrics
-      performance_target: STANDARD
+      performance_target: PERFORMANCE_OPTIMIZED
       schedule:
         quartz_cron_expression: "0 30 * * * ?"
         timezone_id: UTC

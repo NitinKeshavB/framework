@@ -18,7 +18,7 @@ The DDL task splits the file on `;`, so a SQL comment in it, or in `system_views
 
 ## Deploy
 
-Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), then `framework_ingestion` (deploy runs `registry_sync`), then each project. `framework_metrics` (hourly), `framework_runs` (hourly), and `framework_optimize` (daily) are scheduled by the framework bundle. `framework_metrics` finds new `<job>_event_log` tables on its next run, so a new delivery needs no change there.
+Order: `framework_bundle` (deploy runs `framework_ddl`, which does nothing when `framework_meta.sql` is unchanged since its last run, then `framework_system_views`), then `framework_ingestion` (deploy runs `registry_sync`), then each project. `framework_metrics` (hourly), `framework_runs` (hourly), and `framework_optimize` (daily) are scheduled by the framework bundle. `framework_metrics` finds new `<job>_event_log` tables on its next run, so a new delivery needs no change there.
 
 ```bash
 ./run.sh bundle:deploy framework_bundle <target> <profile>

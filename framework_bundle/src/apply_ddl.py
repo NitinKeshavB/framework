@@ -16,11 +16,15 @@ def main() -> None:
         sql_file = Path(sys.argv[2])
     else:
         sql_file = Path(__file__).resolve().parent.parent / "sql" / "framework_meta.sql"
-    apply_ddl(
+    # A third argument, force, applies the SQL even when it was applied before.
+    force = len(sys.argv) > 3 and sys.argv[3] == "force"
+    ran = apply_ddl(
         SparkSession.builder.getOrCreate(),
         catalog,
         sql_file.read_text(encoding="utf-8"),
+        force=force,
     )
+    print(f"applied {ran} statement(s)" if ran else "already applied; nothing to do")
 
 
 if __name__ == "__main__":

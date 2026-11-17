@@ -197,7 +197,7 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     # The job only refreshes the pipeline: no sync, step, or registry wait tasks.
     assert [task["task_key"] for task in _job(bundle)["tasks"]] == ["refresh_pipeline"]
     job = _job(bundle)
-    assert job["performance_target"] == "STANDARD"
+    assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
     assert "environments" not in job
     specs = _settings(bundle)["lff.specs"].split(",")
     assert len(specs) == 2

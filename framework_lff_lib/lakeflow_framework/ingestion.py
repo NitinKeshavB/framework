@@ -56,8 +56,9 @@ PLACEHOLDER_CATALOG = "catalog"
 WHEEL = "../../framework_lff_lib/dist/*.whl"
 # Serverless environment for job tasks: version 4 runs Python 3.12.
 ENVIRONMENT_VERSION = "4"
-# Scheduled and file-triggered batch loads have no deadline, so they take the cheaper mode.
-PERFORMANCE_TARGET = "STANDARD"
+# Fast startup while the framework is being brought up. STANDARD is cheaper and starts in
+# minutes, which suits scheduled loads once they run unattended.
+PERFORMANCE_TARGET = "PERFORMANCE_OPTIMIZED"
 # Each pipeline publishes its event log to framework_meta as <job name><suffix>.
 EVENT_LOG_SUFFIX = "_event_log"
 WORKFLOW_TAG = "lakeflow_framework_workflow"

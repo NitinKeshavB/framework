@@ -257,4 +257,4 @@ def test_ops_bundle_wires_metrics_system_views_and_table_health():
     assert "event_log" not in pipeline  # its own log would be read back as an ingestion log
     refresh = jobs["framework_metrics"]["tasks"][0]["pipeline_task"]["pipeline_id"]
     assert refresh == "${resources.pipelines.framework_metrics_pipeline.id}"
-    assert jobs["framework_metrics"]["performance_target"] == "STANDARD"
+    assert jobs["framework_metrics"]["performance_target"] == "PERFORMANCE_OPTIMIZED"
