@@ -27,7 +27,6 @@ OBJECT_KEYS = ("object_kind", "full_name")
 # Columns the writer computes from the staged columns.
 OBJECT_DERIVED = {"config": "parse_json(config_json)"}
 OBJECT_TABLE_COLUMNS = (*OBJECT_COLUMNS, *OBJECT_DERIVED)
-_ALREADY_EXISTS = ("FIELD_ALREADY_EXISTS", "already exists")
 _STEP_TYPES = {
     "timestamp_columns": ("started_at", "ended_at", "recorded_at"),
     "date_columns": ("event_date",),
@@ -48,20 +47,6 @@ def apply_ddl(spark, catalog: str, text: str | None = None, force: bool = False)
     if not force and _ddl_applied(spark, catalog, digest):
         return 0
     for statement in statements:
-        if statement.upper().startswith("CREATE BLOOMFILTER"):
-            try:
-                spark.sql(statement)
-            except Exception:
-                continue
-            continue
-        if _adds_columns(statement):
-            # ADD COLUMNS has no IF NOT EXISTS, and a new table already has the column.
-            try:
-                spark.sql(statement)
-            except Exception as exc:
-                if not any(marker in str(exc) for marker in _ALREADY_EXISTS):
-                    raise
-            continue
         spark.sql(statement)
     spark.sql(
         f"INSERT INTO {_table(catalog, 'ddl_applied')} (sql_hash, applied_at) "
@@ -86,10 +71,6 @@ def _ddl_applied(spark, catalog: str, digest: str) -> bool:
         # The first run, before framework_ddl has created the table.
         return False
     return bool(found)
-
-
-def _adds_columns(statement: str) -> bool:
-    return bool(re.match(r"ALTER\s+TABLE\s+\S+\s+ADD\s+COLUMNS?\b", statement, re.IGNORECASE))
 
 
 def append_steps(spark, payloads: list[dict], seen: set | None = None, catalog: str = "") -> int:

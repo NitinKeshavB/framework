@@ -82,11 +82,11 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 ## The registry
 
-Four registry tables in `<catalog>.framework_meta`. `object_registry` is SCD Type 2: every version of every definition, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. `run_ledger` holds events and stays insert-only. `object_current` and `run_current` hold one row per key for lookups. `registry_sync` writes them all at deploy, and the deploy fails if it fails, so the deployed configuration is always in the tables. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
+Four registry tables in `<catalog>.framework_meta`. `object_registry` is SCD Type 2: every version of every definition, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. `run_ledger` holds events and stays insert-only. `object_current` and `run_current` hold one row per key for lookups. `registry_sync` writes them all at deploy, and the deploy fails if it fails, so the deployed configuration is always in the tables. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). The file creates a fresh `framework_meta` and has no `ALTER` statements: until go-live, a table change means dropping the schema and deploying again. See [MAINTAINERS.md](MAINTAINERS.md).
 
 `framework_ddl` records the hash of the SQL it applied in `framework_meta.ddl_applied`. A deploy that brings the same SQL finds the hash and stops after that one lookup. A deploy that changes the SQL file runs every statement again; they are all idempotent. To reapply unchanged SQL, for example after a view was dropped by hand, delete the rows from `ddl_applied` or run `apply_ddl.py` with `force` as its third argument. `framework_system_views` uses the same table for its own file.
 
-`object_registry` catalogs every definition the job syncs. Each row keeps the definition as `config_json`, the text its `content_hash` covers, and as `config`, the same document parsed to `VARIANT`; the views read `config:path`. `framework_ddl` adds `config` to tables created before it existed and fills it on `object_current`. Older history rows are read through `parse_json(config_json)`.
+`object_registry` catalogs every definition the job syncs. Each row keeps the definition as `config_json`, the text its `content_hash` covers, and as `config`, the same document parsed to `VARIANT`; the views read `config:path`.
 
 | Kind | What it is |
 | --- | --- |
@@ -196,9 +196,9 @@ The tables use liquid clustering:
 - `run_current`: `CLUSTER BY (owner, object_kind, full_name)`
 - `table_health`: `CLUSTER BY (owner, event_date, table_name)`
 
-Each table clusters on at most three keys. `framework_ddl` moves tables created with four keys to these with `ALTER TABLE ... CLUSTER BY`; new writes and the next `OPTIMIZE` use them.
+Each table clusters on at most three keys.
 
-All set `delta.autoOptimize.optimizeWrite`, and the registry tables also set `autoCompact`: they are written once per deploy, so compacting after that commit is cheap. `framework_ddl` turns it on for tables created while it was off. Predictive optimization, once the catalog owner enables it, also compacts these tables in the background. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
+All set `delta.autoOptimize.optimizeWrite`, and the registry tables also set `autoCompact`: they are written once per deploy, so compacting after that commit is cheap. Predictive optimization, once the catalog owner enables it, also compacts these tables in the background. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
 `v_object_history` reads `valid_from` and `valid_to` from `object_registry`, so a filter on `owner` or on the dates prunes files directly. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
 
@@ -250,7 +250,6 @@ None of the following has run on Databricks. The code assumes them:
 - `details:update_progress.state` on the published event log, and `dlt_update_id` in `usage_metadata` for the optional cost view.
 - A condition task with a bundle variable as its left operand, and a job whose only other task is excluded finishing as succeeded.
 - `ALTER STREAMING TABLE` and `ALTER MATERIALIZED VIEW` with `SET TAGS`, `UNSET TAGS`, and `ALTER COLUMN ... COMMENT` on pipeline-owned tables, and whether a later pipeline update keeps column comments it does not define.
-- `ALTER TABLE ... ADD COLUMNS (config VARIANT)` failing with `FIELD_ALREADY_EXISTS` on a table that has it, which the DDL task skips. The same for the four SCD columns.
 - `ALTER SCHEMA ... SET TAGS` and `UNSET TAGS`, and `information_schema.schemata` and `schema_tags`, run as the deploy identity.
 - The SCD Type 2 `MERGE` with a `UNION ALL` source and a null merge key, `LEFT ANTI JOIN` against a temporary view inside `MERGE`, and `DELETE ... WHERE NOT EXISTS` on `object_current`. The statements parse and behave as intended on DuckDB, not yet on Databricks.
 

@@ -502,11 +502,7 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     ]
     assert keys and all(len(key.split(",")) <= 3 for key in keys)
     assert "'delta.autoOptimize.autoCompact' = 'false'" not in text
-    for table in ("object_registry", "object_current", "run_ledger", "run_current"):
-        assert (
-            f"ALTER TABLE framework_dev.framework_meta.{table}\n"
-            "SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true')"
-        ) in text
+    assert not any(statement.upper().startswith("ALTER") for statement in statements)
     assert "VIEW framework_dev.framework_meta.v_ownership_refusals" in text
     assert "step_name = 'ownership_check' AND status = 'FAILED'" in text
     assert "v_ownership_conflicts" in text
@@ -520,14 +516,12 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "framework_events" not in text
     assert "v_tables" in text
     assert "v_object_history" in text
-    assert "PARTITION BY object_kind, full_name" in text
     assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.object_current" in text
     assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.run_current" in text
     current_view = next(statement for statement in statements if "v_object_current" in statement)
     assert "object_current" in current_view
     assert "QUALIFY" not in current_view
-    assert "DROP VIEW IF EXISTS framework_dev.framework_meta.v_recon" in text
-    assert "CREATE OR REPLACE VIEW framework_dev.framework_meta.v_recon" not in text
+    assert "v_recon" not in text
     run_current = next(
         statement
         for statement in statements
@@ -539,19 +533,14 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "framework_meta.table_health" in text
     history = text.split("v_object_history", 1)[1]
     assert "is_deleted" in history.split(";")[0] and "LEAD(" not in history.split(";")[0]
-    assert "WHEN MATCHED AND t.valid_from IS NULL" in text
     assert "CREATE BLOOMFILTER INDEX" not in text
     assert "v_columns" in text
     assert "v_column_history" in text
     assert "valid_from" in text
     assert "valid_to" in text
     assert "is_current" in text
-    assert not any(statement.upper().startswith("DELETE") for statement in statements)
-    # Only object_current, which is not history, is updated: its older rows get config parsed.
-    updates = [statement for statement in statements if statement.upper().startswith("UPDATE")]
-    assert [statement.split()[1] for statement in updates] == [
-        "framework_dev.framework_meta.object_current"
-    ]
+    # A fresh schema only: tables and views, and no statement that changes rows.
+    assert {statement.split()[0].upper() for statement in statements} == {"CREATE"}
     assert _column_list(text, "object_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
     assert _column_list(text, "run_ledger") == list(LEDGER_COLUMNS)
 
@@ -1019,25 +1008,6 @@ def test_a_removed_definition_gets_a_deletion_version_and_leaves_object_current(
         retire_definitions(object(), [_owned_row()], "c", owner_kind="x' OR 1=1")
     with pytest.raises(ValueError, match="catalog"):
         retire_statements("not a catalog", "_deployed", "source_system")
-
-
-def test_ddl_skips_a_column_the_table_already_has_and_raises_other_errors():
-    ran: list[str] = []
-
-    class Spark:
-        def __init__(self, failure: str):
-            self.failure = failure
-
-        def sql(self, statement):
-            ran.append(statement)
-            if "ADD COLUMNS" in statement:
-                raise RuntimeError(self.failure)
-
-    apply_ddl(Spark("[FIELD_ALREADY_EXISTS] Cannot add column config"), "framework_dev")
-    assert sum("ADD COLUMNS" in statement for statement in ran) == 6
-    assert any("v_bronze_tables" in statement for statement in ran)
-    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
-        apply_ddl(Spark("PERMISSION_DENIED"), "framework_dev")
 
 
 def test_ddl_already_applied_runs_only_the_lookup_unless_forced():

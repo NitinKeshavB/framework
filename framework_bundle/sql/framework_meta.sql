@@ -9,8 +9,7 @@
 -- that stays current until the definition comes back. Nothing in it is updated except
 -- valid_to and is_current, and nothing is deleted. run_ledger and table_health are events
 -- and stay insert-only. object_current and run_current hold one row per key
--- so a lookup does not window the history. The backfill below runs only while the current
--- table is empty. job_runs, job_task_runs, and pipeline_updates are written hourly by
+-- so a lookup does not window the history. job_runs, job_task_runs, and pipeline_updates are written hourly by
 -- framework_runs from the Jobs API and the pipeline event logs, merged on their run or update
 -- key, so a run that was still going is updated when it ends. They need no system table
 -- grants. Row counts are in table_load_metrics. Cost is in system_views.sql.
@@ -21,8 +20,11 @@
 -- delivery is how its source delivers.
 --
 -- config is config_json parsed to VARIANT, so the views read it with config:path. config_json
--- stays: content_hash is computed over that text. Rows recorded before config existed are read
--- through parse_json(config_json).
+-- stays: content_hash is computed over that text.
+--
+-- This file creates a fresh framework_meta. It has no ALTER statements, so a table created
+-- with an older shape keeps it. Until go-live, drop the schema to change a table. After
+-- go-live, add an ALTER here for each change instead.
 
 CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_meta;
 
@@ -218,137 +220,6 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
   sql_hash STRING,
   applied_at TIMESTAMP
 );
-
--- Tables created before config existed get the column here. The DDL task skips this
--- statement when the column is already there.
-ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (config VARIANT);
-
-ALTER TABLE ${catalog}.framework_meta.object_current ADD COLUMNS (config VARIANT);
-
--- The SCD Type 2 columns, one statement each so each is skipped on its own once it exists.
-ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (valid_from TIMESTAMP);
-
-ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (valid_to TIMESTAMP);
-
-ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (is_current BOOLEAN);
-
-ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (is_deleted BOOLEAN);
-
--- Versions written before those columns existed get them from the order they were recorded
--- in. A version is valid until the next one. Only rows without valid_from change, so this
--- does nothing once every row has it.
-MERGE INTO ${catalog}.framework_meta.object_registry t
-USING (
-  SELECT
-    object_kind,
-    full_name,
-    recorded_at,
-    content_hash,
-    LEAD(recorded_at) OVER (
-      PARTITION BY object_kind, full_name
-      ORDER BY recorded_at, content_hash
-    ) AS valid_to
-  FROM (
-    SELECT DISTINCT object_kind, full_name, recorded_at, content_hash
-    FROM ${catalog}.framework_meta.object_registry
-  ) versions
-) s
-ON t.object_kind = s.object_kind
-  AND t.full_name = s.full_name
-  AND t.recorded_at = s.recorded_at
-  AND t.content_hash = s.content_hash
-WHEN MATCHED AND t.valid_from IS NULL THEN UPDATE SET
-  t.valid_from = t.recorded_at,
-  t.valid_to = s.valid_to,
-  t.is_current = s.valid_to IS NULL,
-  t.is_deleted = false;
-
--- Liquid clustering keys can change in place. New writes and OPTIMIZE use the new keys.
-ALTER TABLE ${catalog}.framework_meta.object_registry CLUSTER BY (owner, object_kind, full_name);
-
-ALTER TABLE ${catalog}.framework_meta.run_ledger CLUSTER BY (owner, event_date, run_id);
-
--- Writes are once per deploy now, so compaction after each commit is cheap. Tables created
--- while it was off are switched here.
-ALTER TABLE ${catalog}.framework_meta.object_registry
-SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
-
-ALTER TABLE ${catalog}.framework_meta.object_current
-SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
-
-ALTER TABLE ${catalog}.framework_meta.run_ledger
-SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
-
-ALTER TABLE ${catalog}.framework_meta.run_current
-SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
-
--- object_current is not history, so its older rows are parsed once here.
-UPDATE ${catalog}.framework_meta.object_current
-SET config = parse_json(config_json)
-WHERE config IS NULL AND config_json IS NOT NULL;
-
-INSERT INTO ${catalog}.framework_meta.object_current (
-  object_kind,
-  full_name,
-  owner_kind,
-  owner,
-  requested_by,
-  delivery,
-  parent_full_name,
-  relation,
-  config_json,
-  content_hash,
-  source,
-  recorded_at,
-  config
-)
-SELECT
-  object_kind,
-  full_name,
-  owner_kind,
-  owner,
-  requested_by,
-  delivery,
-  parent_full_name,
-  relation,
-  config_json,
-  content_hash,
-  source,
-  recorded_at,
-  coalesce(config, parse_json(config_json)) AS config
-FROM ${catalog}.framework_meta.object_registry
-WHERE (SELECT COUNT(*) FROM ${catalog}.framework_meta.object_current) = 0
-QUALIFY row_number() OVER (
-  PARTITION BY object_kind, full_name
-  ORDER BY recorded_at DESC
-) = 1;
-
-INSERT INTO ${catalog}.framework_meta.run_current
-SELECT
-  run_id,
-  parent_run_id,
-  object_kind,
-  full_name,
-  owner_kind,
-  owner,
-  step_no,
-  step_name,
-  status,
-  started_at,
-  ended_at,
-  failure_reason,
-  recon_json,
-  recorded_at,
-  event_date
-FROM ${catalog}.framework_meta.run_ledger
-WHERE (SELECT COUNT(*) FROM ${catalog}.framework_meta.run_current) = 0
-QUALIFY row_number() OVER (
-  PARTITION BY owner_kind, owner, object_kind, full_name
-  ORDER BY recorded_at DESC
-) = 1;
-
--- Load counts come from framework_meta.table_load_metrics, which framework_metrics builds.
-DROP VIEW IF EXISTS ${catalog}.framework_meta.v_recon;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_current AS
 SELECT
@@ -555,7 +426,7 @@ SELECT
   parent_full_name,
   relation,
   config_json,
-  coalesce(config, parse_json(config_json)) AS config,
+  config,
   content_hash,
   source,
   valid_from,

@@ -214,7 +214,7 @@ erDiagram
   }
 ```
 
-`object_current` has every column of `object_registry` except the four SCD columns: it is the current, non-deleted version of each definition. `run_current` has every column of `run_ledger`. The diagram shows the keys and the columns most queries use. Rows written before the SCD columns existed get them from `framework_ddl`, in the order they were recorded.
+`object_current` has every column of `object_registry` except the four SCD columns: it is the current, non-deleted version of each definition. `run_current` has every column of `run_ledger`. The diagram shows the keys and the columns most queries use.
 
 | Table | Clustered by |
 | --- | --- |
@@ -224,7 +224,7 @@ erDiagram
 | `run_current` | `(owner, object_kind, full_name)` |
 | `table_health` | `(owner, event_date, table_name)` |
 
-Every registry table sets `delta.autoOptimize.optimizeWrite` and `delta.autoOptimize.autoCompact`; `table_health` sets `optimizeWrite`. `framework_ddl` turns `autoCompact` on for tables created while it was off.
+Every registry table sets `delta.autoOptimize.optimizeWrite` and `delta.autoOptimize.autoCompact`; `table_health` sets `optimizeWrite`.
 
 `config` is `config_json` parsed to `VARIANT`; `content_hash` is computed over `config_json`, so both are kept. In `run_ledger` and `run_current`, `parent_run_id`, `step_no`, `started_at`, and `ended_at` are only set on job steps from before runs moved to the system tables, and `recon_json` is no longer written. The columns stay so those rows still read.
 

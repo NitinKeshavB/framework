@@ -6,12 +6,16 @@ The version in [framework_lff_lib/pyproject.toml](../framework_lff_lib/pyproject
 
 The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `object_registry` row.
 
-The registry DDL in `framework_bundle/sql/framework_meta.sql` runs on every `framework_bundle` deploy, so each statement must be safe to run again. Tables are `CREATE ... IF NOT EXISTS` and views `CREATE OR REPLACE VIEW`. A schema change is added below the tables as a statement that is safe to repeat:
+The registry DDL in `framework_bundle/sql/framework_meta.sql` runs on a `framework_bundle` deploy whenever the file has changed, so each statement must be safe to run again. Tables are `CREATE ... IF NOT EXISTS` and views `CREATE OR REPLACE VIEW`.
 
-- A new column is `ALTER TABLE ... ADD COLUMNS`. The DDL task skips that statement when the column is already there.
+Until go-live the file describes a fresh schema and has no `ALTER` statements. To change a table, edit its `CREATE TABLE`, drop `<catalog>.framework_meta`, and deploy `framework_bundle` then `framework_ingestion` again; `registry_sync` writes the definitions back. Registry history, run history, and metrics start over.
+
+After go-live, add each change below the tables as a statement that is safe to repeat, and keep the `CREATE TABLE` up to date for a fresh catalog:
+
+- A new column is `ALTER TABLE ... ADD COLUMNS`. It has no `IF NOT EXISTS`, so `apply_ddl` must skip it when the column is there.
 - A new clustering key is `ALTER TABLE ... CLUSTER BY`, at most three keys.
-- A backfill is an `UPDATE` whose `WHERE` matches only rows still missing the value, as `config` is filled on `object_current`. Never `UPDATE` the history tables.
-- A table property change is `ALTER TABLE ... SET TBLPROPERTIES`, as `autoCompact` is turned on.
+- A backfill is an `UPDATE` whose `WHERE` matches only rows still missing the value. Never `UPDATE` the history tables.
+- A table property change is `ALTER TABLE ... SET TBLPROPERTIES`.
 - A retired view is `DROP VIEW IF EXISTS`.
 
 The DDL task splits the file on `;`, so a SQL comment in it, or in `system_views.sql`, must not contain a semicolon. A test enforces this. The system-table views are in `system_views.sql` and their own `framework_system_views` job, because they need `SELECT` on `system.billing` and `system.access`. The job runs them only when the target sets `system_views` to `true`, and deploy only warns if it fails. Keep everything a team needs to operate, run status included, out of that file: those grants come from a metastore admin.
