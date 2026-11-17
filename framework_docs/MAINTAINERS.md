@@ -6,11 +6,18 @@ The version in [framework_lff_lib/pyproject.toml](../framework_lff_lib/pyproject
 
 The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `object_registry` row.
 
-The registry DDL in `framework_bundle/sql/framework_meta.sql` is create-only: `CREATE ... IF NOT EXISTS` for the schema, volume, and tables, and `CREATE OR REPLACE VIEW` for the views. It has no `ALTER`. Nothing has been deployed yet, so the columns are the first version. Once a catalog holds data, a column change is a migration with a plan for existing rows, and it needs its own reviewed script, not an edit dropped into that file.
+The registry DDL in `framework_bundle/sql/framework_meta.sql` runs on every `framework_bundle` deploy, so each statement must be safe to run again. Tables are `CREATE ... IF NOT EXISTS` and views `CREATE OR REPLACE VIEW`. A schema change is added below the tables as a statement that is safe to repeat:
+
+- A new column is `ALTER TABLE ... ADD COLUMNS`. The DDL task skips that statement when the column is already there.
+- A new clustering key is `ALTER TABLE ... CLUSTER BY`, at most three keys.
+- A backfill is an `UPDATE` whose `WHERE` matches only rows still missing the value, as `config` is filled on `object_current`. Never `UPDATE` the history tables.
+- A retired view is `DROP VIEW IF EXISTS`.
+
+The DDL task splits the file on `;`, so a SQL comment in it, or in `system_views.sql`, must not contain a semicolon. A test enforces this. The system-table views are in `system_views.sql` and their own `framework_system_views` job, because they need `SELECT` on `system.lakeflow`, `system.billing`, and `system.access`. Deploy only warns if that job fails.
 
 ## Deploy
 
-Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), start `framework_collector`, then `framework_ingestion` (deploy runs `registry_sync`), then each project.
+Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), start `framework_collector`, then `framework_ingestion` (deploy runs `registry_sync`), then each project. `framework_metrics` (hourly) and `framework_optimize` (daily) are scheduled by the framework bundle. `framework_metrics` finds new `<job>_event_log` tables on its next run, so a new delivery needs no change there.
 
 ```bash
 ./run.sh bundle:deploy framework_bundle <target> <profile>
@@ -35,6 +42,8 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 - Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines. The collector is the exception: its checkpoint is under the events volume because it is a job, and it lists only `*.json` so that checkpoint is not ingested.
 - Do not schedule a `VACUUM` that shortens retention.
 - Do not create a table or schema in a spec's name from a pipeline. Schemas and volumes are prepared outside the framework.
+- Do not add a Unity Catalog tag key outside `classification`, `domain`, `owner`, and `pii` to `apply_metadata` without listing it in `unity.py`. It unsets only those keys, so tags set by others stay.
+- Do not drop the `event_log` block or the `lakeflow_framework_workflow` tag from generated pipelines and jobs. `table_load_metrics` and the run views depend on them.
 
 ## Adding a source kind
 

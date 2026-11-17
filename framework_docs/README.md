@@ -122,7 +122,7 @@ quarantine: { schema: erp_quarantine}
 ## Common spec rules
 
 - `raw_to_bronze` holds the bronze table, keys, `columns`, and `rules`. Rows that fail the rules go to `<bronze table>_qrntn` in the bronze schema by default. The `quarantine` block is optional and can override `table`, `schema`, `classification`, or `pii`.
-- A column is `name`, `type`, and an optional `description`, which becomes the column comment. `classification` and `pii` on a column are only needed when they differ from the bronze table.
+- A column is `name`, `type`, and an optional `description`, which becomes the column comment in Unity Catalog. The table's and each column's `classification` and `pii`, and the table's `domain` and `owner`, become Unity Catalog tags. The job's `apply_metadata` task sets both after every refresh. `classification` and `pii` on a column are only needed when they differ from the bronze table.
 - `pii` values are `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, `pii_personal`. Omit `pii` when there is none. A `raw`, `bronze`, or `quarantine` block can override `classification` or `pii`.
 - `notify.on_failure` is who is mailed when the job fails. It defaults to the technical owner. The generated job's `email_notifications` carries the addresses of all its tables.
 - Specs do not name a catalog. Every job passes the environment's catalog (`--catalog ${var.catalog}`), so one spec deploys to dev and prod. To validate by hand: `lakeflow-framework validate <folder> --catalog <catalog>`.

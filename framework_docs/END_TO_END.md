@@ -1,6 +1,6 @@
 # Lakeflow framework, end to end
 
-The whole path in this repository, from a spec to a registry row. A team adding a table needs only the first section. The rest is for maintainers.
+The whole path in this repository, from a spec to a registry row. A team adding a table needs only the first section. The rest is for maintainers. The same flows are drawn, with every table's columns and keys, in [ARCHITECTURE.md](ARCHITECTURE.md#flows) and [its data model](ARCHITECTURE.md#data-model).
 
 ## What a team does
 
@@ -136,7 +136,7 @@ System tables remain the source for job definitions, run duration, cost, and obs
 
 ## Metrics
 
-Three sources, all in `framework_meta`:
+Pipeline event logs give row and rule counts, the system tables give run outcomes, cost, and observed lineage, and `DESCRIBE` gives table size. Everything lands in, or is viewed from, `framework_meta`:
 
 | Table or view | Built by | What it holds |
 | --- | --- | --- |

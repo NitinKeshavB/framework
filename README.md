@@ -131,6 +131,6 @@ source venv/bin/activate        # or set PYTHON to a venv's python
 
 - [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, `project.yaml`
 - [framework_docs/END_TO_END.md](framework_docs/END_TO_END.md) for the run path, quality rules, and the registry
-- [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the package boundaries and design choices
+- [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the flows, the data model of every table the framework writes, the module boundaries, and the design choices
 - [framework_docs/MAINTAINERS.md](framework_docs/MAINTAINERS.md) for versioning, deploy, and what not to change
 - [framework_docs/ROADMAP.md](framework_docs/ROADMAP.md) for what is built, phase 1, and what is not verified

@@ -10,6 +10,7 @@ What is built, what phase 1 covers, and what has not been verified.
 | Ingestion kinds | `sftp_files` and `sharepoint_files` (raw volume to bronze), `database` (PostgreSQL, Azure SQL, SQL Server, DB2 through a foreign catalog, to bronze), and the original `cloud_files` path, which is frozen: the code is kept but validation rejects `autoloader`, `copy_into`, and `ctas` until they run end to end on serverless |
 | Config-driven output | One pipeline and one job per delivery, plus `SOURCE_MAP.md`, generated from `source.yaml` and the table specs |
 | Registry | Workflow, pipeline, dataflow, flow, securable, link, and column definitions. Job run steps with `RUNNING` / `SUCCEEDED` / `FAILED`. Views for definitions, lineage, history, and `v_job_status`. Load metrics in `table_load_metrics`, and job, task, and pipeline runs with cost from the system tables. |
+| Unity Catalog metadata | `apply_metadata` after each refresh sets table and column tags (`classification`, `domain`, `owner`, `pii`) and column comments from the spec, changing only what differs. `v_metadata_drift` and `v_observed_lineage` compare the registry with Unity Catalog and `system.access`. |
 | Ownership | Bronze is owned by its source system. `requested_by` and `delivery` are recorded. The collector refuses a second owner. `v_ownership_conflicts` is empty when the rules hold. |
 | Curation structure | `framework_curation/<domain>/<project>/project.yaml` with silver, gold, and data products, reference and ownership checks, `PROJECT_MAP.md` and `PROJECTS_INDEX.md` |
 | Scaffolding | `new-source`, `new-table`, `new-project` |
@@ -29,6 +30,13 @@ What is built, what phase 1 covers, and what has not been verified.
 Start with one silver and one gold example and review the shape before building.
 
 **3. Deliberately outside the framework (owned by each domain).** Schemas and the raw volume exist before a deploy. The framework does not create them. The catalog, the foreign catalogs, and the external locations also exist already.
+
+## Still open from the framework review
+
+- **A leaner run path.** Each delivery job writes `RUNNING`, syncs, and waits for the collector before the pipeline starts, then writes `SUCCEEDED` or `FAILED`. The proposal is to drop `mark_running`, `sync`, `await_registry`, `record_success`, and `record_failure`, pass the specs to the pipeline in its configuration, take run outcomes from the system tables, and make `registry_sync` the only definition writer. If the collector stays, it should stage each batch once and keep `recorded_at` out of the hashed body. Not designed in detail yet.
+- **Production settings.** Every bundle's `prod` target still uses the `aal_dev_fdh` catalog, and no target sets `run_as`. Set the prod catalog and a service principal before a production deploy.
+- **Large database tables.** An `incremental_column` would let a `database` load read only rows newer than the last load instead of the whole table. Not decided.
+- **Archiving loaded files.** Auto Loader's `cleanSource` could move or delete files after they load. Not decided; the raw volume currently keeps every file.
 
 ## Next after phase 1
 
@@ -50,3 +58,6 @@ Listed in [END_TO_END.md](END_TO_END.md#checked-on-a-real-workspace). The first 
 - A table has one owner. Another project or team reads it.
 - Specs carry no catalog; jobs pass the environment's.
 - Silver, gold, and data-product transforms are phase 1, not MVP.
+- Each source is read once, into a private staging table. Bronze holds only clean rows; quarantine keeps the failing rows with `failed_rules`.
+- Row counts come from pipeline event logs, run outcomes and cost from the system tables. The registry holds definitions, owners, and job steps.
+- Unity Catalog tags are plain tags, and column comments are applied with `ALTER` after each refresh.
