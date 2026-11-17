@@ -158,6 +158,12 @@ def test_resource_keys_are_unique_and_the_job_refreshes_its_pipeline(bundle: Pat
     assert pipeline_key != "billing_daily"  # the job's key
     refresh = _tasks(bundle)["refresh_pipeline"]
     assert refresh["pipeline_task"]["pipeline_id"] == f"${{resources.pipelines.{pipeline_key}.id}}"
+    assert pipelines["resources"]["pipelines"][pipeline_key]["event_log"] == {
+        "catalog": "${var.catalog}",
+        "schema": "framework_meta",
+        "name": "billing_daily_event_log",
+    }
+    assert _job(bundle)["tags"] == {"lakeflow_framework_workflow": "billing_daily"}
 
 
 def test_check_fails_when_a_table_is_added_without_regenerating(bundle: Path) -> None:
@@ -710,4 +716,26 @@ def test_deploy_updates_the_registry(tmp_path: Path) -> None:
         "bundle validate -t dev --profile prof",
         "bundle deploy -t dev --profile prof",
         "bundle run framework_ddl -t dev --profile prof",
+        "bundle run framework_system_views -t dev --profile prof",
     ]
+
+
+def test_deploy_warns_when_the_system_views_cannot_be_created(tmp_path: Path) -> None:
+    """Without grants on the system tables the registry still deploys."""
+
+    binary = tmp_path / "databricks"
+    binary.write_text(
+        '#!/bin/sh\ncase "$*" in *framework_system_views*) exit 1;; esac\n', encoding="utf-8"
+    )
+    binary.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    result = subprocess.run(
+        ["bash", "./run.sh", "bundle:deploy", "framework_bundle", "dev"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "framework_system_views failed" in result.stderr

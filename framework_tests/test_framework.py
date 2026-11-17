@@ -13,6 +13,7 @@ from lakeflow_framework.cli import main
 from lakeflow_framework.collector import (
     _cast,
     append_definitions,
+    apply_ddl,
     await_registered,
     event_statements,
 )
@@ -21,7 +22,6 @@ from lakeflow_framework.load import get_strategy
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
     OBJECT_COLUMNS,
-    build_recon,
     current_objects_sql,
     ddl_statements,
     ingest_steps,
@@ -400,14 +400,12 @@ def test_registry_hash_is_stable_and_steps_do_not_duplicate():
         step_no=50,
         step_name="record_success",
         status="SUCCEEDED",
-        recon=build_recon(source_count=10, inserted=8, updated=1, rejected=1),
     )
     keys: set = set()
     assert len(ingest_steps([running, success], keys)) == 2
     assert ingest_steps([success], keys) == []
     assert step_file_name(running).endswith("100_10_RUNNING.json")
-    assert build_recon(source_count=10, inserted=3, rejected=1)["recon_result"] == "mismatch"
-    assert build_recon(source_count=10, output_rows=9, rejected=1)["recon_result"] == "matched"
+    assert "recon" not in success and "recon_json" not in success
 
 
 def test_pipeline_wiring_uses_auto_cdc_only_when_dedup_is_on():
@@ -500,9 +498,13 @@ def test_current_lookup_prunes_by_owner_kind_and_name():
 def test_ddl_clusters_both_tables_and_names_the_catalog():
     statements = ddl_statements("framework_dev")
     text = "\n".join(statements)
-    assert "CLUSTER BY (owner, object_kind, full_name, recorded_at)" in text
+    assert "CLUSTER BY (owner, object_kind, full_name)" in text
     assert "delta.autoOptimize.autoCompact" in text
-    assert "CLUSTER BY (owner, event_date, full_name, run_id)" in text
+    assert "CLUSTER BY (owner, event_date, run_id)" in text
+    keys = [
+        line.split("(", 1)[1].rstrip(")") for line in text.splitlines() if "CLUSTER BY (" in line
+    ]
+    assert keys and all(len(key.split(",")) <= 3 for key in keys)
     assert "'delta.autoOptimize.autoCompact' = 'false'" in text
     assert "v_ownership_conflicts" in text
     assert "project" not in text.replace("project for silver", "")
@@ -520,8 +522,17 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     current_view = next(statement for statement in statements if "v_object_current" in statement)
     assert "object_current" in current_view
     assert "QUALIFY" not in current_view
-    recon = next(statement for statement in statements if "v_recon" in statement)
-    assert "date_sub(current_date(), 7)" in recon
+    assert "DROP VIEW IF EXISTS framework_dev.framework_meta.v_recon" in text
+    assert "CREATE OR REPLACE VIEW framework_dev.framework_meta.v_recon" not in text
+    run_current = next(
+        statement
+        for statement in statements
+        if "VIEW" in statement and "v_run_current AS" in statement
+    )
+    assert "date_sub" not in run_current
+    assert "get_json_object" not in text
+    assert "config:pipeline_ids::ARRAY<STRING>" in text
+    assert "framework_meta.table_health" in text
     history = text.split("v_object_history", 1)[1]
     assert "PARTITION BY owner_kind, owner, object_kind, full_name" in history
     assert "CREATE BLOOMFILTER INDEX" not in text
@@ -531,8 +542,12 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "valid_to" in text
     assert "is_current" in text
     assert not any(statement.upper().startswith("DELETE") for statement in statements)
-    assert not any(statement.upper().startswith("UPDATE") for statement in statements)
-    assert _column_list(text, "object_registry") == list(OBJECT_COLUMNS)
+    # Only object_current, which is not history, is updated: its older rows get config parsed.
+    updates = [statement for statement in statements if statement.upper().startswith("UPDATE")]
+    assert [statement.split()[1] for statement in updates] == [
+        "framework_dev.framework_meta.object_current"
+    ]
+    assert _column_list(text, "object_registry") == [*OBJECT_COLUMNS, "config"]
     assert _column_list(text, "run_ledger") == list(LEDGER_COLUMNS)
 
 
@@ -717,36 +732,52 @@ def test_definition_files_are_one_file_per_owner(tmp_path: Path):
     assert again == written
 
 
-def test_cli_writes_a_step_file_with_recon(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    code = main(
-        [
-            "step",
-            "--owner",
-            "billing",
-            "--object-kind",
-            "workflow",
-            "--full-name",
-            "billing_daily",
-            "--run-id",
-            "100",
-            "--step-no",
-            "50",
-            "--step-name",
-            "record_success",
-            "--status",
-            "SUCCEEDED",
-            "--recon-json",
-            '{"source_count": 10, "output_rows": 9, "rejected": 1}',
-            "--out",
-            str(tmp_path),
-        ]
-    )
-    assert code == 0
+def test_cli_writes_a_step_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    arguments = [
+        "step",
+        "--owner",
+        "billing",
+        "--object-kind",
+        "workflow",
+        "--full-name",
+        "billing_daily",
+        "--run-id",
+        "100",
+        "--step-no",
+        "50",
+        "--step-name",
+        "record_success",
+        "--status",
+        "SUCCEEDED",
+        "--out",
+        str(tmp_path),
+    ]
+    assert main(arguments) == 0
     payload = json.loads(Path(capsys.readouterr().out.strip()).read_text(encoding="utf-8"))
     assert payload["object_kind"] == "workflow"
     assert payload["full_name"] == "billing_daily"
-    assert payload["recon"]["source_count"] == 10
-    assert payload["recon"]["rejected"] == 1
+    assert "recon_json" not in payload
+    # Load counts come from table_load_metrics now, so the step no longer takes them.
+    with pytest.raises(SystemExit):
+        main([*arguments, "--recon-json", "{}"])
+
+
+def test_a_step_file_written_with_counts_still_lands():
+    row = ingest_steps(
+        [
+            {
+                "run_id": "1",
+                "step_no": 50,
+                "status": "SUCCEEDED",
+                "full_name": "billing_daily",
+                "owner_kind": "source_system",
+                "owner": "billing",
+                "step_name": "record_success",
+                "recon_json": '{"source_count": 10}',
+            }
+        ]
+    )[0]
+    assert row["recon_json"] == '{"source_count": 10}'
 
 
 def _registry_polls(*answers: list[dict]):
@@ -1049,6 +1080,11 @@ def test_collector_bounds_the_micro_batch():
         if statement.startswith("INSERT INTO framework_dev.framework_meta.object_registry")
     )
     assert "NOT EXISTS" in history and "h.content_hash = a.content_hash" in history
+    # Columns are named, so a column added to an older table cannot shift the insert.
+    assert history.startswith(
+        "INSERT INTO framework_dev.framework_meta.object_registry (object_kind, full_name, "
+    )
+    assert "parse_json(e.config_json) AS config" in history
     current = next(
         statement
         for statement in statements
@@ -1099,6 +1135,51 @@ def test_a_retried_definition_repairs_the_current_row_without_a_second_history_r
     assert append_definitions(Spark(), [row], set(), "framework_dev") == 0
     assert inserted == []
     assert merged == [[row]]
+
+
+def test_ddl_skips_a_column_the_table_already_has_and_raises_other_errors():
+    ran: list[str] = []
+
+    class Spark:
+        def __init__(self, failure: str):
+            self.failure = failure
+
+        def sql(self, statement):
+            ran.append(statement)
+            if "ADD COLUMNS" in statement:
+                raise RuntimeError(self.failure)
+
+    apply_ddl(Spark("[FIELD_ALREADY_EXISTS] Cannot add column config"), "framework_dev")
+    assert sum("ADD COLUMNS" in statement for statement in ran) == 2
+    assert any("v_bronze_tables" in statement for statement in ran)
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        apply_ddl(Spark("PERMISSION_DENIED"), "framework_dev")
+
+
+def test_definitions_written_from_python_parse_config_to_variant():
+    statements: list[str] = []
+
+    class Frame:
+        def createOrReplaceTempView(self, _name):
+            pass
+
+    class Spark:
+        def createDataFrame(self, _rows, _schema):
+            return Frame()
+
+        def sql(self, statement):
+            statements.append(statement)
+
+    from lakeflow_framework.collector import OBJECT_DERIVED, _insert, _merge_current
+
+    row = _owned_row()
+    _insert(Spark(), "t", [row], OBJECT_COLUMNS, derived=OBJECT_DERIVED)
+    _merge_current(Spark(), "c", [row], OBJECT_COLUMNS, ("object_kind",), derived=OBJECT_DERIVED)
+    insert, merge = statements
+    assert insert.startswith("INSERT INTO t (object_kind, ")
+    assert "recorded_at, config) SELECT" in insert
+    assert "parse_json(config_json) AS config" in insert
+    assert "t.config = s.config" in merge
 
 
 def test_an_unsafe_name_is_not_inserted_by_skipping_the_check():

@@ -5,7 +5,7 @@
 Folders at the repository root start with `framework_`.
 
 - `framework_lff_lib` is the wheel. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`.
-- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql`, the DDL job, the collector, and daily `OPTIMIZE`.
+- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL job, the collector, the `framework_metrics` pipeline, and daily `OPTIMIZE` and table health.
 - `framework_ingestion` is source to bronze: source systems, table specs, and the pipelines and jobs generated from them.
 - `framework_curation/<domain>/<project>` is one bundle per project for silver, gold, and data products.
 - `framework_examples/ingestion` is the set of specs to copy for each source kind. `framework_examples/consumer` is the original single-bundle example and is reference only.
@@ -61,6 +61,7 @@ erDiagram
     string content_hash
     string source
     timestamp recorded_at
+    variant config
   }
   run_ledger {
     string run_id
@@ -81,7 +82,7 @@ erDiagram
   }
 ```
 
-`object_registry` is clustered by `(owner, object_kind, full_name, recorded_at)`. `run_ledger` is clustered by `(owner, event_date, full_name, run_id)`.
+`object_registry` is clustered by `(owner, object_kind, full_name)`. `run_ledger` is clustered by `(owner, event_date, run_id)`. `config` is `config_json` parsed to `VARIANT`. `recon_json` is no longer written.
 
 ## Registry, logical
 
@@ -108,7 +109,7 @@ erDiagram
 | `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, domain, classification, PII |
 | `link` | `<pipeline_id>-><table>` | pipeline | `writes` or `rejects_to` | Child table name |
 | `column` | `<table>.<column>` | table name | `column_of` | Ordinal, type, description, classification, PII |
-| `run_ledger` step | the job name | none | none | Status `RUNNING` / `SUCCEEDED` / `FAILED`, step name, optional recon |
+| `run_ledger` step | the job name | none | none | Status `RUNNING` / `SUCCEEDED` / `FAILED`, step name, failure text |
 
 A file source whose raw layer is a volume still has a `raw` flow. That flow records the volume path and has no securable. A `cloud_files` raw flow has a securable, because its raw layer is a Delta table. A database load has no raw flow. Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
 
@@ -138,13 +139,12 @@ flowchart TD
   v_object_history --> v_column_history
   run_ledger --> run_current
   run_ledger --> v_process
-  run_ledger --> v_recon
   run_current --> v_run_current
   v_workflows --> v_job_status
   v_run_current --> v_job_status
 ```
 
-`v_lineage` is the current `link` row for each parent, child, and relation. `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` parses `recon_json` on `record_success` steps from the last 7 days. `v_run_current` is `run_current` for those 7 days. `v_job_status` joins each workflow to that latest step. `v_ownership_conflicts` lists a current name with more than one owner. Job run steps are stored with `object_kind = workflow` and `full_name = job_name`.
+`v_lineage` is the current `link` row for each parent, child, and relation. `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, and `v_columns` read `v_object_current` and read fields with `config:path`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_run_current` is `run_current`, every job's latest step however long ago it ran. `v_job_status` joins each workflow to that latest step. `v_ownership_conflicts` lists a current name with more than one owner. Job run steps are stored with `object_kind = workflow` and `full_name = job_name`.
 
 `v_object_history` windows by `owner_kind`, `owner`, `object_kind`, and `full_name`. Filter those columns, and `owner` in particular, or the window reads every version in the table. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row.
 
@@ -164,7 +164,7 @@ flowchart TD
 
 **Quality rules are functions from config to SQL.** The template does not know how a not-null rule was produced.
 
-**The registry is two tables.** Attributes and relationships are columns on `object_registry`. Run steps, failure text, and reconciliation are rows in `run_ledger`.
+**The registry is two tables.** Attributes and relationships are columns on `object_registry`. Run steps and failure text are rows in `run_ledger`. Load counts come from each pipeline's event log, in `table_load_metrics`.
 
 **Auto Loader options are a fixed map.** A format allow-list, `max_files_per_trigger` (1000 when the spec omits it), JSON `multiline` only when the spec sets it, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`. Each table lists its path once, in the dataset that checks the rules. Quarantine reads that dataset, not the path. CSV, delimited text, and JSON get `cloudFiles.schemaHints` from `columns`, and `source.file_events: true` sets `cloudFiles.useManagedFileEvents`.
 

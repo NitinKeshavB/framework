@@ -444,7 +444,6 @@ def step_payload(
     object_kind: str = "pipeline",
     parent_run_id: str | None = None,
     failure_reason: str | None = None,
-    recon: Mapping[str, Any] | None = None,
     started_at: str | None = None,
     ended_at: str | None = None,
 ) -> dict[str, Any]:
@@ -466,8 +465,6 @@ def step_payload(
         "started_at": started_at,
         "ended_at": ended_at,
         "failure_reason": failure_reason,
-        "recon": dict(recon) if recon else None,
-        "recon_json": json.dumps(recon, sort_keys=True) if recon else None,
         "recorded_at": _now(),
     }
 
@@ -501,9 +498,8 @@ def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
         "started_at": payload.get("started_at"),
         "ended_at": payload.get("ended_at"),
         "failure_reason": payload.get("failure_reason"),
-        "recon_json": json.dumps(payload["recon"], sort_keys=True)
-        if payload.get("recon")
-        else payload.get("recon_json"),
+        # Step files written before load counts moved to table_load_metrics can carry this.
+        "recon_json": payload.get("recon_json"),
         "recorded_at": recorded,
         "event_date": recorded[:10],
     }
@@ -526,49 +522,6 @@ def ingest_steps(
         seen_keys.add(key)
         rows.append(ledger_row(payload))
     return rows
-
-
-def build_recon(
-    *,
-    source_files: list[dict[str, Any]] | None = None,
-    source_count: int | None = None,
-    inserted: int | None = None,
-    updated: int | None = None,
-    deleted: int | None = None,
-    output_rows: int | None = None,
-    rejected: int | None = None,
-    target_records: dict[str, int] | None = None,
-) -> dict[str, Any]:
-    arrived = source_count
-    if arrived is None and source_files:
-        arrived = sum(int(item.get("record_count") or 0) for item in source_files)
-    if inserted is None and updated is None:
-        landed = (output_rows or 0) + (rejected or 0)
-        comparable = output_rows is not None or rejected is not None
-    else:
-        landed = (inserted or 0) + (updated or 0) + (rejected or 0)
-        comparable = True
-    if arrived is None or not comparable:
-        result = "unknown"
-        detail = "source count or target metrics are missing"
-    elif arrived == landed:
-        result = "matched"
-        detail = f"source {arrived} equals landed {landed}"
-    else:
-        result = "mismatch"
-        detail = f"source {arrived} does not equal landed {landed}"
-    return {
-        "source_files": source_files or [],
-        "source_count": arrived,
-        "inserted": inserted,
-        "updated": updated,
-        "deleted": deleted,
-        "output_rows": output_rows,
-        "rejected": rejected,
-        "target_records": target_records or {},
-        "recon_result": result,
-        "detail": detail,
-    }
 
 
 def registered_sql(pipeline_ids: list[str], catalog: str) -> str:

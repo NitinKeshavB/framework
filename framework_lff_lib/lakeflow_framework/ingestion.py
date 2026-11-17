@@ -55,6 +55,9 @@ WHEEL = "../../framework_lff_lib/dist/*.whl"
 ENVIRONMENT_VERSION = "4"
 # Scheduled and file-triggered batch loads have no deadline, so they take the cheaper mode.
 PERFORMANCE_TARGET = "STANDARD"
+# Each pipeline publishes its event log to framework_meta as <job name><suffix>.
+EVENT_LOG_SUFFIX = "_event_log"
+WORKFLOW_TAG = "lakeflow_framework_workflow"
 # How long a job waits for the collector to register its pipelines before the run fails.
 REGISTRY_WAIT_SECONDS = 900
 EVENTS = "/Volumes/${var.catalog}/framework_meta/framework_events"
@@ -293,6 +296,12 @@ def _pipeline_resource(name: str) -> dict[str, Any]:
                     "serverless": True,
                     "channel": "current",
                     "continuous": False,
+                    # framework_metrics finds the logs by this name and reads the job name from it.
+                    "event_log": {
+                        "catalog": "${var.catalog}",
+                        "schema": "framework_meta",
+                        "name": f"{name}{EVENT_LOG_SUFFIX}",
+                    },
                     "libraries": [{"file": {"path": f"../pipelines/{name}.py"}}],
                     # A pipeline does not accept whl libraries, and the CLI does not rewrite a
                     # local path in its pip dependencies, so name the wheel `bundle deploy` uploads.
@@ -395,7 +404,8 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         )
     )
 
-    job: dict[str, Any] = {"name": name}
+    # Deployed names carry a dev or prod prefix, so the run views join system tables on this tag.
+    job: dict[str, Any] = {"name": name, "tags": {WORKFLOW_TAG: name}}
     notes = email_notifications(configs)
     if notes:
         job["email_notifications"] = {**notes, "no_alert_for_skipped_runs": True}

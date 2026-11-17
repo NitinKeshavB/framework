@@ -26,6 +26,10 @@ from lakeflow_framework.pipeline import MetadataNotFound
 
 RUN_KEYS = ("owner_kind", "owner", "object_kind", "full_name")
 OBJECT_KEYS = ("object_kind", "full_name")
+# Columns the collector computes from the event columns rather than reads from an event file.
+OBJECT_DERIVED = {"config": "parse_json(config_json)"}
+OBJECT_TABLE_COLUMNS = (*OBJECT_COLUMNS, *OBJECT_DERIVED)
+_ALREADY_EXISTS = ("FIELD_ALREADY_EXISTS", "already exists")
 _STEP_TYPES = {
     "timestamp_columns": ("started_at", "ended_at", "recorded_at"),
     "date_columns": ("event_date",),
@@ -43,7 +47,19 @@ def apply_ddl(spark, catalog: str, text: str | None = None) -> None:
             except Exception:
                 continue
             continue
+        if _adds_columns(statement):
+            # ADD COLUMNS has no IF NOT EXISTS, and a new table already has the column.
+            try:
+                spark.sql(statement)
+            except Exception as exc:
+                if not any(marker in str(exc) for marker in _ALREADY_EXISTS):
+                    raise
+            continue
         spark.sql(statement)
+
+
+def _adds_columns(statement: str) -> bool:
+    return bool(re.match(r"ALTER\s+TABLE\s+\S+\s+ADD\s+COLUMNS?\b", statement, re.IGNORECASE))
 
 
 def append_steps(spark, payloads: list[dict], seen: set | None = None, catalog: str = "") -> int:
@@ -112,6 +128,7 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
             to_insert,
             OBJECT_COLUMNS,
             timestamp_columns=("recorded_at",),
+            derived=OBJECT_DERIVED,
         )
     _merge_current(
         spark,
@@ -120,6 +137,7 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
         OBJECT_COLUMNS,
         OBJECT_KEYS,
         timestamp_columns=("recorded_at",),
+        derived=OBJECT_DERIVED,
     )
     for row in fresh:
         held.difference_update(
@@ -253,15 +271,24 @@ def _merge_current(
     date_columns: tuple[str, ...] = (),
     int_columns: tuple[str, ...] = (),
     newer_than: str | None = None,
+    derived: Mapping[str, str] | None = None,
 ) -> None:
     """Replace the one current row for each key. History tables are not updated."""
 
     if not rows or spark is None or not hasattr(spark, "createDataFrame"):
         return
     staged = _stage(
-        spark, "_framework_current", rows, columns, timestamp_columns, date_columns, int_columns
+        spark,
+        "_framework_current",
+        rows,
+        columns,
+        timestamp_columns,
+        date_columns,
+        int_columns,
+        derived or {},
     )
-    spark.sql(_merge_sql(table, staged, keys, columns, newer_than))
+    written = (*columns, *(derived or {}))
+    spark.sql(_merge_sql(table, staged, keys, written, newer_than))
 
 
 def _insert(
@@ -272,11 +299,20 @@ def _insert(
     timestamp_columns: tuple[str, ...] = (),
     date_columns: tuple[str, ...] = (),
     int_columns: tuple[str, ...] = (),
+    derived: Mapping[str, str] | None = None,
 ) -> int:
     staged = _stage(
-        spark, "_framework_append", rows, columns, timestamp_columns, date_columns, int_columns
+        spark,
+        "_framework_append",
+        rows,
+        columns,
+        timestamp_columns,
+        date_columns,
+        int_columns,
+        derived or {},
     )
-    spark.sql(f"INSERT INTO {table} {staged}")
+    written = ", ".join((*columns, *(derived or {})))
+    spark.sql(f"INSERT INTO {table} ({written}) {staged}")
     return len(rows)
 
 
@@ -288,6 +324,7 @@ def _stage(
     timestamp_columns: tuple[str, ...],
     date_columns: tuple[str, ...],
     int_columns: tuple[str, ...],
+    derived: Mapping[str, str],
 ) -> str:
     """Register ``rows`` as a string-typed view and return the SELECT that types them."""
 
@@ -300,7 +337,8 @@ def _stage(
     schema = StructType([StructField(column, StringType(), True) for column in columns])
     spark.createDataFrame(string_rows, schema).createOrReplaceTempView(view)
     select = ", ".join(
-        _cast(column, timestamp_columns, date_columns, int_columns) for column in columns
+        [_cast(column, timestamp_columns, date_columns, int_columns) for column in columns]
+        + [f"{expression} AS {column}" for column, expression in derived.items()]
     )
     return f"SELECT {select} FROM {view}"
 
@@ -428,9 +466,13 @@ def event_statements(catalog: str) -> list[str]:
         f"{meta}.run_current", refused, RUN_KEYS, LEDGER_COLUMNS, "recorded_at"
     )
     definition_columns = ", ".join(
-        f"{recorded} AS recorded_at" if column == "recorded_at" else f"e.{column}"
-        for column in OBJECT_COLUMNS
+        [
+            f"{recorded} AS recorded_at" if column == "recorded_at" else f"e.{column}"
+            for column in OBJECT_COLUMNS
+        ]
+        + ["parse_json(e.config_json) AS config"]
     )
+    object_columns = ", ".join(OBJECT_TABLE_COLUMNS)
     accepted = (
         f"SELECT {definition_columns} "
         f"FROM ({latest_definition}) e "
@@ -441,8 +483,8 @@ def event_statements(catalog: str) -> list[str]:
         f"AND NOT (c.full_name IS NOT NULL AND {other_owner})"
     )
     object_insert = (
-        f"INSERT INTO {meta}.object_registry "
-        f"SELECT {', '.join(OBJECT_COLUMNS)} FROM ({accepted}) a "
+        f"INSERT INTO {meta}.object_registry ({object_columns}) "
+        f"SELECT {object_columns} FROM ({accepted}) a "
         f"WHERE NOT EXISTS ("
         f"SELECT 1 FROM {meta}.object_registry h "
         f"WHERE h.owner = a.owner AND h.object_kind = a.object_kind "
@@ -450,7 +492,7 @@ def event_statements(catalog: str) -> list[str]:
         f"AND h.recorded_at = a.recorded_at)"
     )
     object_merge = _merge_sql(
-        f"{meta}.object_current", accepted, OBJECT_KEYS, OBJECT_COLUMNS, "recorded_at"
+        f"{meta}.object_current", accepted, OBJECT_KEYS, OBJECT_TABLE_COLUMNS, "recorded_at"
     )
     return [
         ledger_insert,

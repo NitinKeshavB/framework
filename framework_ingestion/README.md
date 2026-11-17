@@ -6,7 +6,7 @@ Domain-owned ingestion into bronze. Projects do not own anything here. Any team 
 
 | Bundle | Holds | Owner |
 | --- | --- | --- |
-| `framework_bundle` | The registry (`framework_meta`), the collector, and `OPTIMIZE` | Platform team |
+| `framework_bundle` | The registry (`framework_meta`), the collector, load metrics, and `OPTIMIZE` | Platform team |
 | `framework_ingestion` (this one) | Source to bronze | Domain, per source system |
 | `framework_curation/<domain>/<project>` | Silver, gold, and data products | One project each |
 

@@ -8,6 +8,10 @@ resources:
       serverless: true
       channel: current
       continuous: false
+      event_log:
+        catalog: ${var.catalog}
+        schema: framework_meta
+        name: abs_daily_event_log
       libraries:
       - file:
           path: ../pipelines/abs_daily.py

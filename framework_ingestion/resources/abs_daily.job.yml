@@ -3,6 +3,8 @@ resources:
   jobs:
     abs_daily:
       name: abs_daily
+      tags:
+        lakeflow_framework_workflow: abs_daily
       email_notifications:
         on_failure:
         - nitinkeshav.bolla@allianz.com.au

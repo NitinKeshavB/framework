@@ -20,6 +20,28 @@ resources:
       queue:
         enabled: true
 
+    # Needs SELECT on system.lakeflow and system.billing, so it is apart from framework_ddl:
+    # without those grants the registry still deploys.
+    framework_system_views:
+      name: framework_system_views
+      performance_target: STANDARD
+      tasks:
+        - task_key: apply_system_views
+          environment_key: framework_env
+          spark_python_task:
+            python_file: ../src/apply_ddl.py
+            parameters:
+              - ${var.catalog}
+              - ${workspace.file_path}/sql/system_views.sql
+      environments:
+        - environment_key: framework_env
+          spec:
+            environment_version: "4"
+            dependencies:
+              - ../../framework_lff_lib/dist/*.whl
+      queue:
+        enabled: true
+
     framework_collector:
       name: framework_collector
       continuous:
@@ -51,9 +73,42 @@ resources:
             python_file: ../src/optimize_registry.py
             parameters:
               - ${var.catalog}
+        - task_key: table_health
+          environment_key: framework_env
+          spark_python_task:
+            python_file: ../src/record_table_health.py
+            parameters:
+              - ${var.catalog}
       environments:
         - environment_key: framework_env
           spec:
             environment_version: "4"
             dependencies:
               - ../../framework_lff_lib/dist/*.whl
+
+    framework_metrics:
+      name: framework_metrics
+      performance_target: STANDARD
+      schedule:
+        quartz_cron_expression: "0 30 * * * ?"
+        timezone_id: UTC
+      tasks:
+        - task_key: refresh_metrics
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.framework_metrics_pipeline.id}
+      queue:
+        enabled: true
+
+  pipelines:
+    framework_metrics_pipeline:
+      name: framework_metrics
+      catalog: ${var.catalog}
+      schema: framework_meta
+      serverless: true
+      channel: current
+      continuous: false
+      configuration:
+        lakeflow_framework.catalog: ${var.catalog}
+      libraries:
+        - file:
+            path: ../src/framework_metrics.py

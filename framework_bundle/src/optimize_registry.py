@@ -1,4 +1,7 @@
-"""Daily compaction for the two registry tables. This does not delete process history."""
+"""Daily compaction for the registry tables. This does not delete process history.
+
+With predictive optimization on for the catalog, these OPTIMIZE runs find little to do.
+"""
 
 import sys
 
@@ -12,6 +15,7 @@ def main() -> None:
     spark.sql(f"OPTIMIZE {catalog}.framework_meta.run_ledger")
     spark.sql(f"OPTIMIZE {catalog}.framework_meta.object_current")
     spark.sql(f"OPTIMIZE {catalog}.framework_meta.run_current")
+    spark.sql(f"OPTIMIZE {catalog}.framework_meta.table_health")
 
 
 if __name__ == "__main__":

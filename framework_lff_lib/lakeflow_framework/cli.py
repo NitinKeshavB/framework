@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -80,7 +79,6 @@ def main(argv: list[str] | None = None) -> int:
     step.add_argument("--out", type=Path, required=True)
     step.add_argument("--failure-reason")
     step.add_argument("--parent-run-id")
-    step.add_argument("--recon-json")
 
     waiting = commands.add_parser(
         "await-registry", help="wait until the registry holds the version of each spec synced"
@@ -180,10 +178,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"registry has the synced {', '.join(expected)}")
             return 0
         if args.command == "step":
-            recon = json.loads(args.recon_json) if args.recon_json else None
-            if recon is not None and not isinstance(recon, dict):
-                print("recon-json must be a JSON object", file=sys.stderr)
-                return 1
             payload = step_payload(
                 owner=args.owner,
                 owner_kind=args.owner_kind,
@@ -195,7 +189,6 @@ def main(argv: list[str] | None = None) -> int:
                 status=args.status,
                 failure_reason=args.failure_reason,
                 parent_run_id=args.parent_run_id,
-                recon=recon,
             )
             path = write_step_file(args.out, payload)
             print(path)
@@ -210,9 +203,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except MetadataNotFound as exc:
         print(str(exc), file=sys.stderr)
-        return 1
-    except json.JSONDecodeError:
-        print("recon-json must be a JSON object", file=sys.stderr)
         return 1
     except StopIteration:
         print(f"pipeline {args.pipeline} was not in the validated files", file=sys.stderr)

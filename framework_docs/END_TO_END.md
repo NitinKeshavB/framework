@@ -31,7 +31,7 @@ The job writes small JSON files at each step. It does not write the registry tab
 3. **await_registry** waits until `v_object_current` has the content hash that sync just recorded for each pipeline. A row with an older hash means the spec is out of date, so the job keeps waiting.
 4. **batch_load** runs only for `cloud_files` tables that use `copy_into` or `ctas`. Those methods are not in the MVP, so no generated job has this task yet.
 5. **refresh_pipeline** runs the Lakeflow pipeline. `build_pipeline` reads each spec back from the registry. A missing row is an error.
-6. **record_success** writes `SUCCEEDED` and can carry counts (`--recon-json`). **record_failure** writes `FAILED` if any earlier task fails, including a failed success step.
+6. **record_success** writes `SUCCEEDED`. **record_failure** writes `FAILED` if any earlier task fails, including a failed success step. Load counts are not in the step: they come from the pipeline event log, in `table_load_metrics`.
 
 Files land in `/Volumes/<catalog>/framework_meta/framework_events` as `<owner_kind>/<owner>/<full_name>/<run_id>_<step_no>_<status>.json`, and definitions under `<owner_kind>/<owner>/definitions/`. The collector lands those files. It is paused by default; start it after the first framework deploy so run steps reach the ledger.
 
@@ -78,9 +78,9 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 ## The registry
 
-Four tables in `<catalog>.framework_meta`. `object_registry` and `run_ledger` are the history and stay insert-only. `object_current` and `run_current` hold one row per key so a job status check does not window that history. The collector merges those two. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
+Four registry tables in `<catalog>.framework_meta`. `object_registry` and `run_ledger` are the history and stay insert-only. `object_current` and `run_current` hold one row per key so a job status check does not window that history. The collector merges those two. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
 
-`object_registry` catalogs every definition the job syncs:
+`object_registry` catalogs every definition the job syncs. Each row keeps the definition as `config_json`, the text its `content_hash` covers, and as `config`, the same document parsed to `VARIANT`; the views read `config:path`. `framework_ddl` adds `config` to tables created before it existed and fills it on `object_current`. Older history rows are read through `parse_json(config_json)`.
 
 | Kind | What it is |
 | --- | --- |
@@ -96,7 +96,7 @@ A new row is written when that object's own hash changes, so a job rename versio
 
 Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `owner` is its name. Bronze rows are owned by the source system. `requested_by` is the team that asked for the table and `delivery` is how its source delivers. They are for the maps and do not affect ownership.
 
-`run_ledger` is one row per step: number, name, status (`RUNNING`, `SUCCEEDED`, `FAILED`), start, end, and failure text. Delivery jobs file steps with `object_kind = workflow` and `full_name = <job_name>`. The success step can carry `recon_json`: counts, inserted, updated, deleted, output rows, rejected, and `matched` or `mismatch`. An ownership refusal is a `FAILED` `ownership_check` step on the pipeline or table that was refused.
+`run_ledger` is one row per step: number, name, status (`RUNNING`, `SUCCEEDED`, `FAILED`), start, end, and failure text. Delivery jobs file steps with `object_kind = workflow` and `full_name = <job_name>`. `recon_json` is no longer written; the column stays so older rows and step files still load. An ownership refusal is a `FAILED` `ownership_check` step on the pipeline or table that was refused.
 
 ### Ownership
 
@@ -116,10 +116,10 @@ A pipeline or table has one owner. Before inserting, the collector looks up the 
 | `v_columns`, `v_column_history` | Current and past columns of raw, bronze, and quarantine. |
 | `v_lineage` | Latest link per parent, child, and relation. |
 | `v_process` | Every step of every run. |
-| `v_run_current` | Latest step per job in the last 7 days, read from `run_current`. |
+| `v_run_current` | Latest step per job, however long ago it ran, read from `run_current`. |
 | `v_job_status` | Each workflow joined to that latest step: `RUNNING`, `SUCCEEDED`, or `FAILED`. |
-| `v_recon` | Counts on success steps from the last 7 days. Older counts stay in `run_ledger`. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
+| `v_bronze_tables` | Every bronze table and its owner. The table health step reads it. |
 
 Example: the latest status for every billing job.
 
@@ -130,7 +130,32 @@ WHERE owner = 'billing'
 ORDER BY job_name
 ```
 
-System tables remain the source for job definitions, run duration, pipeline events, and observed lineage. The collector copies the fields that would be lost when those age out or an object is dropped: the owner, the flow graph, the failure text, and the source reconciliation. Analysts query `framework_meta` only.
+System tables remain the source for job definitions, run duration, cost, and observed lineage. The collector copies the fields that would be lost when those age out or an object is dropped: the owner, the flow graph, and the failure text. Analysts query `framework_meta` only.
+
+## Metrics
+
+Three sources, all in `framework_meta`:
+
+| Table or view | Built by | What it holds |
+| --- | --- | --- |
+| `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
+| `table_load_metrics` | The `framework_metrics` pipeline, hourly | One row per job, pipeline, update, flow, and table: rows written, upserted, deleted, and dropped, each expectation's passed and failed counts, the last backlog bytes and files, status, and duration |
+| `v_job_runs` | `framework_system_views` (`system_views.sql`) | Each job run from `system.lakeflow.job_run_timeline`: result state, termination code, setup, queue, and execution seconds, and DBUs and list cost from `system.billing.usage` |
+| `v_job_task_runs` | The same | Each task run from `job_task_run_timeline`: result state and termination code |
+| `v_pipeline_updates` | The same | Each pipeline update from `pipeline_update_timeline`, with its DBUs and list cost |
+| `table_health` | `framework_optimize`, daily | Each bronze table's file count and size (`DESCRIBE DETAIL`), and its last load commit with its operation metrics (`DESCRIBE HISTORY`, skipping `OPTIMIZE` and `VACUUM`) |
+
+`framework_metrics` lists the `*_event_log` tables on every update and streams their `flow_definition` and `flow_progress` events into `flow_events`, one append flow per log, so a new delivery is picked up on the next hourly run. Quality rules are checked on the private staging table, so the expectation counts are on the row whose `layer` is `staged`; its `dataflow` is the spec's `pipeline_id`, as on the bronze row.
+
+Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). The run views match a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline on its name with or without that prefix. The system tables cover the account, so each row carries `workspace_id`. Cost is usage at list price. The identity that runs `framework_system_views` needs `SELECT` on `system.lakeflow` and `system.billing`. Deploy runs it after `framework_ddl` and only warns if it fails, so the registry deploys without those grants. Anyone who can read `framework_meta` can read these views, cost included.
+
+```sql
+-- last week's loads of one table, with the rows that failed each rule
+SELECT update_id, started_at, rows_written, rows_upserted, expectations
+FROM framework_meta.table_load_metrics
+WHERE dataflow = 'abs_orders' AND started_at >= current_date() - INTERVAL 7 DAYS
+ORDER BY started_at DESC
+```
 
 About 10,000 jobs can write status files at once because those are files, not Delta commits. The collector is the only Delta writer. Running that many pipelines at once is a workspace quota, separate from this registry.
 
@@ -138,12 +163,15 @@ About 10,000 jobs can write status files at once because those are files, not De
 
 The tables use liquid clustering:
 
-- `object_registry`: `CLUSTER BY (owner, object_kind, full_name, recorded_at)`
+- `object_registry`: `CLUSTER BY (owner, object_kind, full_name)`
 - `object_current`: `CLUSTER BY (owner, object_kind, full_name)`
-- `run_ledger`: `CLUSTER BY (owner, event_date, full_name, run_id)`
+- `run_ledger`: `CLUSTER BY (owner, event_date, run_id)`
 - `run_current`: `CLUSTER BY (owner, object_kind, full_name)`
+- `table_health`: `CLUSTER BY (owner, event_date, table_name)`
 
-All four set `delta.autoOptimize.optimizeWrite`. `autoCompact` is off: the collector commits every 30 seconds, and compacting after each commit rewrites the same files and falls behind the jobs waiting on `await_registry`. A daily job runs `OPTIMIZE`, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
+Each table clusters on at most three keys. `framework_ddl` moves tables created with four keys to these with `ALTER TABLE ... CLUSTER BY`; new writes and the next `OPTIMIZE` use them.
+
+All set `delta.autoOptimize.optimizeWrite`. `autoCompact` is off: the collector commits after every pass, about every 10 seconds while files arrive, and compacting after each commit rewrites the same files and falls behind the jobs waiting on `await_registry`. Predictive optimization, once the catalog owner enables it, compacts these tables in the background instead. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
 `v_object_history` partitions by `owner_kind`, `owner`, `object_kind`, and `full_name`. A query that filters `owner` is applied before that window. Filtering only `valid_from` cannot be, because that would change which row comes next. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
 
@@ -152,7 +180,7 @@ A sync writes one JSON-lines file per owner. An unchanged sync overwrites that s
 To see the registry as it was at a moment:
 
 ```sql
-SELECT object_kind, full_name, config_json, valid_from, valid_to
+SELECT object_kind, full_name, config, valid_from, valid_to
 FROM framework_meta.v_object_history
 WHERE owner = 'billing'
   AND valid_from <= TIMESTAMP '2026-11-08 00:00:00'
@@ -177,6 +205,9 @@ None of the following has run on Databricks. The code assumes them:
 - `DESCRIBE DETAIL` `numRecords` on streaming tables and materialized views.
 - The collector checkpoint under the events volume, with `pathGlobFilter` of `*.json` so checkpoint files are not ingested.
 - Workspace concurrency if many pipelines run together.
+- `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names `table_load_metrics` reads.
+- The system table columns the run views read: `setup_duration_seconds`, `queue_duration_seconds`, and `execution_duration_seconds` on `job_run_timeline`, `tags` on `system.lakeflow.jobs`, and `dlt_update_id` in `usage_metadata`.
+- `ALTER TABLE ... ADD COLUMNS (config VARIANT)` failing with `FIELD_ALREADY_EXISTS` on a table that has it, which the DDL task skips.
 
 If one fails, record the observed syntax here and change the single strategy or DDL statement. Do not spread a workaround across the bundles.
 

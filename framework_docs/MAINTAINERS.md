@@ -10,7 +10,7 @@ The registry DDL in `framework_bundle/sql/framework_meta.sql` is create-only: `C
 
 ## Deploy
 
-Order: `framework_bundle` (deploy runs `framework_ddl`), start `framework_collector`, then `framework_ingestion` (deploy runs `registry_sync`), then each project.
+Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), start `framework_collector`, then `framework_ingestion` (deploy runs `registry_sync`), then each project.
 
 ```bash
 ./run.sh bundle:deploy framework_bundle <target> <profile>

@@ -1,4 +1,4 @@
--- Registry for Lakeflow workflows, pipelines, flows, securables, runs, and reconciliation.
+-- Registry for Lakeflow workflows, pipelines, flows, securables, runs, and table health.
 -- ${catalog} is replaced by the DDL task. History tables are insert-only.
 -- object_current and run_current hold one row per key so a job status check does not
 -- window the history. The collector replaces those rows. The backfill below runs only
@@ -8,6 +8,10 @@
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
 -- owned by their source system. requested_by is the team that asked for a bronze table, and
 -- delivery is how its source delivers.
+--
+-- config is config_json parsed to VARIANT, so the views read it with config:path. config_json
+-- stays: content_hash is computed over that text. Rows recorded before config existed are read
+-- through parse_json(config_json).
 
 CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_meta;
 
@@ -25,14 +29,16 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
   config_json STRING,
   content_hash STRING,
   source STRING,
-  recorded_at TIMESTAMP
+  recorded_at TIMESTAMP,
+  config VARIANT
 )
-CLUSTER BY (owner, object_kind, full_name, recorded_at)
+CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'false'
 );
 
+-- recon_json is no longer written. It stays so older rows and step files still load.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
   run_id STRING,
   parent_run_id STRING,
@@ -50,7 +56,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
   recorded_at TIMESTAMP,
   event_date DATE
 )
-CLUSTER BY (owner, event_date, full_name, run_id)
+CLUSTER BY (owner, event_date, run_id)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'false'
@@ -69,7 +75,8 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_current (
   config_json STRING,
   content_hash STRING,
   source STRING,
-  recorded_at TIMESTAMP
+  recorded_at TIMESTAMP,
+  config VARIANT
 )
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
@@ -101,7 +108,57 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'false'
 );
 
-INSERT INTO ${catalog}.framework_meta.object_current
+-- One row per bronze table per framework_optimize run.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.table_health (
+  table_name STRING,
+  owner_kind STRING,
+  owner STRING,
+  num_files BIGINT,
+  size_in_bytes BIGINT,
+  last_version BIGINT,
+  last_operation STRING,
+  last_commit_at TIMESTAMP,
+  last_operation_metrics MAP<STRING, STRING>,
+  error STRING,
+  recorded_at TIMESTAMP,
+  event_date DATE
+)
+CLUSTER BY (owner, event_date, table_name)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true'
+);
+
+-- Tables created before config existed get the column here. The DDL task skips this
+-- statement when the column is already there.
+ALTER TABLE ${catalog}.framework_meta.object_registry ADD COLUMNS (config VARIANT);
+
+ALTER TABLE ${catalog}.framework_meta.object_current ADD COLUMNS (config VARIANT);
+
+-- Liquid clustering keys can change in place. New writes and OPTIMIZE use the new keys.
+ALTER TABLE ${catalog}.framework_meta.object_registry CLUSTER BY (owner, object_kind, full_name);
+
+ALTER TABLE ${catalog}.framework_meta.run_ledger CLUSTER BY (owner, event_date, run_id);
+
+-- object_current is not history, so its older rows are parsed once here.
+UPDATE ${catalog}.framework_meta.object_current
+SET config = parse_json(config_json)
+WHERE config IS NULL AND config_json IS NOT NULL;
+
+INSERT INTO ${catalog}.framework_meta.object_current (
+  object_kind,
+  full_name,
+  owner_kind,
+  owner,
+  requested_by,
+  delivery,
+  parent_full_name,
+  relation,
+  config_json,
+  content_hash,
+  source,
+  recorded_at,
+  config
+)
 SELECT
   object_kind,
   full_name,
@@ -114,7 +171,8 @@ SELECT
   config_json,
   content_hash,
   source,
-  recorded_at
+  recorded_at,
+  coalesce(config, parse_json(config_json)) AS config
 FROM ${catalog}.framework_meta.object_registry
 WHERE (SELECT COUNT(*) FROM ${catalog}.framework_meta.object_current) = 0
 QUALIFY row_number() OVER (
@@ -146,6 +204,9 @@ QUALIFY row_number() OVER (
   ORDER BY recorded_at DESC
 ) = 1;
 
+-- Load counts come from framework_meta.table_load_metrics, which framework_metrics builds.
+DROP VIEW IF EXISTS ${catalog}.framework_meta.v_recon;
+
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_current AS
 SELECT
   object_kind,
@@ -157,11 +218,13 @@ SELECT
   parent_full_name,
   relation,
   config_json,
+  config,
   content_hash,
   source,
   recorded_at
 FROM ${catalog}.framework_meta.object_current;
 
+-- Every job's latest step, however long ago it ran: a weekly or monthly job still shows.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_run_current AS
 SELECT
   run_id,
@@ -176,11 +239,9 @@ SELECT
   started_at,
   ended_at,
   failure_reason,
-  recon_json,
   recorded_at,
   event_date
-FROM ${catalog}.framework_meta.run_current
-WHERE event_date >= date_sub(current_date(), 7);
+FROM ${catalog}.framework_meta.run_current;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_process AS
 SELECT
@@ -196,43 +257,9 @@ SELECT
   started_at,
   ended_at,
   failure_reason,
-  recon_json,
   recorded_at,
   event_date
 FROM ${catalog}.framework_meta.run_ledger;
-
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_recon AS
-SELECT
-  run_id,
-  owner_kind,
-  owner,
-  full_name,
-  event_date,
-  recorded_at,
-  recon.source_count AS source_count,
-  recon.inserted AS inserted,
-  recon.updated AS updated,
-  recon.deleted AS deleted,
-  recon.output_rows AS output_rows,
-  recon.rejected AS rejected,
-  recon.recon_result AS recon_result,
-  recon.detail AS detail
-FROM (
-  SELECT
-    run_id,
-    owner_kind,
-    owner,
-    full_name,
-    event_date,
-    recorded_at,
-    from_json(
-      recon_json,
-      'source_count INT, inserted INT, updated INT, deleted INT, output_rows INT, rejected INT, recon_result STRING, detail STRING'
-    ) AS recon
-  FROM ${catalog}.framework_meta.run_ledger
-  WHERE step_name = 'record_success'
-    AND event_date >= date_sub(current_date(), 7)
-) parsed;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_lineage AS
 SELECT
@@ -242,6 +269,7 @@ SELECT
   parent_full_name,
   relation,
   config_json,
+  config,
   content_hash,
   source,
   recorded_at
@@ -255,8 +283,8 @@ SELECT
   owner,
   requested_by,
   delivery,
-  get_json_object(config_json, '$.pipeline_ids') AS pipeline_ids,
-  get_json_object(config_json, '$.requested_by') AS requesters,
+  config:pipeline_ids::ARRAY<STRING> AS pipeline_ids,
+  config:requested_by::ARRAY<STRING> AS requesters,
   content_hash,
   recorded_at
 FROM ${catalog}.framework_meta.v_object_current
@@ -270,12 +298,12 @@ SELECT
   requested_by,
   delivery,
   parent_full_name AS job_name,
-  get_json_object(config_json, '$.config.domain') AS domain,
-  get_json_object(config_json, '$.config.data_domain') AS data_domain,
-  get_json_object(config_json, '$.config.team') AS team,
-  get_json_object(config_json, '$.config.technical_owner') AS technical_owner,
-  get_json_object(config_json, '$.config.notify.on_failure') AS failure_mail,
-  get_json_object(config_json, '$.config.notify.on_success') AS success_mail
+  config:config.domain::STRING AS domain,
+  config:config.data_domain::STRING AS data_domain,
+  config:config.team::STRING AS team,
+  config:config.technical_owner::STRING AS technical_owner,
+  config:config.notify.on_failure AS failure_mail,
+  config:config.notify.on_success AS success_mail
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind = 'pipeline';
 
@@ -287,9 +315,9 @@ SELECT
   requested_by,
   delivery,
   parent_full_name AS pipeline,
-  get_json_object(config_json, '$.raw') AS raw,
-  get_json_object(config_json, '$.bronze') AS bronze,
-  get_json_object(config_json, '$.quarantine') AS quarantine,
+  config:raw AS raw,
+  config:bronze AS bronze,
+  config:quarantine AS quarantine,
   recorded_at
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind = 'dataflow';
@@ -303,9 +331,9 @@ SELECT
   delivery,
   parent_full_name AS dataflow,
   relation,
-  get_json_object(config_json, '$.layer') AS layer,
-  get_json_object(config_json, '$.path') AS path,
-  get_json_object(config_json, '$.table') AS table_name,
+  config:layer::STRING AS layer,
+  config:path::STRING AS path,
+  config:table::STRING AS table_name,
   recorded_at
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind = 'flow';
@@ -316,12 +344,12 @@ SELECT
   owner_kind,
   owner,
   requested_by,
-  get_json_object(config_json, '$.domain') AS domain,
-  get_json_object(config_json, '$.data_domain') AS data_domain,
-  get_json_object(config_json, '$.team') AS team,
-  get_json_object(config_json, '$.technical_owner') AS technical_owner,
-  get_json_object(config_json, '$.classification') AS classification,
-  get_json_object(config_json, '$.pii') AS pii
+  config:domain::STRING AS domain,
+  config:data_domain::STRING AS data_domain,
+  config:team::STRING AS team,
+  config:technical_owner::STRING AS technical_owner,
+  config:classification::STRING AS classification,
+  config:pii::STRING AS pii
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
 
@@ -342,7 +370,6 @@ SELECT
   run.started_at,
   run.ended_at,
   run.failure_reason,
-  run.recon_json,
   run.recorded_at AS run_recorded_at,
   run.event_date
 FROM ${catalog}.framework_meta.v_workflows workflow
@@ -377,6 +404,7 @@ SELECT
   parent_full_name,
   relation,
   config_json,
+  config,
   content_hash,
   source,
   valid_from,
@@ -393,6 +421,7 @@ FROM (
     parent_full_name,
     relation,
     config_json,
+    coalesce(config, parse_json(config_json)) AS config,
     content_hash,
     source,
     recorded_at AS valid_from,
@@ -406,14 +435,14 @@ FROM (
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_columns AS
 SELECT
   parent_full_name AS table_name,
-  get_json_object(config_json, '$.name') AS column_name,
+  config:name::STRING AS column_name,
   owner_kind,
   owner,
-  CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
-  get_json_object(config_json, '$.data_type') AS data_type,
-  get_json_object(config_json, '$.description') AS description,
-  get_json_object(config_json, '$.classification') AS classification,
-  get_json_object(config_json, '$.pii') AS pii,
+  config:ordinal::INT AS ordinal,
+  config:data_type::STRING AS data_type,
+  config:description::STRING AS description,
+  config:classification::STRING AS classification,
+  config:pii::STRING AS pii,
   recorded_at
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind = 'column';
@@ -421,17 +450,27 @@ WHERE object_kind = 'column';
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_column_history AS
 SELECT
   parent_full_name AS table_name,
-  get_json_object(config_json, '$.name') AS column_name,
+  config:name::STRING AS column_name,
   owner_kind,
   owner,
-  CAST(get_json_object(config_json, '$.ordinal') AS INT) AS ordinal,
-  get_json_object(config_json, '$.data_type') AS data_type,
-  get_json_object(config_json, '$.description') AS description,
-  get_json_object(config_json, '$.classification') AS classification,
-  get_json_object(config_json, '$.pii') AS pii,
+  config:ordinal::INT AS ordinal,
+  config:data_type::STRING AS data_type,
+  config:description::STRING AS description,
+  config:classification::STRING AS classification,
+  config:pii::STRING AS pii,
   content_hash,
   valid_from,
   valid_to,
   is_current
 FROM ${catalog}.framework_meta.v_object_history
 WHERE object_kind = 'column';
+
+-- Bronze tables, for the daily table health step.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_tables AS
+SELECT DISTINCT
+  config:table::STRING AS table_name,
+  owner_kind,
+  owner
+FROM ${catalog}.framework_meta.object_current
+WHERE object_kind = 'flow'
+  AND config:layer::STRING = 'bronze';

@@ -6,10 +6,10 @@ What is built, what phase 1 covers, and what has not been verified.
 
 | Area | State |
 | --- | --- |
-| Platform bundle | Registry DDL in `framework_bundle/sql/framework_meta.sql`, collector, daily `OPTIMIZE`. Ownership columns and checks. |
+| Platform bundle | Registry DDL in `framework_bundle/sql/framework_meta.sql`, collector, daily `OPTIMIZE` and table health, and the `framework_metrics` pipeline over every ingestion event log. Ownership columns and checks. |
 | Ingestion kinds | `sftp_files` and `sharepoint_files` (raw volume to bronze), `database` (PostgreSQL, Azure SQL, SQL Server, DB2 through a foreign catalog, to bronze), and the original `cloud_files` path, which is frozen: the code is kept but validation rejects `autoloader`, `copy_into`, and `ctas` until they run end to end on serverless |
 | Config-driven output | One pipeline and one job per delivery, plus `SOURCE_MAP.md`, generated from `source.yaml` and the table specs |
-| Registry | Workflow, pipeline, dataflow, flow, securable, link, and column definitions. Job run steps with `RUNNING` / `SUCCEEDED` / `FAILED`. Views for definitions, lineage, history, recon, and `v_job_status`. |
+| Registry | Workflow, pipeline, dataflow, flow, securable, link, and column definitions. Job run steps with `RUNNING` / `SUCCEEDED` / `FAILED`. Views for definitions, lineage, history, and `v_job_status`. Load metrics in `table_load_metrics`, and job, task, and pipeline runs with cost from the system tables. |
 | Ownership | Bronze is owned by its source system. `requested_by` and `delivery` are recorded. The collector refuses a second owner. `v_ownership_conflicts` is empty when the rules hold. |
 | Curation structure | `framework_curation/<domain>/<project>/project.yaml` with silver, gold, and data products, reference and ownership checks, `PROJECT_MAP.md` and `PROJECTS_INDEX.md` |
 | Scaffolding | `new-source`, `new-table`, `new-project` |
