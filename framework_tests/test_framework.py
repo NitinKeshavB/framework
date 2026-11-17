@@ -9,7 +9,13 @@ import pytest
 
 from lakeflow_framework import ConfigValidationError, build_pipeline, validate_configs
 from lakeflow_framework.cli import main
-from lakeflow_framework.collector import append_definitions, await_registered, decode_events
+from lakeflow_framework.collector import (
+    _cast,
+    append_definitions,
+    await_registered,
+    decode_events,
+    event_statements,
+)
 from lakeflow_framework.config import config_from_document, email_notifications
 from lakeflow_framework.load import get_strategy
 from lakeflow_framework.metadata import (
@@ -25,10 +31,11 @@ from lakeflow_framework.metadata import (
     ownership_conflicts,
     split_payloads,
     step_file_name,
+    step_keys_sql,
     step_payload,
     write_definition_files,
 )
-from lakeflow_framework.pipeline import MetadataNotFound, UnityMetadata, assemble
+from lakeflow_framework.pipeline import MetadataNotFound, UnityMetadata, assemble, build_pipelines
 from lakeflow_framework.quality import compile_rules, fail_sql
 
 EXAMPLES = (
@@ -288,6 +295,16 @@ def test_autoloader_options_omit_checkpoint_and_schema_location():
     assert "cloudFiles.schemaLocation" not in options
     assert "checkpoint" not in options
     assert options["rescuedDataColumn"] == "_rescued_data"
+    assert options["cloudFiles.maxFilesPerTrigger"] == "1000"
+    json_options = get_strategy("autoloader").options(
+        config_from_document(_billing(format="json", delimiter=None))
+    )
+    assert "multiLine" not in json_options
+    multiline = _billing(format="json", delimiter=None)
+    multiline["source_to_raw"]["source"]["multiline"] = True
+    assert (
+        get_strategy("autoloader").options(config_from_document(multiline))["multiLine"] == "true"
+    )
 
 
 def test_copy_into_and_ctas_sql():
@@ -415,6 +432,8 @@ def test_one_line_pipeline_file_uses_the_running_session(monkeypatch: pytest.Mon
     build_pipeline("billing_invoices")
     assert pipelines.names
     assert pipelines.cdc[0]["keys"] == ["invoice_id"]
+    assert spark.readStream.loads == 1
+    assert any("_source_file" in expr for exprs in spark.readStream.exprs for expr in exprs)
 
 
 def test_one_line_pipeline_file_off_cluster_says_why():
@@ -434,12 +453,12 @@ def test_current_lookup_prunes_by_owner_kind_and_name():
             }
         ],
     )
-    assert "FROM framework_dev.framework_meta.object_registry" in statement
+    assert "FROM framework_dev.framework_meta.object_current" in statement
     assert "owner_kind IN ('source_system')" in statement
     assert "owner IN ('billing')" in statement
     assert "object_kind IN ('column')" in statement
     assert "full_name IN ('framework_dev.billing_bronze.invoices.amount')" in statement
-    assert "QUALIFY row_number()" in statement
+    assert "QUALIFY" not in statement
     assert "v_object_current" not in statement
 
 
@@ -449,10 +468,10 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "CLUSTER BY (owner, object_kind, full_name, recorded_at)" in text
     assert "delta.autoOptimize.autoCompact" in text
     assert "CLUSTER BY (owner, event_date, full_name, run_id)" in text
+    assert "'delta.autoOptimize.autoCompact' = 'false'" in text
     assert "v_ownership_conflicts" in text
     assert "project" not in text.replace("project for silver", "")
     assert "${catalog}" not in text
-    assert "CREATE BLOOMFILTER INDEX" in text
     assert "v_workflows" in text
     assert "v_pipelines" in text
     assert "v_dataflows" in text
@@ -461,6 +480,16 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "v_tables" in text
     assert "v_object_history" in text
     assert "PARTITION BY object_kind, full_name" in text
+    assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.object_current" in text
+    assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.run_current" in text
+    current_view = next(statement for statement in statements if "v_object_current" in statement)
+    assert "object_current" in current_view
+    assert "QUALIFY" not in current_view
+    recon = next(statement for statement in statements if "v_recon" in statement)
+    assert "date_sub(current_date(), 7)" in recon
+    history = text.split("v_object_history", 1)[1]
+    assert "PARTITION BY owner_kind, owner, object_kind, full_name" in history
+    assert "CREATE BLOOMFILTER INDEX" not in text
     assert "v_columns" in text
     assert "v_column_history" in text
     assert "valid_from" in text
@@ -634,18 +663,22 @@ def test_example_columns_keep_descriptions_and_sensitivity():
     assert recorded["classification"] == "confidential"
 
 
-def test_definition_files_are_one_object_each_and_steps_stay_separate(tmp_path: Path):
+def test_definition_files_are_one_file_per_owner(tmp_path: Path):
     rows = object_rows(config_from_document(_billing()))
     written = write_definition_files(tmp_path, rows)
-    assert len(written) == len(rows)
-    payload = json.loads(written[0].read_text(encoding="utf-8"))
-    assert payload["kind"] == "definition"
+    assert len(written) == 1
+    lines = [line for line in written[0].read_text(encoding="utf-8").splitlines() if line]
+    assert len(lines) == len(rows)
+    payloads = [json.loads(line) for line in lines]
+    assert {payload["kind"] for payload in payloads} == {"definition"}
     steps, definitions = split_payloads(
-        [payload, {"kind": "step", "run_id": "1"}, {"kind": "other"}]
+        payloads + [{"kind": "step", "run_id": "1"}, {"kind": "other"}]
     )
     assert len(steps) == 1
-    assert len(definitions) == 1
+    assert len(definitions) == len(rows)
     assert "kind" not in definitions[0]
+    again = write_definition_files(tmp_path, rows)
+    assert again == written
 
 
 def test_cli_writes_a_step_file_with_recon(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
@@ -908,6 +941,158 @@ def test_definition_and_step_files_are_filed_under_their_owner(tmp_path: Path):
                      step_name="a", status="RUNNING")  # fmt: skip
 
 
+def test_a_delivery_reads_every_pipeline_document_once():
+    calls: list[list[str]] = []
+
+    class Reader:
+        def get_pipelines(self, pipeline_ids):
+            calls.append(list(pipeline_ids))
+            return {
+                "billing_invoices": _billing(),
+                "ledger_entries": _ledger(),
+            }
+
+    spark, pipelines = _FakeSpark(), _FakePipelines()
+    graphs = build_pipelines(
+        ["billing_invoices", "ledger_entries"],
+        spark=spark,
+        pipelines=pipelines,
+        metadata=Reader(),
+    )
+    assert calls == [["billing_invoices", "ledger_entries"]]
+    assert [graph.pipeline_id for graph in graphs] == ["billing_invoices", "ledger_entries"]
+    # Auto Loader lists files once. The batch bronze hop reads the valid view, not the raw table again.
+    assert spark.readStream.loads == 1
+    assert spark.read.tables.count("ledger_entries_valid") == 1
+
+
+def test_step_lookup_prunes_by_owner_and_event_date():
+    statement = step_keys_sql(
+        "framework_dev",
+        ["100", "100"],
+        owners=["billing", "billing"],
+        event_dates=["2026-11-09"],
+    )
+    assert "run_id IN ('100')" in statement
+    assert "owner IN ('billing')" in statement
+    assert "event_date IN (DATE '2026-11-09')" in statement
+    widened = step_keys_sql("framework_dev", ["100"], owners=["bad owner"])
+    assert "owner IN" not in widened
+    assert "to_timestamp" in _cast("recorded_at", ("recorded_at",), (), ())
+
+
+def test_collector_bounds_the_micro_batch():
+    text = (
+        Path(__file__).resolve().parents[1] / "framework_bundle" / "src" / "collect_events.py"
+    ).read_text(encoding="utf-8")
+    assert 'option("cloudFiles.maxFilesPerTrigger", _MAX_FILES_PER_TRIGGER)' in text
+    assert 'option("pathGlobFilter", "*.json")' in text
+    assert "_checkpoints/collector" in text
+    assert '_MAX_FILES_PER_TRIGGER = "5000"' in text
+    assert "land_events" in text
+    assert "availableNow=True" in text
+    assert ".collect()" not in text
+    statements = event_statements("framework_dev")
+    landed = "\n".join(statements)
+    assert "framework_dev.framework_meta.object_current" in landed
+    assert "framework_dev.framework_meta.run_current" in landed
+    assert "date_sub(current_date(), 2)" in landed
+    assert "INSERT INTO framework_dev.framework_meta.object_registry" in landed
+    history = next(
+        statement
+        for statement in statements
+        if statement.startswith("INSERT INTO framework_dev.framework_meta.object_registry")
+    )
+    assert "NOT EXISTS" in history and "h.content_hash = a.content_hash" in history
+    current = next(
+        statement
+        for statement in statements
+        if statement.startswith("MERGE INTO framework_dev.framework_meta.object_current")
+    )
+    assert "NOT EXISTS" not in current
+    with pytest.raises(ValueError):
+        event_statements("framework dev")
+
+
+def test_a_retried_definition_repairs_the_current_row_without_a_second_history_row(monkeypatch):
+    inserted: list[list[dict]] = []
+    merged: list[list[dict]] = []
+
+    def fake_insert(_spark, _table, rows, *_args, **_kwargs):
+        inserted.append(rows)
+        return len(rows)
+
+    def fake_merge(_spark, _table, rows, *_args, **_kwargs):
+        merged.append(rows)
+
+    monkeypatch.setattr("lakeflow_framework.collector._insert", fake_insert)
+    monkeypatch.setattr("lakeflow_framework.collector._merge_current", fake_merge)
+    row = _owned_row()
+
+    class Frame:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def collect(self):
+            return self.rows
+
+    class Spark:
+        def sql(self, statement):
+            if "object_registry" in statement and "content_hash" in statement:
+                return Frame(
+                    [
+                        {
+                            "object_kind": row["object_kind"],
+                            "full_name": row["full_name"],
+                            "content_hash": row["content_hash"],
+                            "recorded_at": row["recorded_at"],
+                        }
+                    ]
+                )
+            return Frame([])
+
+    assert append_definitions(Spark(), [row], set(), "framework_dev") == 0
+    assert inserted == []
+    assert merged == [[row]]
+
+
+def test_an_unsafe_name_is_not_inserted_by_skipping_the_check():
+    with pytest.raises(ValueError):
+        append_definitions(object(), [_owned_row(full_name="not a name")], set(), "framework_dev")
+
+
+def test_cloud_files_accept_a_unity_catalog_volume_path():
+    config = config_from_document(
+        _billing(path="/Volumes/framework_dev/billing_raw/landing/invoices/")
+    )
+    assert config.load_method == "autoloader"
+    assert config.path == "/Volumes/framework_dev/billing_raw/landing/invoices/"
+
+
+def test_batch_sql_escapes_quotes_in_paths_and_excel_addresses():
+    copy_sql = get_strategy("copy_into").batch_sql(
+        config_from_document(
+            _billing(
+                load_method="copy_into",
+                dedup=False,
+                watermark_column=None,
+                path="abfss://landing@storage.dfs.core.windows.net/a'b/",
+            )
+        )
+    )[0]
+    assert "a''b" in copy_sql
+    excel = _billing(
+        format="excel",
+        load_method="ctas",
+        dedup=False,
+        watermark_column=None,
+        delimiter=None,
+        header_rows=1,
+        data_address="'Sheet1'!A1",
+    )
+    assert "'''Sheet1''!A1'" in get_strategy("ctas").batch_sql(config_from_document(excel))[0]
+
+
 def test_event_files_are_read_whole_and_parsed_without_a_schema(tmp_path: Path, capsys):
     """The collector reads each file as text, so steps and definitions need no shared schema."""
 
@@ -935,7 +1120,7 @@ def test_event_files_are_read_whole_and_parsed_without_a_schema(tmp_path: Path, 
     assert set(definitions[0]) == set(OBJECT_COLUMNS)
 
 
-def test_pipeline_lookup_takes_only_a_statement_and_rejects_sql():
+def test_pipeline_lookup_binds_the_id_and_rejects_sql():
     class Frame:
         def collect(self):
             return []
@@ -974,10 +1159,27 @@ def _dump(document: dict) -> str:
     return yaml.safe_dump(document)
 
 
+class _Frame:
+    def __init__(self, reader: "_Reader"):
+        self.reader = reader
+
+    def filter(self, where: str) -> "_Frame":
+        self.reader.wheres.append(where)
+        return self
+
+    def selectExpr(self, *exprs: str) -> "_Frame":
+        self.reader.exprs.append(exprs)
+        return self
+
+
 class _Reader:
     def __init__(self):
         self.options = {}
         self.format_name = None
+        self.loads = 0
+        self.tables: list[str] = []
+        self.wheres: list[str] = []
+        self.exprs: list[tuple[str, ...]] = []
 
     def format(self, name):
         self.format_name = name
@@ -988,10 +1190,13 @@ class _Reader:
         return self
 
     def load(self, path):
-        return {"format": self.format_name, "path": path, "options": dict(self.options)}
+        self.loads += 1
+        self.path = path
+        return _Frame(self)
 
     def table(self, name):
-        return {"table": name}
+        self.tables.append(name)
+        return _Frame(self)
 
 
 class _FakeSpark:

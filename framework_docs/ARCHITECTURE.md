@@ -116,16 +116,19 @@ Each object is hashed on its own document, so a job rename versions the pipeline
 
 ## Views
 
-Views do not store a second copy. Current views keep the latest row. History views add `valid_from` (`recorded_at`) and `valid_to` (the next `recorded_at` for that object, or null).
+`object_current` and `run_current` store the one row a status check needs. History views still window `object_registry` and `run_ledger`. They add `valid_from` (`recorded_at`) and `valid_to` (the next `recorded_at` for that object, or null).
 
 ```mermaid
 flowchart TD
   object_registry[object_registry]
+  object_current[object_current]
   run_ledger[run_ledger]
-  object_registry --> v_object_current
+  run_current[run_current]
+  object_registry --> object_current
   object_registry --> v_object_history
-  object_registry --> v_lineage
-  object_registry --> v_ownership_conflicts
+  object_current --> v_object_current
+  object_current --> v_lineage
+  object_current --> v_ownership_conflicts
   v_object_current --> v_workflows
   v_object_current --> v_pipelines
   v_object_current --> v_dataflows
@@ -133,18 +136,21 @@ flowchart TD
   v_object_current --> v_tables
   v_object_current --> v_columns
   v_object_history --> v_column_history
+  run_ledger --> run_current
   run_ledger --> v_process
-  run_ledger --> v_run_current
   run_ledger --> v_recon
+  run_current --> v_run_current
   v_workflows --> v_job_status
   v_run_current --> v_job_status
 ```
 
-`v_lineage` is the latest `link` row for each parent, child, and relation. `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` is the `record_success` step with `recon_json` parsed. `v_run_current` is the latest step in the last 7 days. `v_job_status` joins each workflow to that latest step. `v_ownership_conflicts` lists any name with more than one owner. Job run steps are stored with `object_kind = workflow` and `full_name = job_name`.
+`v_lineage` is the current `link` row for each parent, child, and relation. `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, and `v_columns` read `v_object_current` and extract fields from `config_json`. `v_column_history` is `v_object_history` where `object_kind` is `column`. `v_recon` parses `recon_json` on `record_success` steps from the last 7 days. `v_run_current` is `run_current` for those 7 days. `v_job_status` joins each workflow to that latest step. `v_ownership_conflicts` lists a current name with more than one owner. Job run steps are stored with `object_kind = workflow` and `full_name = job_name`.
+
+`v_object_history` windows by `owner_kind`, `owner`, `object_kind`, and `full_name`. Filter those columns, and `owner` in particular, or the window reads every version in the table. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row.
 
 ## Design choices
 
-**The Unity Catalog volume is the raw layer for file kinds.** `sftp_files` and `sharepoint_files` keep the files as delivered and have no raw Delta table. A database has no raw layer. Only `cloud_files` writes a raw table first. Quarantine and bronze are always built, and both are filtered by the quality rules.
+**The Unity Catalog volume is the raw layer for file kinds.** `sftp_files` and `sharepoint_files` keep the files as delivered and have no raw Delta table. A database has no raw layer. `cloud_files` writes a raw table first. Its path may be `abfss://`, `s3://`, or a `/Volumes/<catalog>/<schema>/<volume>` path: Auto Loader, `COPY INTO`, and `read_files` all read a volume. Quarantine and bronze are always built, and both are filtered by the quality rules.
 
 **The source system owns bronze.** Many teams can add specs under one source. The registry records `requested_by` for the team that asked. The collector refuses a second source system for the same table. Two teams under the same source share that owner on purpose. Silver, gold, and data products are owned by a project.
 
@@ -160,7 +166,7 @@ flowchart TD
 
 **The registry is two tables.** Attributes and relationships are columns on `object_registry`. Run steps, failure text, and reconciliation are rows in `run_ledger`.
 
-**Auto Loader options are a fixed map.** A format allow-list, a positive `max_files_per_trigger`, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`.
+**Auto Loader options are a fixed map.** A format allow-list, `max_files_per_trigger` (1000 when the spec omits it), JSON `multiline` only when the spec sets it, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`. File methods list the path once; bronze and quarantine read the landed table or the landing view.
 
 Lakeflow Connect is how SharePoint, and later other managed sources, will reach the raw volume or bronze. See the [roadmap](ROADMAP.md).
 

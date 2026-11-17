@@ -33,7 +33,7 @@ deliveries:
 | Field | Rule |
 | --- | --- |
 | `kind` | `sftp_files` and `sharepoint_files` need `raw_volume` (schema and volume). `database` needs `foreign_catalog` and takes an optional `engine` of `postgresql`, `azure_sql`, `sql_server`, or `db2`. `cloud_files` is the original raw-table path. |
-| `deliveries` | At least one. Each has exactly one of `schedule` (a Quartz cron) or `trigger: file_arrival`. A database delivery has a schedule only. A `cloud_files` file-arrival delivery needs a `path` that starts with `abfss://` or `s3://`. |
+| `deliveries` | At least one. Each has exactly one of `schedule` (a Quartz cron) or `trigger: file_arrival`. A database delivery has a schedule only. A `cloud_files` file-arrival delivery needs a path that starts with `abfss://` or `s3://`, or a `/Volumes/<catalog>/<schema>/<volume>` path. |
 | `fetch` | Rejected. Copying files from SFTP or SharePoint into the raw volume is not built. |
 
 A delivery is the unit of deployment: every table in it loads in one Lakeflow pipeline and one job. A source with different cadences has several deliveries.
@@ -86,7 +86,7 @@ raw_to_bronze:
 quarantine: { schema: billing_quarantine}
 ```
 
-`source` also takes `path_glob`, `max_files_per_trigger`, `header_rows` and `data_address` (Excel, both required), and `external_location`. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`.
+`source` also takes `path_glob`, `max_files_per_trigger` (default 1000), `multiline` (JSON only; default false), `header_rows` and `data_address` (Excel, both required), and `external_location`. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`. An Excel address may quote the sheet name, as in `'Sheet1'!A1`.
 
 ## Table spec: a database table
 
@@ -147,7 +147,7 @@ raw_to_bronze: { ... as above ... }
 quarantine: { ... as above ... }
 ```
 
-Excel cannot use `copy_into`. `fixed_width` needs `fixed_columns` (`name`, `start`, `length`) on the source. Paths must be `abfss://` or `s3://`.
+Excel cannot use `copy_into`. `fixed_width` needs `fixed_columns` (`name`, `start`, `length`) on the source. A `cloud_files` path is `abfss://`, `s3://`, or `/Volumes/<catalog>/<schema>/<volume>/...`. `volume_files` is a volume path and does not create a raw table.
 
 ## project.yaml
 

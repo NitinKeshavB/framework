@@ -87,6 +87,8 @@ That is all. The generator validates every source and spec, then rewrites the ma
 ./run.sh bundle:deploy framework_ingestion dev <profile>
 ```
 
+Deploy uploads the bundle, then runs `registry_sync`. That job writes every spec into `framework_meta` under the target catalog. The framework bundle must already be deployed, because that deploy creates the registry.
+
 ## Prerequisites
 
 The framework does not create these. The domain makes sure they exist before a deploy:

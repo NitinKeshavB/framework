@@ -2,7 +2,7 @@
 
 from lakeflow_framework.config import ConfigValidationError, PipelineConfig, validate_configs
 from lakeflow_framework.load import get_strategy
-from lakeflow_framework.pipeline import MetadataNotFound, build_pipeline
+from lakeflow_framework.pipeline import MetadataNotFound, build_pipeline, build_pipelines
 
 __all__ = [
     "ConfigValidationError",
@@ -10,6 +10,7 @@ __all__ = [
     "MetadataNotFound",
     "PipelineConfig",
     "build_pipeline",
+    "build_pipelines",
     "validate_configs",
 ]
 

@@ -26,6 +26,7 @@ from lakeflow_framework.config import (
     EMAIL,
     FILE_KINDS,
     IDENTIFIER,
+    VOLUME_PATH,
     ConfigValidationError,
     PipelineConfig,
     email_notifications,
@@ -75,8 +76,12 @@ class SourceSystem:
     engine: str = ""
 
 
-def load_sources(bundle: Path) -> list[SourceSystem]:
-    """Read and validate every source system. Raises one error listing every problem."""
+def load_sources(bundle: Path, catalog: str | None = None) -> list[SourceSystem]:
+    """Read and validate every source system. Raises one error listing every problem.
+
+    ``catalog`` is the environment catalog. Generate omits it and uses a stand-in, because a spec
+    does not name dev or prod. Deploy passes the target's catalog so the registered names match it.
+    """
 
     root = bundle / "sources"
     errors: list[str] = []
@@ -106,7 +111,7 @@ def load_sources(bundle: Path) -> list[SourceSystem]:
     if spec_files:
         try:
             configs = validate_configs(
-                [path for _, path in spec_files], catalog=PLACEHOLDER_CATALOG
+                [path for _, path in spec_files], catalog=catalog or PLACEHOLDER_CATALOG
             )
         except ConfigValidationError as exc:
             errors.extend(exc.errors)
@@ -118,6 +123,27 @@ def load_sources(bundle: Path) -> list[SourceSystem]:
     if errors:
         raise ConfigValidationError(errors)
     return systems
+
+
+def registry_rows(bundle: Path, catalog: str) -> list[dict[str, Any]]:
+    """Every definition this bundle deploys, named in ``catalog``.
+
+    Deploy writes these rows into the registry after the files are uploaded, so a pipeline can
+    read what was just deployed without waiting for the next delivery run.
+    """
+
+    from lakeflow_framework.metadata import new_object_rows, object_rows, workflow_rows
+
+    if not catalog or not re.fullmatch(r"[A-Za-z0-9_-]+", catalog):
+        raise ConfigValidationError(["catalog is required"])
+    systems = load_sources(bundle, catalog=catalog)
+    configs = [table.config for system in systems for table in system.tables]
+    seen: set[tuple[str, str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    for config in configs:
+        rows.extend(new_object_rows(object_rows(config), seen))
+    rows.extend(new_object_rows(workflow_rows(configs), seen))
+    return rows
 
 
 def render_map(systems: list[SourceSystem]) -> str:
@@ -207,8 +233,14 @@ def _generated_files(bundle: Path) -> list[str]:
 
 
 def _pipeline_source(tables: list[SourceTable]) -> str:
-    lines = [GENERATED, "from lakeflow_framework import build_pipeline", ""]
-    lines += [f'build_pipeline("{table.config.pipeline_id}")' for table in tables]
+    # One call reads every pipeline document in this delivery. A call per table repeats that scan.
+    ids = ", ".join(f'"{table.config.pipeline_id}"' for table in tables)
+    lines = [
+        GENERATED,
+        "from lakeflow_framework import build_pipelines",
+        "",
+        f"build_pipelines([{ids}])",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -465,9 +497,11 @@ def _read_source(path: Path, name: str, errors: list[str]) -> SourceSystem | Non
         if trigger and kind == DATABASE_KIND:
             found.append(f"{path}: a database delivery runs on a schedule, not a {trigger}")
         if trigger == "file_arrival" and kind == "cloud_files":
-            if not CLOUD_PATH.match(str(detail.get("path") or "")):
+            arrival = str(detail.get("path") or "")
+            if not (CLOUD_PATH.match(arrival) or VOLUME_PATH.match(arrival)):
                 found.append(
-                    f"{path}: delivery {delivery} needs a path that starts with abfss:// or s3://"
+                    f"{path}: delivery {delivery} needs a path that starts with abfss:// or s3://, "
+                    "or a /Volumes path"
                 )
     errors.extend(found)
     if found:

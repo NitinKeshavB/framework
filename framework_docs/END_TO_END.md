@@ -15,7 +15,7 @@ CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check`
 
 For each delivery of each source system, from the specs alone:
 
-- `pipelines/<source_system>_<delivery>.py` calls `build_pipeline("<id>")` once for each table.
+- `pipelines/<source_system>_<delivery>.py` calls `build_pipelines([...])` once, with every table in that delivery. The registry is read in one query.
 - `resources/<source_system>_<delivery>.pipeline.yml` is one serverless Lakeflow pipeline.
 - `resources/<source_system>_<delivery>.job.yml` is one job. A file source fires on files landing in the raw volume. A scheduled source uses its cron.
 - `SOURCE_MAP.md` shows the same model as a diagram and tables.
@@ -33,7 +33,9 @@ The job writes small JSON files at each step. It does not write the registry tab
 5. **refresh_pipeline** runs the Lakeflow pipeline. `build_pipeline` reads each spec back from the registry. A missing row is an error.
 6. **record_success** writes `SUCCEEDED` and can carry counts (`--recon-json`). **record_failure** writes `FAILED` if any earlier task fails, including a failed success step.
 
-Files land in `/Volumes/<catalog>/framework_meta/framework_events` as `<owner_kind>/<owner>/<full_name>/<run_id>_<step_no>_<status>.json`, and definitions under `<owner_kind>/<owner>/definitions/`. One collector job is the only writer of `object_registry` and `run_ledger`. Start `framework_collector` after the first deploy; it is paused by default.
+Files land in `/Volumes/<catalog>/framework_meta/framework_events` as `<owner_kind>/<owner>/<full_name>/<run_id>_<step_no>_<status>.json`, and definitions under `<owner_kind>/<owner>/definitions/`. The collector lands those files. It is paused by default; start it after the first framework deploy so run steps reach the ledger.
+
+Deploy also updates the registry before it returns. `bundle:deploy framework_bundle` runs `framework_ddl`. `bundle:deploy framework_ingestion` runs `registry_sync`, which inserts the deployed specs with the same writer the collector uses. A later delivery sync of an unchanged spec does not add another history row.
 
 ## How each kind loads
 
@@ -44,7 +46,7 @@ The graph depends on the kind. Quarantine and bronze are filtered by the quality
 | Files, `volume_files` | Auto Loader on the raw volume path. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table of failing rows | Streaming table of passing rows, or Auto CDC on the keys when `dedup: true` |
 | Database, `snapshot` | The foreign-catalog table, in batch | Materialized view of failing rows | Materialized view of passing rows |
 | Database, `merge` | The same, as snapshots | Materialized view | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
-| Cloud files, `autoloader` | Auto Loader into a raw streaming table | Streaming table | Streaming table, or Auto CDC with `dedup: true` |
+| Cloud files, `autoloader` | Auto Loader once into a raw streaming table. The projection, including `_source_file` and `_ingested_at`, is applied on that read. | Streaming table, read from the raw table | Streaming table read from the valid view, or Auto CDC from that view when `dedup: true` |
 | Cloud files, `copy_into` | `COPY INTO` a raw table (`force = false`) before the pipeline | Streaming table | Streaming table |
 | Cloud files, `ctas` | `CREATE OR REPLACE TABLE` raw | Materialized view | Materialized view |
 
@@ -63,7 +65,7 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 ## The registry
 
-Two tables in `<catalog>.framework_meta`. History is insert-only: the framework never runs `UPDATE` or `DELETE` on them. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql).
+Four tables in `<catalog>.framework_meta`. `object_registry` and `run_ledger` are the history and stay insert-only. `object_current` and `run_current` hold one row per key so a job status check does not window that history. The collector merges those two. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). A catalog created before these tables existed picks them up the next time `framework_ddl` runs; the script copies the latest history row in only while the current table is empty.
 
 `object_registry` catalogs every definition the job syncs:
 
@@ -85,13 +87,13 @@ Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `o
 
 ### Ownership
 
-A pipeline or table has one owner. Before inserting, the collector looks up the current owner of each pipeline and table in the batch. If another owner holds it, the row is not inserted and the collector writes a `FAILED` `ownership_check` step to the ledger, with the holder named in `failure_reason`. The collector keeps running. Flows, links, workflows, dataflows, and columns follow their pipeline or table. `v_ownership_conflicts` lists any name with two owners in its history; it should be empty. Moving a table to another owner is a deliberate manual change, not something the collector allows.
+A pipeline or table has one owner. Before inserting, the collector looks up the current owner of each pipeline and table in the batch. If another owner holds it, the row is not inserted and the collector writes a `FAILED` `ownership_check` step to the ledger, with the holder named in `failure_reason`. The collector keeps running. Flows, links, workflows, dataflows, and columns follow their pipeline or table. `v_ownership_conflicts` lists a name that has two rows in `object_current`; it should be empty. Moving a table to another owner is a deliberate manual change, not something the collector allows.
 
 ### Views
 
 | View | What it answers |
 | --- | --- |
-| `v_object_current` | Latest definition for every object. This is what the pipeline loads. |
+| `v_object_current` | The current definition for every object, read from `object_current`. This is what the pipeline loads. |
 | `v_object_history` | Every version, with `valid_from` / `valid_to`. A point in time is `valid_from <= t AND (valid_to IS NULL OR valid_to > t)`. |
 | `v_workflows` | Each delivery job, its pipeline ids, and every requester. |
 | `v_pipelines` | Owner, requester, delivery, domain, team, technical owner, mail lists. |
@@ -101,9 +103,9 @@ A pipeline or table has one owner. Before inserting, the collector looks up the 
 | `v_columns`, `v_column_history` | Current and past columns of raw, bronze, and quarantine. |
 | `v_lineage` | Latest link per parent, child, and relation. |
 | `v_process` | Every step of every run. |
-| `v_run_current` | Latest step per job in the last 7 days. |
+| `v_run_current` | Latest step per job in the last 7 days, read from `run_current`. |
 | `v_job_status` | Each workflow joined to that latest step: `RUNNING`, `SUCCEEDED`, or `FAILED`. |
-| `v_recon` | Counts on success steps. |
+| `v_recon` | Counts on success steps from the last 7 days. Older counts stay in `run_ledger`. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
 
 Example: the latest status for every billing job.
@@ -124,11 +126,15 @@ About 10,000 jobs can write status files at once because those are files, not De
 The tables use liquid clustering:
 
 - `object_registry`: `CLUSTER BY (owner, object_kind, full_name, recorded_at)`
+- `object_current`: `CLUSTER BY (owner, object_kind, full_name)`
 - `run_ledger`: `CLUSTER BY (owner, event_date, full_name, run_id)`
+- `run_current`: `CLUSTER BY (owner, object_kind, full_name)`
 
-Both set `delta.autoOptimize.optimizeWrite` and `autoCompact`, so the collector's small inserts are compacted as they land. The DDL also creates bloom-filter indexes on `full_name` and `run_id`; if the runtime rejects that, the DDL task skips it. A daily job runs `OPTIMIZE`. `VACUUM` is not scheduled, so process history is never removed.
+All four set `delta.autoOptimize.optimizeWrite`. `autoCompact` is off: the collector commits every 30 seconds, and compacting after each commit rewrites the same files and falls behind the jobs waiting on `await_registry`. A daily job runs `OPTIMIZE`, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
-Before an insert, the collector reads only the current hash for the owners, kinds, and names in that batch, and the current owner of the pipelines and tables in it. It does not scan history for other owners. Filter `owner` and `object_kind` (and `full_name` when known) before the `valid_from` / `valid_to` test. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
+`v_object_history` partitions by `owner_kind`, `owner`, `object_kind`, and `full_name`. A query that filters `owner` is applied before that window. Filtering only `valid_from` cannot be, because that would change which row comes next. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
+
+A sync writes one JSON-lines file per owner. An unchanged sync overwrites that same file, so Auto Loader does not read it again. Step files stay one per status. The collector lands a batch in Spark: it does not collect the rows onto the driver. It appends a definition when `object_current` has no row or a different hash, and a step when `(run_id, step_no, status)` is absent from the last two days of `run_ledger`. It then merges the current tables, and only when the incoming `recorded_at` is at least as new as the row already there. A file that arrives late does not roll the current row backward. The checkpoint directory under the events volume is not ingested. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
 
 To see the registry as it was at a moment:
 
@@ -156,7 +162,7 @@ None of the following has run on Databricks. The code assumes them:
 - COPY INTO as a job statement before the pipeline.
 - Excel `headerRows` and `dataAddress` without `schemaLocation`.
 - `DESCRIBE DETAIL` `numRecords` on streaming tables and materialized views.
-- Bloom-filter index syntax, and the collector checkpoint under the events volume.
+- The collector checkpoint under the events volume, with `pathGlobFilter` of `*.json` so checkpoint files are not ingested.
 - Workspace concurrency if many pipelines run together.
 
 If one fails, record the observed syntax here and change the single strategy or DDL statement. Do not spread a workaround across the bundles.

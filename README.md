@@ -69,12 +69,12 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 ## Deploy order
 
-1. `./run.sh bundle:deploy framework_bundle <target> <profile>`
-2. Run the `framework_ddl` job, then start `framework_collector`. The collector is the only writer of the registry tables.
-3. `./run.sh bundle:deploy framework_ingestion <target> <profile>`
+1. `./run.sh bundle:deploy framework_bundle <target> <profile>`. After the upload it runs `framework_ddl`, so the registry tables and views exist when the command returns.
+2. Start `framework_collector`. It stays the writer for run steps. It is paused by default.
+3. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry.
 4. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
 
-`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog.
+`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery run still syncs its own specs; an unchanged hash does not add another history row.
 
 ## See what is running
 

@@ -12,7 +12,7 @@ from lakeflow_framework.config import ConfigValidationError
 from lakeflow_framework.projects import INDEX_NAME, MAP_NAME, generate, load_projects, new_project
 
 REPO = Path(__file__).resolve().parents[1]
-INGESTION = REPO / "framework_ingestion"
+INGESTION = REPO / "framework_examples" / "ingestion"
 PROJECTS = REPO / "framework_curation"
 
 

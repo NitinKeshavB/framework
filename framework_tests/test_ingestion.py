@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,11 +13,18 @@ import yaml
 
 from lakeflow_framework.cli import main
 from lakeflow_framework.config import ConfigValidationError
-from lakeflow_framework.ingestion import MAP_NAME, generate, load_sources, new_source, new_table
+from lakeflow_framework.ingestion import (
+    MAP_NAME,
+    generate,
+    load_sources,
+    new_source,
+    new_table,
+    registry_rows,
+)
 from lakeflow_framework.metadata import object_rows, workflow_rows
 from lakeflow_framework.pipeline import build_pipeline
 
-SAMPLE = Path(__file__).resolve().parents[1] / "framework_ingestion"
+SAMPLE = Path(__file__).resolve().parents[1] / "framework_examples" / "ingestion"
 
 LEGACY_SOURCE = """\
 source_system: legacy
@@ -99,13 +108,16 @@ def _tasks(bundle: Path, name: str = "billing_daily") -> dict:
     return {task["task_key"]: task for task in _job(bundle, name)["tasks"]}
 
 
-def test_every_source_kind_is_in_the_sample(tmp_path: Path) -> None:
+def test_every_source_kind_is_in_the_sample() -> None:
     systems = {system.name: system for system in load_sources(SAMPLE)}
-    assert {name: system.kind for name, system in systems.items()} == {
-        "billing": "sftp_files",
-        "erp": "database",
-        "hr_docs": "sharepoint_files",
-    }
+    kinds = {name: system.kind for name, system in systems.items()}
+    assert kinds["billing"] == "sftp_files"
+    assert kinds["erp"] == "database"
+    assert kinds["hr_docs"] == "sharepoint_files"
+    assert kinds["abs"] == "sftp_files"
+    assert kinds["policies"] == "sharepoint_files"
+    assert kinds["claims_db"] == "database"
+    assert kinds["drops"] == "cloud_files"
     assert [t.config.load_method for t in systems["billing"].tables] == ["volume_files"]
     assert {t.config.load_method for t in systems["erp"].tables} == {"database_table"}
     assert len(systems["erp"].tables) == 2
@@ -162,8 +174,7 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     _add_table(bundle, "credits", "collections")
     generate(bundle)
     source = (bundle / "pipelines" / "billing_daily.py").read_text("utf-8")
-    assert 'build_pipeline("billing_credits")' in source
-    assert 'build_pipeline("billing_invoices")' in source
+    assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
     tasks = _tasks(bundle)
     assert tasks["sync"]["spark_python_task"]["parameters"].count("--out") == 1
     awaited = tasks["await_registry"]["spark_python_task"]["parameters"]
@@ -199,7 +210,7 @@ def test_database_job_has_a_schedule_and_syncs_both_tables(tmp_path: Path) -> No
     synced = _tasks(tmp_path, "erp_nightly")["sync"]["spark_python_task"]["parameters"]
     assert sum(item.endswith(".yaml") for item in synced) == 2
     source = (tmp_path / "pipelines" / "erp_nightly.py").read_text("utf-8")
-    assert 'build_pipeline("erp_customers")' in source and 'build_pipeline("erp_orders")' in source
+    assert 'build_pipelines(["erp_customers", "erp_orders"])' in source
 
 
 def test_scheduled_delivery_gets_a_schedule_not_a_file_trigger(bundle: Path) -> None:
@@ -227,6 +238,28 @@ def test_cloud_files_source_keeps_its_raw_table_and_adds_a_batch_load_step(bundl
     ]
     assert tasks["refresh_pipeline"]["depends_on"] == [{"task_key": "batch_load"}]
     assert _job(bundle, "legacy_daily")["trigger"]["file_arrival"]["url"].startswith("abfss://")
+
+
+def test_cloud_files_file_arrival_can_watch_a_volume(bundle: Path) -> None:
+    folder = bundle / "sources" / "legacy" / "legacy"
+    folder.mkdir(parents=True)
+    volume = "/Volumes/framework_dev/legacy_raw/landing/"
+    (folder.parent / "source.yaml").write_text(
+        LEGACY_SOURCE.replace(
+            "abfss://landing@storage.dfs.core.windows.net/legacy/",
+            volume,
+        ),
+        "utf-8",
+    )
+    (folder / "legacy_credits.yaml").write_text(
+        LEGACY_SPEC.replace(
+            "abfss://landing@storage.dfs.core.windows.net/legacy/credits/",
+            volume + "credits/",
+        ),
+        "utf-8",
+    )
+    generate(bundle)
+    assert _job(bundle, "legacy_daily")["trigger"]["file_arrival"]["url"] == volume
 
 
 def test_specs_do_not_name_a_catalog_and_jobs_pass_the_environment_catalog(bundle: Path) -> None:
@@ -538,7 +571,7 @@ class _Pipelines:
 
 def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) -> None:
     generate(bundle)
-    assert 'build_pipeline("billing_invoices")' in (
+    assert 'build_pipelines(["billing_invoices"])' in (
         bundle / "pipelines" / "billing_daily.py"
     ).read_text("utf-8")
     refresh = _tasks(bundle)["refresh_pipeline"]["pipeline_task"]["pipeline_id"]
@@ -610,3 +643,44 @@ def test_a_spec_with_no_project_sits_next_to_source_yaml(bundle: Path) -> None:
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
     assert "belongs in billing/billing/" in " ".join(caught.value.errors)
+
+
+def test_registry_rows_use_the_deployed_catalog() -> None:
+    rows = registry_rows(SAMPLE, "aal_dev_fdh")
+    pipelines = {row["full_name"] for row in rows if row["object_kind"] == "pipeline"}
+    assert "billing_invoices" in pipelines
+    tables = [
+        row["full_name"] for row in rows if row["object_kind"] in {"table", "streaming_table"}
+    ]
+    assert tables
+    assert all(name.startswith("aal_dev_fdh.") for name in tables)
+    with pytest.raises(ConfigValidationError):
+        registry_rows(SAMPLE, "not a catalog")
+
+
+def test_deploy_updates_the_registry(tmp_path: Path) -> None:
+    """Deploy runs the registry job after the upload. The CLI is not contacted."""
+
+    log = tmp_path / "calls"
+    binary = tmp_path / "databricks"
+    binary.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$DEPLOY_LOG"\n',
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    env["DEPLOY_LOG"] = str(log)
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        ["bash", "./run.sh", "bundle:deploy", "framework_bundle", "dev", "prof"],
+        cwd=root,
+        env=env,
+        check=True,
+    )
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls == [
+        "bundle validate -t dev --profile prof",
+        "bundle deploy -t dev --profile prof",
+        "bundle run framework_ddl -t dev --profile prof",
+    ]

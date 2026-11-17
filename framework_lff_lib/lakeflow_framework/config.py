@@ -115,6 +115,7 @@ class PipelineConfig:
     data_address: str | None = None
     max_files_per_trigger: int | None = None
     path_glob: str | None = None
+    json_multiline: bool = False
     job_name: str | None = None
     domain: str = ""
     data_domain: str = ""
@@ -198,6 +199,7 @@ class PipelineConfig:
             _put(source, "data_address", self.data_address)
             _put(source, "max_files_per_trigger", self.max_files_per_trigger)
             _put(source, "path_glob", self.path_glob)
+            _put(source, "multiline", True if self.json_multiline else None)
             if self.fixed_columns:
                 source["fixed_columns"] = [
                     {"name": column.name, "start": column.start, "length": column.length}
@@ -481,8 +483,8 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         errors.append(f"{label}: path is required")
     elif path and load_method == "volume_files" and not VOLUME_PATH.match(path):
         errors.append(f"{label}: path must be a /Volumes/<catalog>/<schema>/<volume> path")
-    elif path and load_method != "volume_files" and not CLOUD_PATH.match(path):
-        errors.append(f"{label}: path must start with abfss:// or s3://")
+    elif path and load_method != "volume_files" and not _storage_path(path):
+        errors.append(f"{label}: path must start with abfss:// or s3://, or be a /Volumes path")
 
     source_catalog = str(source.get("catalog") or "") if is_database else ""
     source_table = str(source.get("table") or "") if is_database else ""
@@ -539,6 +541,10 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
             errors.append(f"{label}: header_rows must be 0 or 1 for excel")
         if not data_address:
             errors.append(f"{label}: data_address is required for excel")
+    multiline = source.get("multiline", False)
+    if not isinstance(multiline, bool):
+        errors.append(f"{label}: multiline must be true or false")
+        multiline = False
 
     max_files = source.get("max_files_per_trigger")
     if max_files is not None:
@@ -596,6 +602,7 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         data_address=str(data_address) if data_address else None,
         max_files_per_trigger=int(max_files) if max_files is not None else None,
         path_glob=_optional_text(source.get("path_glob")),
+        json_multiline=multiline,
         job_name=_optional_text(document.get("job_name")),
         domain=domain,
         data_domain=data_domain,
@@ -762,6 +769,12 @@ def _email_list(value: Any, key: str, label: str, errors: list[str], required: b
         else:
             emails.append(text)
     return emails
+
+
+def _storage_path(path: str) -> bool:
+    """Cloud URI or a Unity Catalog volume. Auto Loader, COPY INTO, and read_files accept both."""
+
+    return bool(CLOUD_PATH.match(path) or VOLUME_PATH.match(path))
 
 
 def _put(mapping: dict[str, Any], key: str, value: Any) -> None:

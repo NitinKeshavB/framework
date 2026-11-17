@@ -76,17 +76,17 @@ function new-table {
         "${requested_args[@]}" "${delivery_args[@]}"
 }
 
-# validate every project against the ingestion bundle and the other projects, then rewrite
+# validate every project against the example bronze sources and the other projects, then rewrite
 # framework_curation/PROJECTS_INDEX.md and each project's PROJECT_MAP.md
 function projects:generate {
     "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
-        --sources "$THIS_DIR/framework_ingestion"
+        --sources "$THIS_DIR/framework_examples/ingestion"
 }
 
 # fail if a project map is out of date (for CI); changes nothing
 function projects:check {
     "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
-        --sources "$THIS_DIR/framework_ingestion" --check
+        --sources "$THIS_DIR/framework_examples/ingestion" --check
 }
 
 # create a project folder with its bundle file: ./run.sh new-project <domain> <project> <owner-email>
@@ -126,6 +126,16 @@ function bundle:deploy {
         cd "$THIS_DIR/$bundle"
         databricks bundle validate -t "$target" "${profile_args[@]}"
         databricks bundle deploy -t "$target" "${profile_args[@]}"
+        # The workspace copy and the registry match when this returns.
+        # framework_bundle applies the DDL. framework_ingestion registers every spec.
+        case "$bundle" in
+            framework_bundle)
+                databricks bundle run framework_ddl -t "$target" "${profile_args[@]}"
+                ;;
+            framework_ingestion)
+                databricks bundle run registry_sync -t "$target" "${profile_args[@]}"
+                ;;
+        esac
     )
 }
 

@@ -395,23 +395,33 @@ OWNED_KINDS = ("pipeline", "table", "streaming_table", "materialized_view")
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_HASH = re.compile(r"^[0-9a-f]{64}$")
-
-
-def definition_file_name(row: Mapping[str, Any]) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", str(row["full_name"])).strip("_")
-    return (
-        f"{row['owner_kind']}/{row['owner']}/definitions/"
-        f"{row['object_kind']}_{safe_name}_{str(row['content_hash'])[:16]}.json"
-    )
+_SAFE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SAFE_INSTANT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def write_definition_files(directory: Path, rows: list[dict[str, Any]]) -> list[Path]:
-    written: list[Path] = []
+    """One JSON-lines file per owner.
+
+    A sync used to write one file per column, flow, and link. At thousands of jobs that listing
+    is the collector's bottleneck. One file per owner is one Auto Loader file; each line is one
+    definition. The name is the hash of the body, so an unchanged sync overwrites the same file
+    and is not collected again.
+    """
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
-        payload = {"kind": "definition", **row}
-        target = directory / definition_file_name(row)
+        grouped.setdefault((str(row["owner_kind"]), str(row["owner"])), []).append(row)
+    written: list[Path] = []
+    for (owner_kind, owner), group in sorted(grouped.items()):
+        lines = [
+            json.dumps({"kind": "definition", **row}, sort_keys=True, separators=(",", ":"))
+            for row in group
+        ]
+        body = "\n".join(lines) + "\n"
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+        target = directory / owner_kind / owner / "definitions" / f"{digest}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        target.write_text(body, encoding="utf-8")
         written.append(target)
     return written
 
@@ -487,6 +497,7 @@ def step_payload(
         "ended_at": ended_at,
         "failure_reason": failure_reason,
         "recon": dict(recon) if recon else None,
+        "recon_json": json.dumps(recon, sort_keys=True) if recon else None,
         "recorded_at": _now(),
     }
 
@@ -522,7 +533,7 @@ def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
         "failure_reason": payload.get("failure_reason"),
         "recon_json": json.dumps(payload["recon"], sort_keys=True)
         if payload.get("recon")
-        else None,
+        else payload.get("recon_json"),
         "recorded_at": recorded,
         "event_date": recorded[:10],
     }
@@ -603,7 +614,7 @@ def registered_sql(pipeline_ids: list[str], catalog: str) -> str:
 
 
 def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
-    """Latest stored hash for each object. A matching hash means that version is still active."""
+    """Current hash for each object. object_current has one row, so this is a point lookup."""
 
     if not catalog or not _SAFE_TOKEN.match(catalog):
         raise ValueError("catalog is required")
@@ -623,13 +634,47 @@ def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
     quoted_owner_kinds = ", ".join(f"'{kind}'" for kind in owner_kinds)
     return (
         "SELECT object_kind, full_name, content_hash "
-        f"FROM {catalog}.framework_meta.object_registry "
+        f"FROM {catalog}.framework_meta.object_current "
         f"WHERE owner_kind IN ({quoted_owner_kinds}) AND owner IN ({quoted_owners}) "
         f"AND object_kind IN ({quoted_kinds}) "
-        f"AND full_name IN ({quoted_names}) "
-        "QUALIFY row_number() OVER ("
-        "PARTITION BY object_kind, full_name ORDER BY recorded_at DESC"
-        ") = 1"
+        f"AND full_name IN ({quoted_names})"
+    )
+
+
+def recorded_versions_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
+    """History rows for these exact versions. A retry matches hash and recorded_at."""
+
+    if not catalog or not _SAFE_TOKEN.match(catalog):
+        raise ValueError("catalog is required")
+    names = sorted({str(row["full_name"]) for row in rows})
+    kinds = sorted({str(row["object_kind"]) for row in rows})
+    owners = sorted({str(row.get("owner") or "") for row in rows})
+    hashes = sorted({str(row["content_hash"]) for row in rows})
+    instants = sorted({str(row["recorded_at"]) for row in rows})
+    if not names or any(not _SAFE_NAME.match(name) for name in names):
+        raise ValueError("object name is required")
+    if any(not _SAFE_TOKEN.match(kind) for kind in kinds):
+        raise ValueError("object kind is required")
+    if any(not _SAFE_TOKEN.match(owner) for owner in owners):
+        raise ValueError("owner is required")
+    if any(not _SAFE_HASH.match(value) for value in hashes):
+        raise ValueError("content hash is required")
+    if any(not _SAFE_INSTANT.match(value) for value in instants):
+        raise ValueError("recorded_at is required")
+    quoted_names = ", ".join(f"'{name}'" for name in names)
+    quoted_kinds = ", ".join(f"'{kind}'" for kind in kinds)
+    quoted_owners = ", ".join(f"'{owner}'" for owner in owners)
+    quoted_hashes = ", ".join(f"'{value}'" for value in hashes)
+    quoted_times = ", ".join(
+        f"to_timestamp('{instant}', 'yyyy-MM-dd''T''HH:mm:ss''Z''')" for instant in instants
+    )
+    return (
+        "SELECT object_kind, full_name, content_hash, "
+        "date_format(recorded_at, 'yyyy-MM-dd''T''HH:mm:ss''Z''') AS recorded_at "
+        f"FROM {catalog}.framework_meta.object_registry "
+        f"WHERE owner IN ({quoted_owners}) "
+        f"AND object_kind IN ({quoted_kinds}) AND full_name IN ({quoted_names}) "
+        f"AND content_hash IN ({quoted_hashes}) AND recorded_at IN ({quoted_times})"
     )
 
 
@@ -683,16 +728,38 @@ def ownership_conflicts(
     return accepted, refused
 
 
-def step_keys_sql(catalog: str, run_ids: list[str]) -> str:
+def step_keys_sql(
+    catalog: str,
+    run_ids: list[str],
+    owners: list[str] | None = None,
+    event_dates: list[str] | None = None,
+) -> str:
+    """Steps already stored for these runs.
+
+    ``owner`` and ``event_date`` are the leading cluster columns. They are added only when every
+    value is safe, so a bad value widens the lookup instead of hiding a row that should dedupe.
+    """
+
     if not catalog or not _SAFE_TOKEN.match(catalog):
         raise ValueError("catalog is required")
     safe_ids = [value for value in run_ids if _SAFE_TOKEN.match(value)]
     if not safe_ids:
         raise ValueError("run id is required")
-    quoted = ", ".join(f"'{value}'" for value in safe_ids)
+    quoted_ids = ", ".join(f"'{value}'" for value in dict.fromkeys(safe_ids))
+    filters = [f"run_id IN ({quoted_ids})"]
+    if owners:
+        unique_owners = list(dict.fromkeys(owners))
+        if all(_SAFE_TOKEN.match(value) for value in unique_owners):
+            quoted_owners = ", ".join(f"'{value}'" for value in sorted(unique_owners))
+            filters.append(f"owner IN ({quoted_owners})")
+    if event_dates:
+        unique_dates = list(dict.fromkeys(event_dates))
+        if all(_SAFE_DATE.match(value) for value in unique_dates):
+            quoted_dates = ", ".join(f"DATE '{value}'" for value in sorted(unique_dates))
+            filters.append(f"event_date IN ({quoted_dates})")
     return (
         f"SELECT run_id, step_no, status FROM {catalog}.framework_meta.run_ledger "
-        f"WHERE run_id IN ({quoted})"
+        f"WHERE {' AND '.join(filters)}"
     )
 
 
