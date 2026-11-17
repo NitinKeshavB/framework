@@ -512,9 +512,7 @@ def _rows(frame: Any) -> list[dict]:
 
 
 def _event_time(column: str) -> str:
-    # The framework writes UTC timestamps as 2026-11-09T00:00:00Z. CAST alone drops the T/Z form
-    # on some runtimes and stores NULL, which breaks history ordering.
-    return (
-        f"COALESCE(to_timestamp({column}, 'yyyy-MM-dd''T''HH:mm:ss''Z'''), "
-        f"CAST({column} AS TIMESTAMP))"
-    )
+    # The framework writes UTC timestamps as 2026-11-09T00:00:00Z, which CAST reads as UTC. A
+    # datetime pattern would need quoted T and Z, and Databricks rejects the quoting that
+    # open-source Spark accepts.
+    return f"CAST({column} AS TIMESTAMP)"

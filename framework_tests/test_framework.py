@@ -974,7 +974,10 @@ def test_step_lookup_prunes_by_owner_and_event_date():
     assert "event_date IN (DATE '2026-11-09')" in statement
     widened = step_keys_sql("framework_dev", ["100"], owners=["bad owner"])
     assert "owner IN" not in widened
-    assert "to_timestamp" in _cast("recorded_at", ("recorded_at",), (), ())
+    cast = _cast("recorded_at", ("recorded_at",), (), ())
+    assert cast == "CAST(recorded_at AS TIMESTAMP) AS recorded_at"
+    # Databricks rejects a datetime pattern with quoted T and Z.
+    assert "to_timestamp" not in cast and "''" not in cast
 
 
 def test_one_merge_closes_the_changed_version_and_inserts_the_new_one():
