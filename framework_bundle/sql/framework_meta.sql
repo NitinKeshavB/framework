@@ -515,15 +515,24 @@ WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
 
 -- A table has one current owner. This view is empty when that holds. A row here means
 -- object_current was written by hand with two rows for the same name.
+-- The owners are made distinct first. Photon fails to compile a distinct count in HAVING
+-- next to collect_set over the same expression.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_conflicts AS
+WITH holders AS (
+  SELECT DISTINCT
+    object_kind,
+    full_name,
+    concat(owner_kind, ':', owner) AS holder
+  FROM ${catalog}.framework_meta.object_current
+  WHERE object_kind IN ('pipeline', 'table', 'streaming_table', 'materialized_view')
+)
 SELECT
   object_kind,
   full_name,
-  collect_set(concat(owner_kind, ':', owner)) AS owners
-FROM ${catalog}.framework_meta.object_current
-WHERE object_kind IN ('pipeline', 'table', 'streaming_table', 'materialized_view')
+  sort_array(collect_list(holder)) AS owners
+FROM holders
 GROUP BY object_kind, full_name
-HAVING count(DISTINCT concat(owner_kind, ':', owner)) > 1;
+HAVING count(*) > 1;
 
 -- Every version of every object. A version was active during [valid_from, valid_to). A
 -- null valid_to is still active. A deletion version (is_deleted) says the definition was
