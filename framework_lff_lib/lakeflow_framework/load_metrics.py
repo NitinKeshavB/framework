@@ -157,30 +157,30 @@ staged_expectations AS (
 )
 SELECT
   '{job_name}' AS job_name,
-  pipeline_id,
-  max(pipeline_name) AS pipeline_name,
-  update_id,
-  dataflow,
-  max(owner_kind) AS owner_kind,
-  max(owner) AS owner,
-  max(CASE WHEN layer = 'bronze' THEN table_name END) AS bronze_table,
-  max(CASE WHEN layer = 'quarantine' THEN table_name END) AS quarantine_table,
-  min(started_at) AS started_at,
-  max(ended_at) AS ended_at,
-  (unix_millis(max(ended_at)) - unix_millis(min(started_at))) / 1000.0 AS duration_seconds,
-  max(CASE WHEN layer = 'staged' THEN rows_written END) AS rows_read,
-  max(CASE WHEN layer = 'bronze' THEN rows_written END) AS rows_bronze,
-  max(CASE WHEN layer = 'quarantine' THEN rows_written END) AS rows_quarantine,
-  coalesce(max(CASE WHEN layer = 'bronze' THEN rows_written END), 0)
-    + coalesce(max(CASE WHEN layer = 'quarantine' THEN rows_written END), 0) AS rows_processed,
-  max(CASE WHEN layer = 'bronze' THEN status END) AS bronze_status,
-  max(CASE WHEN layer = 'quarantine' THEN status END) AS quarantine_status,
+  r.pipeline_id,
+  max(r.pipeline_name) AS pipeline_name,
+  r.update_id,
+  r.dataflow,
+  max(r.owner_kind) AS owner_kind,
+  max(r.owner) AS owner,
+  max(CASE WHEN r.layer = 'bronze' THEN r.table_name END) AS bronze_table,
+  max(CASE WHEN r.layer = 'quarantine' THEN r.table_name END) AS quarantine_table,
+  min(r.started_at) AS started_at,
+  max(r.ended_at) AS ended_at,
+  (unix_millis(max(r.ended_at)) - unix_millis(min(r.started_at))) / 1000.0 AS duration_seconds,
+  max(CASE WHEN r.layer = 'staged' THEN r.rows_written END) AS rows_read,
+  max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END) AS rows_bronze,
+  max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END) AS rows_quarantine,
+  coalesce(max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END), 0)
+    + coalesce(max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END), 0) AS rows_processed,
+  max(CASE WHEN r.layer = 'bronze' THEN r.status END) AS bronze_status,
+  max(CASE WHEN r.layer = 'quarantine' THEN r.status END) AS quarantine_status,
   max(e.expectations) AS expectations
 FROM resolved r
 LEFT JOIN staged_expectations e ON e.dataflow = r.dataflow
-WHERE dataflow IS NOT NULL
-  AND layer IN ('staged', 'bronze', 'quarantine')
-GROUP BY pipeline_id, update_id, dataflow
+WHERE r.dataflow IS NOT NULL
+  AND r.layer IN ('staged', 'bronze', 'quarantine')
+GROUP BY r.pipeline_id, r.update_id, r.dataflow
 """
 
 

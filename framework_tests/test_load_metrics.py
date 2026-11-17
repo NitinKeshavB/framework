@@ -15,6 +15,8 @@ def test_latest_bronze_loads_sql_reads_only_the_newest_update() -> None:
     assert "QUALIFY row_number() OVER (ORDER BY timestamp DESC) = 1" in sql
     assert "rows_read" in sql and "rows_quarantine" in sql and "rows_processed" in sql
     assert "'abs_daily' AS job_name" in sql
+    assert "WHERE r.dataflow IS NOT NULL" in sql
+    assert "GROUP BY r.pipeline_id, r.update_id, r.dataflow" in sql
     assert "MERGE" not in sql.upper()
 
 
