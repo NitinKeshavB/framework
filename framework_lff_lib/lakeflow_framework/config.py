@@ -249,10 +249,17 @@ class PipelineConfig:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def load_yaml(path: Path) -> dict[str, Any]:
-    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+def read_mapping(path: Path, errors: list[str]) -> dict[str, Any] | None:
+    """The YAML mapping in ``path``, or None with the problem appended to ``errors``."""
+
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        errors.append(f"{path}: {exc}")
+        return None
     if not isinstance(document, dict):
-        raise ConfigValidationError([f"{path}: the document must be a mapping"])
+        errors.append(f"{path}: the document must be a mapping")
+        return None
     return document
 
 
@@ -263,13 +270,8 @@ def validate_configs(paths: list[Path], catalog: str | None = None) -> list[Pipe
     errors: list[str] = []
     configs: list[PipelineConfig] = []
     for path in paths:
-        try:
-            document = load_yaml(path)
-        except ConfigValidationError as exc:
-            errors.extend(exc.errors)
-            continue
-        except yaml.YAMLError as exc:
-            errors.append(f"{path}: {exc}")
+        document = read_mapping(path, errors)
+        if document is None:
             continue
         if catalog:
             document = {**document, "catalog": catalog}

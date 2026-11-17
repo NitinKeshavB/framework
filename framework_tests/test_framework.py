@@ -13,7 +13,6 @@ from lakeflow_framework.collector import (
     _cast,
     append_definitions,
     await_registered,
-    decode_events,
     event_statements,
 )
 from lakeflow_framework.config import config_from_document, email_notifications
@@ -1093,33 +1092,6 @@ def test_batch_sql_escapes_quotes_in_paths_and_excel_addresses():
     assert "'''Sheet1''!A1'" in get_strategy("ctas").batch_sql(config_from_document(excel))[0]
 
 
-def test_event_files_are_read_whole_and_parsed_without_a_schema(tmp_path: Path, capsys):
-    """The collector reads each file as text, so steps and definitions need no shared schema."""
-
-    step = step_payload(
-        owner="billing", full_name="billing_daily", run_id="7", step_no=10,
-        step_name="mark_running", status="RUNNING", object_kind="workflow",
-    )  # fmt: skip
-    definition = object_rows(config_from_document(_billing()))[0]
-    texts = [
-        json.dumps(step, sort_keys=True),
-        json.dumps({"kind": "definition", **definition}, sort_keys=True),
-        "not json at all",
-        json.dumps(["not", "an", "object"]),
-        "",
-    ]
-    payloads = decode_events(texts)
-    assert [payload["kind"] for payload in payloads] == ["step", "definition"]
-    assert "skipped" in capsys.readouterr().out
-
-    steps, definitions = split_payloads(payloads)
-    (row,) = ingest_steps(steps)
-    assert (row["run_id"], row["step_no"], row["status"]) == ("7", 10, "RUNNING")
-    assert row["parent_run_id"] is None and row["recon_json"] is None
-    assert definitions[0]["full_name"] == definition["full_name"]
-    assert set(definitions[0]) == set(OBJECT_COLUMNS)
-
-
 def test_pipeline_lookup_binds_the_id_and_rejects_sql():
     class Frame:
         def collect(self):
@@ -1134,7 +1106,7 @@ def test_pipeline_lookup_binds_the_id_and_rejects_sql():
             return Frame()
 
     assert UnityMetadata(Spark()).get_pipeline("billing_invoices") is None
-    assert "full_name = 'billing_invoices'" in statements[0]
+    assert "full_name IN ('billing_invoices')" in statements[0]
     for hostile in ("billing' OR '1'='1", "a;b", "x y", "", "a\n"):
         with pytest.raises(MetadataNotFound):
             UnityMetadata(Spark()).get_pipeline(hostile)

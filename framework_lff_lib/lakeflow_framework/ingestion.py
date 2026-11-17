@@ -30,6 +30,7 @@ from lakeflow_framework.config import (
     ConfigValidationError,
     PipelineConfig,
     email_notifications,
+    read_mapping,
     validate_configs,
 )
 
@@ -132,18 +133,12 @@ def registry_rows(bundle: Path, catalog: str) -> list[dict[str, Any]]:
     read what was just deployed without waiting for the next delivery run.
     """
 
-    from lakeflow_framework.metadata import new_object_rows, object_rows, workflow_rows
+    from lakeflow_framework.metadata import definition_rows
 
     if not catalog or not re.fullmatch(r"[A-Za-z0-9_-]+", catalog):
         raise ConfigValidationError(["catalog is required"])
     systems = load_sources(bundle, catalog=catalog)
-    configs = [table.config for system in systems for table in system.tables]
-    seen: set[tuple[str, str, str]] = set()
-    rows: list[dict[str, Any]] = []
-    for config in configs:
-        rows.extend(new_object_rows(object_rows(config), seen))
-    rows.extend(new_object_rows(workflow_rows(configs), seen))
-    return rows
+    return definition_rows([table.config for system in systems for table in system.tables])
 
 
 def render_map(systems: list[SourceSystem]) -> str:
@@ -205,20 +200,43 @@ def generate(bundle: Path, check: bool = False) -> list[str]:
     """
 
     files = render_files(load_sources(bundle))
-    stale: list[str] = []
-    for relative, text in files.items():
-        target = bundle / relative
-        if not target.exists() or target.read_text(encoding="utf-8") != text:
-            stale.append(relative)
-            if not check:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding="utf-8")
+    stale = write_generated(bundle, files, check)
     for relative in _generated_files(bundle):
         if relative not in files:
             stale.append(relative)
             if not check:
                 (bundle / relative).unlink()
     return sorted(stale)
+
+
+def write_generated(root: Path, files: dict[str, str], check: bool) -> list[str]:
+    """Write each file whose text differs from disk. With ``check``, change nothing.
+
+    Returns the paths that were out of date, in the order given.
+    """
+
+    stale: list[str] = []
+    for relative, text in files.items():
+        target = root / relative
+        if not target.exists() or target.read_text(encoding="utf-8") != text:
+            stale.append(relative)
+            if not check:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+    return stale
+
+
+def identifier_problems(values: dict[str, str]) -> list[str]:
+    return [
+        f"{key} must be an identifier, not {value!r}"
+        for key, value in values.items()
+        if not IDENTIFIER.match(value)
+    ]
+
+
+def refuse_existing(target: Path) -> None:
+    if target.exists():
+        raise ConfigValidationError([f"{target} already exists"])
 
 
 def _generated_files(bundle: Path) -> list[str]:
@@ -432,15 +450,10 @@ def _trigger_volume_problems(systems: list[SourceSystem]) -> list[str]:
 
 
 def _read_source(path: Path, name: str, errors: list[str]) -> SourceSystem | None:
-    try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        errors.append(f"{path}: {exc}")
+    document = read_mapping(path, errors)
+    if document is None:
         return None
     found: list[str] = []
-    if not isinstance(document, dict):
-        errors.append(f"{path}: the document must be a mapping")
-        return None
     if document.get("source_system") != name:
         found.append(f"{path}: source_system must be {name}, the folder name")
     domain = str(document.get("domain") or "")
@@ -637,16 +650,16 @@ def _system_section(system: SourceSystem) -> list[str]:
         )
     lines += ["", "```mermaid", "flowchart LR"]
     for name in sorted(system.deliveries):
-        lines.append(f"  {_node(system.name, name)}{{{{{name}}}}}")
+        lines.append(f"  {node_id(system.name, name)}{{{{{name}}}}}")
     for table in sorted(system.tables, key=lambda item: item.config.pipeline_id):
         config = table.config
         lines.append(
-            f"  {_node(system.name, table.delivery)} -->|{table.requested_by or system.name}| "
-            f"{_node(config.pipeline_id)}[{config.pipeline_id}]"
+            f"  {node_id(system.name, table.delivery)} -->|{table.requested_by or system.name}| "
+            f"{node_id(config.pipeline_id)}[{config.pipeline_id}]"
         )
-        bronze = _node(config.bronze_schema, config.bronze_table)
+        bronze = node_id(config.bronze_schema, config.bronze_table)
         lines.append(
-            f"  {_node(config.pipeline_id)} --> {bronze}"
+            f"  {node_id(config.pipeline_id)} --> {bronze}"
             f"[{config.bronze_schema}.{config.bronze_table}]"
         )
     lines.append("```")
@@ -664,8 +677,7 @@ def new_source(
     if not EMAIL.match(owner):
         raise ConfigValidationError(["owner must be an email address"])
     target = bundle / "sources" / source_system / SOURCE_FILE
-    if target.exists():
-        raise ConfigValidationError([f"{target} already exists"])
+    refuse_existing(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     head = f"source_system: {source_system}\ndomain: {domain}\nowner: {owner}\nkind: {kind}\n\n"
     if kind in FILE_KINDS:
@@ -730,8 +742,7 @@ def new_table(
     target_dir = folder / requested_by if requested_by else folder
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{source_system}_{table}.yaml"
-    if target.exists():
-        raise ConfigValidationError([f"{target} already exists"])
+    refuse_existing(target)
     kind = str(found.get("kind") or "")
     template = {
         "database": _DATABASE_TEMPLATE,
@@ -852,11 +863,7 @@ raw_to_bronze:
 
 
 def _names(values: dict[str, str]) -> None:
-    bad = [
-        f"{key} must be an identifier, not {value!r}"
-        for key, value in values.items()
-        if not IDENTIFIER.match(value)
-    ]
+    bad = identifier_problems(values)
     if bad:
         raise ConfigValidationError(bad)
 
@@ -872,5 +879,5 @@ def _reads(config: PipelineConfig) -> str:
     return f"{config.path} ({config.file_format})"
 
 
-def _node(*parts: str) -> str:
+def node_id(*parts: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", "_".join(parts))

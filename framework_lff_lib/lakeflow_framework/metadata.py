@@ -7,7 +7,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from lakeflow_framework.config import PipelineConfig
 from lakeflow_framework.quality import compile_rules
@@ -38,106 +38,58 @@ def ddl_statements(catalog: str, text: str | None = None) -> list[str]:
 
 def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[dict[str, Any]]:
     recorded = recorded_at or _now()
-    config_json = json.dumps(
-        {
-            "config": config.canonical(),
-            "rules": [
-                {"name": rule.name, "expression": rule.expression, "origin": rule.origin}
-                for rule in compile_rules(config)
-            ],
-        },
-        sort_keys=True,
-    )
     pipeline_name = config.pipeline_id
     scope = _scope(config)
+
+    def row(kind: str, name: str, parent: str | None, relation: str | None, payload: Any):
+        return _framework_object(kind, name, scope, parent, relation, payload, recorded)
+
+    rules = [
+        {"name": rule.name, "expression": rule.expression, "origin": rule.origin}
+        for rule in compile_rules(config)
+    ]
     rows = [
-        _object(
+        row(
             "pipeline",
             pipeline_name,
-            scope,
             config.job_name,
             "owns" if config.job_name else None,
-            config_json,
-            _digest(config_json),
-            "framework",
-            recorded,
-        )
+            {"config": config.canonical(), "rules": rules},
+        ),
+        row("dataflow", pipeline_name, pipeline_name, "contains", _dataflow_record(config)),
     ]
-    dataflow_json = json.dumps(_dataflow_record(config), sort_keys=True)
-    rows.append(
-        _object(
-            "dataflow",
-            pipeline_name,
-            scope,
-            pipeline_name,
-            "contains",
-            dataflow_json,
-            _digest(dataflow_json),
-            "framework",
-            recorded,
-        )
-    )
     if config.load_method == "volume_files":
-        raw_flow = json.dumps({"layer": "raw", "path": config.path}, sort_keys=True)
         rows.append(
-            _object(
+            row(
                 "flow",
                 f"{pipeline_name}.raw",
-                scope,
                 pipeline_name,
                 "reads",
-                raw_flow,
-                _digest(raw_flow),
-                "framework",
-                recorded,
+                {"layer": "raw", "path": config.path},
             )
         )
     for layer, relation in (("raw", "writes"), ("bronze", "writes"), ("quarantine", "rejects_to")):
         if layer not in config.layers:
             continue
         full_name = config.table_name(layer)
-        flow_json = json.dumps({"table": full_name, "layer": layer}, sort_keys=True)
-        rows.append(
-            _object(
-                "flow",
-                f"{pipeline_name}.{layer}",
-                scope,
-                pipeline_name,
-                relation,
-                flow_json,
-                _digest(flow_json),
-                "framework",
-                recorded,
-            )
-        )
-        table_json = json.dumps(_table_record(config, layer), sort_keys=True)
-        rows.append(
-            _object(
+        flow_name = f"{pipeline_name}.{layer}"
+        rows += [
+            row("flow", flow_name, pipeline_name, relation, {"table": full_name, "layer": layer}),
+            row(
                 _securable_kind(config, layer),
                 full_name,
-                scope,
-                f"{pipeline_name}.{layer}",
+                flow_name,
                 relation,
-                table_json,
-                _digest(table_json),
-                "framework",
-                recorded,
-            )
-        )
-        link_json = json.dumps({"child": full_name}, sort_keys=True)
-        rows.append(
-            _object(
+                _table_record(config, layer),
+            ),
+            row(
                 "link",
                 f"{pipeline_name}->{full_name}",
-                scope,
                 pipeline_name,
                 relation,
-                link_json,
-                _digest(link_json),
-                "framework",
-                recorded,
-            )
-        )
+                {"child": full_name},
+            ),
+        ]
     rows.extend(_column_rows(config, recorded))
     return rows
 
@@ -155,29 +107,25 @@ def workflow_rows(
     rows: list[dict[str, Any]] = []
     for job_name, group in sorted(grouped.items()):
         requesters = sorted({item.requested_by for item in group if item.requested_by})
-        payload = json.dumps(
-            {
-                "pipeline_ids": sorted({item.pipeline_id for item in group}),
-                "requested_by": requesters,
-            },
-            sort_keys=True,
-        )
+        payload = {
+            "pipeline_ids": sorted({item.pipeline_id for item in group}),
+            "requested_by": requesters,
+        }
         scope = dict(_scope(group[0]))
         if len(requesters) != 1:
             scope["requested_by"] = None
-        rows.append(
-            _object(
-                "workflow",
-                job_name,
-                scope,
-                None,
-                None,
-                payload,
-                _digest(payload),
-                "framework",
-                recorded,
-            )
-        )
+        rows.append(_framework_object("workflow", job_name, scope, None, None, payload, recorded))
+    return rows
+
+
+def definition_rows(configs: list[PipelineConfig]) -> list[dict[str, Any]]:
+    """Every definition row for these configs, each version once."""
+
+    seen: set[tuple[str, str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    for config in configs:
+        rows.extend(new_object_rows(object_rows(config), seen))
+    rows.extend(new_object_rows(workflow_rows(configs), seen))
     return rows
 
 
@@ -288,8 +236,7 @@ def _column_hash(record: Mapping[str, Any]) -> str:
         "classification": record["classification"],
         "pii": record["pii"],
     }
-    payload = json.dumps(versioned, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return _digest(json.dumps(versioned, sort_keys=True, separators=(",", ":")))
 
 
 def _table_record(config: PipelineConfig, layer: str) -> dict[str, Any]:
@@ -325,6 +272,29 @@ def _scope(config: PipelineConfig) -> dict[str, str | None]:
         "requested_by": config.requested_by,
         "delivery": config.delivery or None,
     }
+
+
+def _framework_object(
+    kind: str,
+    full_name: str,
+    scope: Mapping[str, str | None],
+    parent: str | None,
+    relation: str | None,
+    payload: Any,
+    recorded_at: str,
+) -> dict[str, Any]:
+    config_json = json.dumps(payload, sort_keys=True)
+    return _object(
+        kind,
+        full_name,
+        scope,
+        parent,
+        relation,
+        config_json,
+        _digest(config_json),
+        "framework",
+        recorded_at,
+    )
 
 
 def _object(
@@ -418,7 +388,7 @@ def write_definition_files(directory: Path, rows: list[dict[str, Any]]) -> list[
             for row in group
         ]
         body = "\n".join(lines) + "\n"
-        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+        digest = _digest(body)[:16]
         target = directory / owner_kind / owner / "definitions" / f"{digest}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
@@ -602,69 +572,43 @@ def build_recon(
 
 
 def registered_sql(pipeline_ids: list[str], catalog: str) -> str:
-    if not catalog or not _SAFE_TOKEN.match(catalog):
-        raise ValueError("catalog is required")
+    _require_catalog(catalog)
     if not pipeline_ids or any(not _SAFE_TOKEN.match(pipeline_id) for pipeline_id in pipeline_ids):
         raise ValueError("pipeline id is required")
-    quoted = ", ".join(f"'{pipeline_id}'" for pipeline_id in pipeline_ids)
     return (
         f"SELECT full_name FROM {catalog}.framework_meta.v_object_current "
-        f"WHERE object_kind = 'pipeline' AND full_name IN ({quoted})"
+        f"WHERE object_kind = 'pipeline' AND full_name IN ({_sql_in(pipeline_ids)})"
     )
 
 
 def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
     """Current hash for each object. object_current has one row, so this is a point lookup."""
 
-    if not catalog or not _SAFE_TOKEN.match(catalog):
-        raise ValueError("catalog is required")
-    names = sorted({str(row["full_name"]) for row in rows})
-    kinds = sorted({str(row["object_kind"]) for row in rows})
-    owners = sorted({str(row.get("owner") or "") for row in rows})
+    _require_catalog(catalog)
+    names, kinds, owners = _object_keys(rows)
     owner_kinds = sorted({str(row.get("owner_kind") or "") for row in rows})
-    if not names or any(not _SAFE_NAME.match(name) for name in names):
-        raise ValueError("object name is required")
-    if any(not _SAFE_TOKEN.match(kind) for kind in kinds):
-        raise ValueError("object kind is required")
-    if any(not _SAFE_TOKEN.match(value) for value in [*owners, *owner_kinds]):
+    if any(not _SAFE_TOKEN.match(value) for value in owner_kinds):
         raise ValueError("owner is required")
-    quoted_names = ", ".join(f"'{name}'" for name in names)
-    quoted_kinds = ", ".join(f"'{kind}'" for kind in kinds)
-    quoted_owners = ", ".join(f"'{owner}'" for owner in owners)
-    quoted_owner_kinds = ", ".join(f"'{kind}'" for kind in owner_kinds)
     return (
         "SELECT object_kind, full_name, content_hash "
         f"FROM {catalog}.framework_meta.object_current "
-        f"WHERE owner_kind IN ({quoted_owner_kinds}) AND owner IN ({quoted_owners}) "
-        f"AND object_kind IN ({quoted_kinds}) "
-        f"AND full_name IN ({quoted_names})"
+        f"WHERE owner_kind IN ({_sql_in(owner_kinds)}) AND owner IN ({_sql_in(owners)}) "
+        f"AND object_kind IN ({_sql_in(kinds)}) "
+        f"AND full_name IN ({_sql_in(names)})"
     )
 
 
 def recorded_versions_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
     """History rows for these exact versions. A retry matches hash and recorded_at."""
 
-    if not catalog or not _SAFE_TOKEN.match(catalog):
-        raise ValueError("catalog is required")
-    names = sorted({str(row["full_name"]) for row in rows})
-    kinds = sorted({str(row["object_kind"]) for row in rows})
-    owners = sorted({str(row.get("owner") or "") for row in rows})
+    _require_catalog(catalog)
+    names, kinds, owners = _object_keys(rows)
     hashes = sorted({str(row["content_hash"]) for row in rows})
     instants = sorted({str(row["recorded_at"]) for row in rows})
-    if not names or any(not _SAFE_NAME.match(name) for name in names):
-        raise ValueError("object name is required")
-    if any(not _SAFE_TOKEN.match(kind) for kind in kinds):
-        raise ValueError("object kind is required")
-    if any(not _SAFE_TOKEN.match(owner) for owner in owners):
-        raise ValueError("owner is required")
     if any(not _SAFE_HASH.match(value) for value in hashes):
         raise ValueError("content hash is required")
     if any(not _SAFE_INSTANT.match(value) for value in instants):
         raise ValueError("recorded_at is required")
-    quoted_names = ", ".join(f"'{name}'" for name in names)
-    quoted_kinds = ", ".join(f"'{kind}'" for kind in kinds)
-    quoted_owners = ", ".join(f"'{owner}'" for owner in owners)
-    quoted_hashes = ", ".join(f"'{value}'" for value in hashes)
     quoted_times = ", ".join(
         f"to_timestamp('{instant}', 'yyyy-MM-dd''T''HH:mm:ss''Z''')" for instant in instants
     )
@@ -672,40 +616,62 @@ def recorded_versions_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
         "SELECT object_kind, full_name, content_hash, "
         "date_format(recorded_at, 'yyyy-MM-dd''T''HH:mm:ss''Z''') AS recorded_at "
         f"FROM {catalog}.framework_meta.object_registry "
-        f"WHERE owner IN ({quoted_owners}) "
-        f"AND object_kind IN ({quoted_kinds}) AND full_name IN ({quoted_names}) "
-        f"AND content_hash IN ({quoted_hashes}) AND recorded_at IN ({quoted_times})"
+        f"WHERE owner IN ({_sql_in(owners)}) "
+        f"AND object_kind IN ({_sql_in(kinds)}) AND full_name IN ({_sql_in(names)}) "
+        f"AND content_hash IN ({_sql_in(hashes)}) AND recorded_at IN ({quoted_times})"
     )
 
 
 def object_keys_sql(catalog: str, content_hashes: list[str]) -> str:
-    if not catalog or not _SAFE_TOKEN.match(catalog):
-        raise ValueError("catalog is required")
+    _require_catalog(catalog)
     hashes = [value for value in content_hashes if _SAFE_HASH.match(value)]
     if not hashes:
         raise ValueError("content hash is required")
-    quoted = ", ".join(f"'{value}'" for value in hashes)
     return (
         f"SELECT object_kind, full_name, content_hash FROM {catalog}.framework_meta.object_registry "
-        f"WHERE content_hash IN ({quoted})"
+        f"WHERE content_hash IN ({_sql_in(hashes)})"
     )
 
 
 def owners_sql(catalog: str, full_names: list[str]) -> str:
     """Current owner of each named table or pipeline, from the registry."""
 
-    if not catalog or not _SAFE_TOKEN.match(catalog):
-        raise ValueError("catalog is required")
+    _require_catalog(catalog)
     names = [value for value in full_names if _SAFE_NAME.match(value)]
     if not names:
         raise ValueError("full name is required")
-    quoted = ", ".join(f"'{value}'" for value in names)
     return (
         f"SELECT object_kind, full_name, owner_kind, owner "
         f"FROM {catalog}.framework_meta.v_object_current "
-        f"WHERE object_kind IN ({', '.join(repr(kind) for kind in OWNED_KINDS)}) "
-        f"AND full_name IN ({quoted})"
+        f"WHERE object_kind IN ({_sql_in(OWNED_KINDS)}) "
+        f"AND full_name IN ({_sql_in(names)})"
     )
+
+
+def _require_catalog(catalog: str) -> None:
+    if not catalog or not _SAFE_TOKEN.match(catalog):
+        raise ValueError("catalog is required")
+
+
+def _sql_in(values: Iterable[str]) -> str:
+    """Quote values already checked against a safe pattern for an IN list."""
+
+    return ", ".join(f"'{value}'" for value in values)
+
+
+def _object_keys(rows: list[Mapping[str, Any]]) -> tuple[list[str], list[str], list[str]]:
+    """Sorted, checked names, kinds, and owners of definition rows."""
+
+    names = sorted({str(row["full_name"]) for row in rows})
+    kinds = sorted({str(row["object_kind"]) for row in rows})
+    owners = sorted({str(row.get("owner") or "") for row in rows})
+    if not names or any(not _SAFE_NAME.match(name) for name in names):
+        raise ValueError("object name is required")
+    if any(not _SAFE_TOKEN.match(kind) for kind in kinds):
+        raise ValueError("object kind is required")
+    if any(not _SAFE_TOKEN.match(owner) for owner in owners):
+        raise ValueError("owner is required")
+    return names, kinds, owners
 
 
 def ownership_conflicts(
@@ -740,18 +706,15 @@ def step_keys_sql(
     value is safe, so a bad value widens the lookup instead of hiding a row that should dedupe.
     """
 
-    if not catalog or not _SAFE_TOKEN.match(catalog):
-        raise ValueError("catalog is required")
+    _require_catalog(catalog)
     safe_ids = [value for value in run_ids if _SAFE_TOKEN.match(value)]
     if not safe_ids:
         raise ValueError("run id is required")
-    quoted_ids = ", ".join(f"'{value}'" for value in dict.fromkeys(safe_ids))
-    filters = [f"run_id IN ({quoted_ids})"]
+    filters = [f"run_id IN ({_sql_in(dict.fromkeys(safe_ids))})"]
     if owners:
         unique_owners = list(dict.fromkeys(owners))
         if all(_SAFE_TOKEN.match(value) for value in unique_owners):
-            quoted_owners = ", ".join(f"'{value}'" for value in sorted(unique_owners))
-            filters.append(f"owner IN ({quoted_owners})")
+            filters.append(f"owner IN ({_sql_in(sorted(unique_owners))})")
     if event_dates:
         unique_dates = list(dict.fromkeys(event_dates))
         if all(_SAFE_DATE.match(value) for value in unique_dates):
