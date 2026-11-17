@@ -391,7 +391,15 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
             "pipeline_task": {"pipeline_id": f"${{resources.pipelines.{name}_pipeline.id}}"},
         }
     )
-    tasks.append(step("record_success", ["refresh_pipeline"], 50, "SUCCEEDED"))
+    # After the refresh, so every table exists to be tagged.
+    tasks.append(
+        run_cli(
+            "apply_metadata",
+            ["refresh_pipeline"],
+            ["apply-metadata", *spec_paths, "--catalog", "${var.catalog}"],
+        )
+    )
+    tasks.append(step("record_success", ["apply_metadata"], 50, "SUCCEEDED"))
     tasks.append(
         step(
             "record_failure",

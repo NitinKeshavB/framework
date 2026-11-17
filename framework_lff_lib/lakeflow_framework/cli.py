@@ -87,6 +87,12 @@ def main(argv: list[str] | None = None) -> int:
     waiting.add_argument("--catalog", required=True)
     waiting.add_argument("--timeout-seconds", type=float, default=300)
 
+    unity = commands.add_parser(
+        "apply-metadata", help="set each spec's tags and column comments in Unity Catalog"
+    )
+    unity.add_argument("paths", nargs="+", type=Path, help="the spec files the job loads")
+    unity.add_argument("--catalog", required=True)
+
     batch = commands.add_parser("batch-sql")
     batch.add_argument("paths", nargs="+", type=Path)
     batch.add_argument("--pipeline", required=True)
@@ -176,6 +182,15 @@ def main(argv: list[str] | None = None) -> int:
             spark = SparkSession.builder.getOrCreate()
             await_registered(spark, expected, args.catalog, timeout_seconds=args.timeout_seconds)
             print(f"registry has the synced {', '.join(expected)}")
+            return 0
+        if args.command == "apply-metadata":
+            from pyspark.sql import SparkSession
+
+            from lakeflow_framework.unity import apply_metadata
+
+            configs = validate_configs(_yaml_files(args.paths), catalog=args.catalog)
+            applied = apply_metadata(SparkSession.builder.getOrCreate(), configs, args.catalog)
+            print(f"applied {len(applied)} metadata change(s)")
             return 0
         if args.command == "step":
             payload = step_payload(

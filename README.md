@@ -69,7 +69,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 ## Deploy order
 
-1. `./run.sh bundle:deploy framework_bundle <target> <profile>`. After the upload it runs `framework_ddl`, so the registry tables and views exist when the command returns. It then runs `framework_system_views`, which needs `SELECT` on `system.lakeflow` and `system.billing`; without those grants it warns and the deploy still succeeds.
+1. `./run.sh bundle:deploy framework_bundle <target> <profile>`. After the upload it runs `framework_ddl`, so the registry tables and views exist when the command returns. It then runs `framework_system_views`, which needs `SELECT` on `system.lakeflow`, `system.billing`, and `system.access`; without those grants it warns and the deploy still succeeds.
 2. Start `framework_collector`. It stays the writer for run steps. It is paused by default.
 3. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry.
 4. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
@@ -97,6 +97,8 @@ Query `<catalog>.framework_meta`:
 | `table_load_metrics` | Rows written, upserted, deleted, and dropped, expectation counts, backlog, and duration per pipeline update, flow, and table |
 | `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run state, termination code, durations, and list cost from the system tables |
 | `table_health` | Daily file count, size, and last load commit of each bronze table |
+| `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
+| `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source |
 
 Filter by `owner` and, for runs, `event_date`. History is insert-only.
 

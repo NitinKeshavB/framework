@@ -474,3 +474,91 @@ SELECT DISTINCT
 FROM ${catalog}.framework_meta.object_current
 WHERE object_kind = 'flow'
   AND config:layer::STRING = 'bronze';
+
+-- Declared tags and column comments that Unity Catalog does not hold, or holds differently.
+-- Empty when every apply_metadata task has run since the last spec change. Only tables that
+-- exist are compared, and only the tags this framework sets.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_metadata_drift AS
+WITH existing AS (
+  SELECT lower(concat_ws('.', table_catalog, table_schema, table_name)) AS table_name
+  FROM ${catalog}.information_schema.tables
+),
+declared_tables AS (
+  SELECT lower(full_name) AS table_name, owner_kind, owner, item, nullif(declared, '') AS declared
+  FROM ${catalog}.framework_meta.object_current
+  LATERAL VIEW explode(map(
+    'classification', config:classification::STRING,
+    'domain', config:domain::STRING,
+    'owner', owner,
+    'pii', config:pii::STRING
+  )) items AS item, declared
+  WHERE object_kind IN ('table', 'streaming_table', 'materialized_view')
+),
+applied_tables AS (
+  SELECT
+    lower(concat_ws('.', catalog_name, schema_name, table_name)) AS table_name,
+    tag_name AS item,
+    tag_value AS applied
+  FROM ${catalog}.information_schema.table_tags
+  WHERE tag_name IN ('classification', 'domain', 'owner', 'pii')
+),
+declared_columns AS (
+  SELECT
+    lower(parent_full_name) AS table_name,
+    lower(config:name::STRING) AS column_name,
+    owner_kind,
+    owner,
+    item,
+    nullif(declared, '') AS declared
+  FROM ${catalog}.framework_meta.object_current
+  LATERAL VIEW explode(map(
+    'classification', config:classification::STRING,
+    'pii', config:pii::STRING,
+    'comment', config:description::STRING
+  )) items AS item, declared
+  WHERE object_kind = 'column'
+),
+applied_columns AS (
+  SELECT
+    lower(concat_ws('.', catalog_name, schema_name, table_name)) AS table_name,
+    lower(column_name) AS column_name,
+    tag_name AS item,
+    tag_value AS applied
+  FROM ${catalog}.information_schema.column_tags
+  WHERE tag_name IN ('classification', 'pii')
+  UNION ALL
+  SELECT
+    lower(concat_ws('.', table_catalog, table_schema, table_name)) AS table_name,
+    lower(column_name) AS column_name,
+    'comment' AS item,
+    comment AS applied
+  FROM ${catalog}.information_schema.columns
+  WHERE comment IS NOT NULL
+)
+SELECT
+  d.table_name,
+  CAST(NULL AS STRING) AS column_name,
+  d.owner_kind,
+  d.owner,
+  d.item,
+  d.declared,
+  a.applied
+FROM declared_tables d
+JOIN existing e ON e.table_name = d.table_name
+LEFT JOIN applied_tables a ON a.table_name = d.table_name AND a.item = d.item
+WHERE NOT (d.declared <=> a.applied)
+UNION ALL
+SELECT
+  d.table_name,
+  d.column_name,
+  d.owner_kind,
+  d.owner,
+  d.item,
+  d.declared,
+  a.applied
+FROM declared_columns d
+JOIN existing e ON e.table_name = d.table_name
+LEFT JOIN applied_columns a
+  ON a.table_name = d.table_name AND a.column_name = d.column_name AND a.item = d.item
+WHERE NOT (d.declared <=> a.applied)
+  AND NOT (d.item = 'comment' AND d.declared IS NULL);

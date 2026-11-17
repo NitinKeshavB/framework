@@ -1,6 +1,6 @@
--- Job, task, and pipeline runs from the system tables, joined to the registry.
+-- Job, task, and pipeline runs, and observed lineage, from the system tables, joined to the registry.
 -- ${catalog} is replaced by the DDL task. The identity that runs it needs SELECT on
--- system.lakeflow and system.billing. Anyone who can read framework_meta can read these views,
+-- system.lakeflow, system.billing, and system.access. Anyone who can read framework_meta can read these views,
 -- cost included.
 --
 -- Deployed names carry a dev or prod prefix, so jobs are matched on the
@@ -193,3 +193,60 @@ LEFT JOIN costs cost
   ON cost.workspace_id = pu.workspace_id
  AND cost.pipeline_id = pu.pipeline_id
  AND cost.update_id = pu.update_id;
+
+-- What Unity Catalog saw each bronze and quarantine table read, next to the source the spec
+-- declares. The registry's link and flow rows stay the declared intent, and this is the
+-- observed side. status is declared when the observed source is the declared raw table or under the
+-- declared raw path, undeclared when it is something else, and not_observed when Unity Catalog
+-- has no lineage for the table yet.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_observed_lineage AS
+WITH dataflows AS (
+  SELECT
+    full_name AS dataflow,
+    owner_kind,
+    owner,
+    lower(regexp_replace(config:raw::STRING, '/+$', '')) AS declared_source,
+    lower(config:bronze::STRING) AS bronze,
+    lower(config:quarantine::STRING) AS quarantine
+  FROM ${catalog}.framework_meta.object_current
+  WHERE object_kind = 'dataflow'
+),
+targets AS (
+  SELECT dataflow, owner_kind, owner, declared_source, bronze AS target_table, 'bronze' AS layer
+  FROM dataflows
+  UNION ALL
+  SELECT dataflow, owner_kind, owner, declared_source, quarantine, 'quarantine'
+  FROM dataflows
+),
+observed AS (
+  SELECT
+    lower(target_table_full_name) AS target_table,
+    lower(coalesce(source_table_full_name, source_path)) AS observed_source,
+    max(source_type) AS source_type,
+    max(event_time) AS last_seen,
+    count(*) AS events
+  FROM system.access.table_lineage
+  WHERE lower(target_table_full_name) IN (SELECT target_table FROM targets)
+    AND coalesce(source_table_full_name, source_path) IS NOT NULL
+  GROUP BY lower(target_table_full_name), lower(coalesce(source_table_full_name, source_path))
+)
+SELECT
+  t.dataflow,
+  t.owner_kind,
+  t.owner,
+  t.layer,
+  t.target_table,
+  t.declared_source,
+  o.observed_source,
+  o.source_type,
+  o.last_seen,
+  o.events,
+  CASE
+    WHEN o.observed_source IS NULL THEN 'not_observed'
+    WHEN o.observed_source = t.declared_source THEN 'declared'
+    WHEN t.declared_source LIKE '/volumes/%'
+      AND o.observed_source LIKE concat('%', t.declared_source, '%') THEN 'declared'
+    ELSE 'undeclared'
+  END AS status
+FROM targets t
+LEFT JOIN observed o ON o.target_table = t.target_table;

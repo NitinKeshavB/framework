@@ -75,9 +75,20 @@ resources:
         - task_key: await_registry
         pipeline_task:
           pipeline_id: ${resources.pipelines.abs_daily_pipeline.id}
-      - task_key: record_success
+      - task_key: apply_metadata
         depends_on:
         - task_key: refresh_pipeline
+        environment_key: framework_env
+        spark_python_task:
+          python_file: ../src/run_cli.py
+          parameters:
+          - apply-metadata
+          - ${workspace.file_path}/sources/abs/fdh/abs_accounting.yaml
+          - --catalog
+          - ${var.catalog}
+      - task_key: record_success
+        depends_on:
+        - task_key: apply_metadata
         environment_key: framework_env
         spark_python_task:
           python_file: ../src/run_cli.py
@@ -107,6 +118,7 @@ resources:
         - task_key: sync
         - task_key: await_registry
         - task_key: refresh_pipeline
+        - task_key: apply_metadata
         - task_key: record_success
         run_if: AT_LEAST_ONE_FAILED
         environment_key: framework_env

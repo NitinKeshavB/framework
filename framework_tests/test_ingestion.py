@@ -199,8 +199,16 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
         "sync",
         "await_registry",
         "refresh_pipeline",
+        "apply_metadata",
         "record_success",
     }
+    metadata = tasks["apply_metadata"]
+    assert metadata["depends_on"] == [{"task_key": "refresh_pipeline"}]
+    assert metadata["spark_python_task"]["parameters"][0] == "apply-metadata"
+    assert [
+        item for item in metadata["spark_python_task"]["parameters"] if item.endswith(".yaml")
+    ] == specs
+    assert tasks["record_success"]["depends_on"] == [{"task_key": "apply_metadata"}]
     running = tasks["mark_running"]["spark_python_task"]["parameters"]
     assert running[running.index("--object-kind") + 1] == "workflow"
     assert running[running.index("--full-name") + 1] == "billing_daily"
