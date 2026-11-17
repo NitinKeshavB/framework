@@ -9,9 +9,14 @@ or column that does not exist yet is skipped and applied on the next deploy.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+
+from lakeflow_framework.logs import statement_summary
+
+log = logging.getLogger(__name__)
 
 # The tags this framework owns. Other tags on the same schemas, tables, and columns stay.
 SCHEMA_TAGS = (
@@ -218,12 +223,33 @@ def apply_metadata(spark, rows: list[dict[str, Any]], catalog: str) -> list[str]
 
     declared = declared_metadata(rows)
     if not declared.kinds and not declared.schema_tags:
+        log.info("Unity Catalog: no schema or table declares tags or comments")
         return []
+    log.info(
+        "Unity Catalog: %d schema(s) and %d table(s) declare tags or comments",
+        len(declared.schema_tags),
+        len(declared.kinds),
+    )
     queries = lookup_sql(catalog, declared.kinds, declared.schema_tags)
     rows = {name: _rows(spark.sql(statement)) for name, statement in queries.items()}
     applied, existing = applied_metadata(rows)
+    tables = {table for table, _column in existing}
+    for schema in sorted(declared.schema_tags):
+        if ("schema", schema) not in existing:
+            log.info("Unity Catalog: schema %s does not exist yet; tagged on a later run", schema)
+    for table in sorted(declared.kinds):
+        if table not in tables:
+            log.info("Unity Catalog: table %s does not exist yet; tagged on a later run", table)
     statements = plan_statements(declared, applied, existing)
-    for statement in statements:
+    if not statements:
+        log.info("Unity Catalog: no change to apply")
+    for number, statement in enumerate(statements, 1):
+        log.info(
+            "Unity Catalog change %d/%d: %s",
+            number,
+            len(statements),
+            statement_summary(statement, 200),
+        )
         spark.sql(statement)
     return statements
 

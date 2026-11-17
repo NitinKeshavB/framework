@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # Commits that rewrite or inspect files without loading rows. The last load is the commit wanted.
 MAINTENANCE = {"OPTIMIZE", "VACUUM START", "VACUUM END", "ANALYZE", "REORG", "SET TBLPROPERTIES"}
@@ -91,10 +94,28 @@ def record_table_health(spark, catalog: str) -> int:
         ).collect()
     ]
     recorded = datetime.now(timezone.utc).replace(microsecond=0)
-    rows = [health_row(spark, table, recorded) for table in tables if table.get("table_name")]
+    log.info("table health: %d bronze table(s) in v_bronze_tables", len(tables))
+    rows = []
+    for table in tables:
+        if not table.get("table_name"):
+            continue
+        row = health_row(spark, table, recorded)
+        if row["error"]:
+            log.warning("table health: %s: %s", row["table_name"], row["error"])
+        else:
+            log.info(
+                "table health: %s: %s file(s), %s byte(s), last %s at %s",
+                row["table_name"],
+                row["num_files"],
+                row["size_in_bytes"],
+                row["last_operation"],
+                row["last_commit_at"],
+            )
+        rows.append(row)
     if not rows:
         return 0
     spark.createDataFrame(rows, _schema()).write.mode("append").saveAsTable(f"{meta}.table_health")
+    log.info("table health: appended %d row(s) to %s.table_health", len(rows), meta)
     return len(rows)
 
 

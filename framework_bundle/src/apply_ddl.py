@@ -5,6 +5,7 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 
+from lakeflow_framework.logs import job_logging, step
 from lakeflow_framework.registry import apply_ddl
 
 
@@ -18,13 +19,19 @@ def main() -> None:
         sql_file = Path(__file__).resolve().parent.parent / "sql" / "framework_meta.sql"
     # A third argument, force, applies the SQL even when it was applied before.
     force = len(sys.argv) > 3 and sys.argv[3] == "force"
-    ran = apply_ddl(
-        SparkSession.builder.getOrCreate(),
-        catalog,
-        sql_file.read_text(encoding="utf-8"),
-        force=force,
-    )
-    print(f"applied {ran} statement(s)" if ran else "already applied; nothing to do")
+    log = job_logging("apply_ddl")
+    log.info("catalog %s, sql file %s, force %s", catalog, sql_file, force)
+    with step(log, f"apply {sql_file.name}"):
+        ran = apply_ddl(
+            SparkSession.builder.getOrCreate(),
+            catalog,
+            sql_file.read_text(encoding="utf-8"),
+            force=force,
+        )
+    if ran:
+        log.info("applied %d statement(s)", ran)
+    else:
+        log.info("already applied; nothing to do")
 
 
 if __name__ == "__main__":

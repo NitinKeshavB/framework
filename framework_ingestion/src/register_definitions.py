@@ -10,6 +10,7 @@ from pathlib import Path
 from pyspark.sql import SparkSession
 
 from lakeflow_framework.ingestion import registry_rows
+from lakeflow_framework.logs import job_logging, step
 from lakeflow_framework.registry import append_definitions, retire_definitions
 from lakeflow_framework.unity import apply_metadata
 
@@ -19,16 +20,24 @@ def main() -> None:
     # Serverless runs this file through exec(), so __file__ may not exist. The job passes the
     # deployed bundle root; running the file directly uses the bundle next to src/.
     bundle = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().parent.parent
+    log = job_logging("register_definitions")
+    log.info("catalog %s, bundle %s", catalog, bundle)
     spark = SparkSession.builder.getOrCreate()
-    rows = registry_rows(bundle, catalog)
-    written = append_definitions(spark, rows, set(), catalog)
-    print(f"registered {written} definition version(s) in {catalog}.framework_meta")
+    with step(log, "read the bundle's definitions"):
+        rows = registry_rows(bundle, catalog)
+    systems = sorted(row["full_name"] for row in rows if row["object_kind"] == "source_system")
+    log.info("%d definition(s) from source system(s) %s", len(rows), ", ".join(systems))
+    with step(log, "write new and changed definitions"):
+        written = append_definitions(spark, rows, set(), catalog)
+    log.info("registered %d definition version(s) in %s.framework_meta", written, catalog)
     # This bundle owns every source system in the catalog, so anything it no longer
     # deploys was removed from it.
-    retire_definitions(spark, rows, catalog)
+    with step(log, "retire definitions no longer deployed"):
+        retire_definitions(spark, rows, catalog)
     # A schema or table that does not exist yet is skipped and tagged on the next deploy.
-    applied = apply_metadata(spark, rows, catalog)
-    print(f"applied {len(applied)} Unity Catalog metadata change(s)")
+    with step(log, "apply tags and comments in Unity Catalog"):
+        applied = apply_metadata(spark, rows, catalog)
+    log.info("applied %d Unity Catalog metadata change(s)", len(applied))
 
 
 if __name__ == "__main__":

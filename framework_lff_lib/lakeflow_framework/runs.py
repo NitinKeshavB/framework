@@ -11,9 +11,12 @@ still going last time is read again and its row updated. Rows are merged, never 
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
+
+log = logging.getLogger(__name__)
 
 WORKFLOW_TAG = "lakeflow_framework_workflow"
 EVENT_LOG_SUFFIX = "_event_log"
@@ -167,9 +170,17 @@ def record_job_runs(spark, client, catalog: str, now: datetime | None = None) ->
         if row["job_name"]
     }
     if not workflows:
+        log.info("job runs: v_workflows lists no workflow; nothing to read")
         return 0
+    log.info("job runs: %d registered workflow(s)", len(workflows))
     jobs = framework_jobs((job.as_dict() for job in client.jobs.list()), workflows)
+    found = {name for name, _deployed in jobs.values()}
+    for missing in sorted(workflows - found):
+        log.warning(
+            "job runs: no job tagged %s=%s is visible to this identity", WORKFLOW_TAG, missing
+        )
     since = _read_from(spark, f"{meta}.job_runs", recorded)
+    log.info("job runs: reading runs that started since %s", since.isoformat())
     workspace_id = _text(client.get_workspace_id())
     runs: dict[str, dict] = {}
     tasks: list[dict] = []
@@ -177,10 +188,13 @@ def record_job_runs(spark, client, catalog: str, now: datetime | None = None) ->
         listed = client.jobs.list_runs(
             job_id=int(job_id), start_time_from=_millis(since), expand_tasks=True
         )
+        count = 0
         for run in listed:
             row, task_rows = job_run_rows(run.as_dict(), job_name, deployed, workspace_id, recorded)
             runs[row["run_id"]] = row
             tasks += task_rows
+            count += 1
+        log.info("job runs: %s (job %s, %s): %d run(s)", job_name, job_id, deployed, count)
     # A run that started before the reread window and was still going last pass.
     for item in _rows(
         spark.sql(f"SELECT job_id, run_id FROM {meta}.job_runs WHERE status = 'RUNNING'")
@@ -189,6 +203,7 @@ def record_job_runs(spark, client, catalog: str, now: datetime | None = None) ->
         job = jobs.get(_text(item["job_id"]))
         if run_id in runs or job is None:
             continue
+        log.info("job runs: rereading run %s of %s, still running last pass", run_id, job[0])
         run = client.jobs.get_run(int(run_id)).as_dict()
         row, task_rows = job_run_rows(run, job[0], job[1], workspace_id, recorded)
         runs[run_id] = row
@@ -201,6 +216,11 @@ def record_job_runs(spark, client, catalog: str, now: datetime | None = None) ->
         TASK_RUN_COLUMNS,
         ("job_run_id", "task_run_id"),
     )
+    statuses = sorted({str(row["status"]) for row in runs.values()})
+    for status in statuses:
+        count = sum(1 for row in runs.values() if str(row["status"]) == status)
+        log.info("job runs: %d %s", count, status)
+    log.info("job runs: merged %d run(s) and %d task run(s)", len(runs), len(tasks))
     return len(runs)
 
 
@@ -259,8 +279,11 @@ def record_pipeline_updates(spark, catalog: str, now: datetime | None = None) ->
     names = [row["tableName"] for row in _rows(spark.sql(f"SHOW TABLES IN {meta}"))]
     logs = event_log_jobs(names)
     if not logs:
+        log.info("pipeline updates: no <job>_event_log table in %s yet", meta)
         return 0
+    log.info("pipeline updates: event logs %s", ", ".join(sorted(logs)))
     since = _read_from(spark, f"{meta}.pipeline_updates", recorded)
+    log.info("pipeline updates: reading updates since %s", since.isoformat())
     source = pipeline_updates_sql(meta, logs, since)
     spark.sql(
         _merge_sql(
@@ -270,6 +293,7 @@ def record_pipeline_updates(spark, catalog: str, now: datetime | None = None) ->
             PIPELINE_UPDATE_COLUMNS,
         )
     )
+    log.info("pipeline updates: merged the updates from %d event log(s)", len(logs))
     return len(logs)
 
 

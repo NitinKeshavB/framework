@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import time
+from collections import Counter
 from typing import Any, Mapping
 
+from lakeflow_framework.logs import statement_summary
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
     OBJECT_COLUMNS,
@@ -21,6 +25,8 @@ from lakeflow_framework.metadata import (
     step_keys_sql,
     step_payload,
 )
+
+log = logging.getLogger(__name__)
 
 RUN_KEYS = ("owner_kind", "owner", "object_kind", "full_name")
 OBJECT_KEYS = ("object_kind", "full_name")
@@ -44,10 +50,28 @@ def apply_ddl(spark, catalog: str, text: str | None = None, force: bool = False)
 
     statements = ddl_statements(catalog, text)
     digest = ddl_hash(statements)
-    if not force and _ddl_applied(spark, catalog, digest):
+    log.info("DDL for %s: %d statement(s), sql hash %s", catalog, len(statements), digest[:12])
+    if force:
+        log.info("force is set: applying even if this hash was applied before")
+    elif _ddl_applied(spark, catalog, digest):
+        log.info("sql hash %s is already in ddl_applied: nothing to apply", digest[:12])
         return 0
-    for statement in statements:
-        spark.sql(statement)
+    for number, statement in enumerate(statements, 1):
+        started = time.monotonic()
+        try:
+            spark.sql(statement)
+        except Exception:
+            log.error(
+                "statement %d/%d failed: %s", number, len(statements), statement_summary(statement)
+            )
+            raise
+        log.info(
+            "statement %d/%d in %.1fs: %s",
+            number,
+            len(statements),
+            time.monotonic() - started,
+            statement_summary(statement),
+        )
     spark.sql(
         f"INSERT INTO {_table(catalog, 'ddl_applied')} (sql_hash, applied_at) "
         f"VALUES ('{digest}', current_timestamp())"
@@ -107,20 +131,33 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
     held = seen if seen is not None else set()
     # Copy so a failed write does not mark this batch as the current version.
     fresh = new_object_rows(rows, set(held))
+    log.info("definitions: %d declared (%s)", len(rows), _by_kind(rows))
+    current: dict[tuple[str, str], str] = {}
     if catalog and fresh:
         # Ownership comes first: another owner's identical definition must be refused and
         # recorded, not skipped as already current.
         fresh = _refuse_other_owners(spark, catalog, fresh)
     if catalog and fresh:
         current = _current_object_hashes(spark, catalog, fresh)
+        candidates = len(fresh)
         fresh = [
             row
             for row in fresh
             if current.get((row["object_kind"], row["full_name"])) != row["content_hash"]
         ]
+        log.info(
+            "definitions: %d unchanged since the current version, %d new or changed",
+            candidates - len(fresh),
+            len(fresh),
+        )
     if not fresh:
+        log.info("definitions: nothing to write")
         return 0
+    for row in fresh:
+        change = "changed" if (row["object_kind"], row["full_name"]) in current else "new"
+        log.info("definition %s %s: %s", row["object_kind"], row["full_name"], change)
     written = _scd2_merge(spark, _table(catalog, "object_registry"), fresh)
+    log.info("definitions: wrote %d version(s) to object_registry and object_current", written)
     _merge_current(
         spark,
         _table(catalog, "object_current"),
@@ -160,8 +197,22 @@ def retire_definitions(
     schema = StructType([StructField(key, StringType(), False) for key in OBJECT_KEYS])
     rows = [dict(zip(OBJECT_KEYS, key)) for key in keys]
     spark.createDataFrame(rows, schema).createOrReplaceTempView("_framework_deployed")
+    gone = _rows(
+        spark.sql(
+            f"SELECT c.object_kind, c.full_name FROM {_table(catalog, 'object_current')} c "
+            "LEFT ANTI JOIN _framework_deployed d "
+            "ON d.object_kind = c.object_kind AND d.full_name = c.full_name "
+            f"WHERE c.owner_kind = '{owner_kind}' ORDER BY c.object_kind, c.full_name"
+        )
+    )
+    if not gone:
+        log.info("retire: every current %s definition is still deployed", owner_kind)
+        return
+    for row in gone:
+        log.info("retire: %s %s is no longer deployed", row["object_kind"], row["full_name"])
     for statement in retire_statements(catalog, "_framework_deployed", owner_kind):
         spark.sql(statement)
+    log.info("retire: wrote %d deletion version(s)", len(gone))
 
 
 def scd2_merge_sql(table: str, staged: str) -> str:
@@ -258,6 +309,15 @@ def _refuse_other_owners(spark, catalog: str, rows: list[dict]) -> list[dict]:
         steps = []
         for row in refused:
             holder = current[(str(row["object_kind"]), str(row["full_name"]))]
+            log.warning(
+                "refused %s %s for %s %s: it is owned by %s %s",
+                row["object_kind"],
+                row["full_name"],
+                row["owner_kind"],
+                row["owner"],
+                holder[0],
+                holder[1],
+            )
             steps.append(
                 step_payload(
                     owner_kind=str(row["owner_kind"]),
@@ -276,6 +336,11 @@ def _refuse_other_owners(spark, catalog: str, rows: list[dict]) -> list[dict]:
             )
         append_steps(spark, steps, None, catalog)
     return accepted
+
+
+def _by_kind(rows: list[dict]) -> str:
+    counts = Counter(str(row["object_kind"]) for row in rows)
+    return ", ".join(f"{kind} {count}" for kind, count in sorted(counts.items()))
 
 
 def _table(catalog: str, name: str) -> str:

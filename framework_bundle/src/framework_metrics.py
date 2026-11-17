@@ -192,6 +192,7 @@ def register(dp, spark, catalog: str) -> None:
     meta = f"{catalog}.framework_meta"
     names = [row.tableName for row in spark.sql(f"SHOW TABLES IN {meta}").collect()]
     logs = event_logs(names)
+    print(f"framework_metrics: {len(logs)} event log(s) in {meta}: {', '.join(logs) or 'none'}")
     if logs:
         dp.create_streaming_table(
             name=EVENTS,

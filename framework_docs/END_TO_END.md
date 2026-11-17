@@ -33,6 +33,8 @@ Definitions change only when specs change, and specs change only at deploy, so t
 
 If `registry_sync` fails, the deploy command fails.
 
+Every framework job task writes timestamped log lines to its run's output: the arguments it ran with, each step with its start, end, seconds taken, and the error that ended it, and what it decided. `framework_ddl` logs each statement and its time, or that the SQL was already applied. `registry_sync` logs the definitions it found by kind, each new or changed one, each refusal with the owner that holds the name, each retired definition, each Unity Catalog change, and each schema or table not yet created. `framework_runs` logs the read window, the runs read per job, and any registered workflow whose job it cannot see. `framework_optimize` logs the files each `OPTIMIZE` removed and added, and each table's health figures or error.
+
 ## What a delivery job does
 
 A delivery job is one task, **refresh_pipeline**. A `cloud_files` table that uses `copy_into` or `ctas` adds **batch_load** before it; those methods are frozen, so no generated job has that task yet. The job writes nothing to the registry.
