@@ -154,6 +154,7 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
 | `table_load_metrics` | The `framework_metrics` pipeline, hourly | One row per job, pipeline, update, flow, and table: rows written, upserted, deleted, and dropped, each expectation's passed and failed counts, the last backlog bytes and files, status, and duration |
+| `bronze_loads` | The same pipeline | One row per bronze table load (job, update, dataflow): `rows_read` from staged, `rows_bronze`, `rows_quarantine`, and `rows_processed` (bronze + quarantine) |
 | `job_runs`, `v_job_runs` | `framework_runs`, hourly, from the Jobs API | Each run of a framework job: status, result state, termination code, trigger, setup, queue, execution, and run seconds, and the run page URL |
 | `job_task_runs`, `v_job_task_runs` | The same | Each task run: task key, status, result state, and termination code |
 | `pipeline_updates`, `v_pipeline_updates` | `framework_runs`, from the `update_progress` events in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
@@ -166,10 +167,17 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). `framework_runs` matches a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline update on the name of the event log it is in. It needs no system table grants: the identity that runs it needs `CAN_VIEW` on the delivery jobs, which the deploying identity has. The Jobs API keeps 60 days of runs, and `job_runs` keeps them after that.
 
 ```sql
--- last week's loads of one table, with the rows that failed each rule
-SELECT update_id, started_at, rows_written, rows_upserted, expectations
+-- rows read and loaded for each bronze table load
+SELECT job_name, bronze_table, quarantine_table, started_at,
+       rows_read, rows_bronze, rows_quarantine, rows_processed, expectations
+FROM framework_meta.bronze_loads
+WHERE bronze_table ILIKE '%finance_abs'
+ORDER BY started_at DESC;
+
+-- per-flow detail (staged / bronze / quarantine) when you need it
+SELECT update_id, started_at, layer, table_name, rows_written, expectations
 FROM framework_meta.table_load_metrics
-WHERE dataflow = 'abs_orders' AND started_at >= current_date() - INTERVAL 7 DAYS
+WHERE dataflow = 'abs_accounting' AND started_at >= current_date() - INTERVAL 7 DAYS
 ORDER BY started_at DESC
 ```
 

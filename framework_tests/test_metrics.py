@@ -120,6 +120,14 @@ def test_metrics_pipeline_finds_each_event_log_and_names_its_job():
         metrics.event_columns("x' OR '1'='1")
 
 
+def test_bronze_loads_has_rows_read_and_rows_processed():
+    sql = _metrics_module().bronze_loads_sql("table_load_metrics")
+    assert "rows_read" in sql and "rows_processed" in sql
+    assert "rows_bronze" in sql and "rows_quarantine" in sql
+    assert "layer = 'staged'" in sql and "layer = 'bronze'" in sql
+    assert "GROUP BY job_name, pipeline_id, update_id, dataflow" in sql
+
+
 def test_table_load_metrics_groups_by_pipeline_update_flow_and_table():
     sql = _metrics_module().table_load_metrics_sql("flow_events", "framework_dev.framework_meta")
     assert "GROUP BY job_name, pipeline_id, update_id, flow_name" in sql
@@ -147,13 +155,6 @@ class _Pipelines:
 
     def create_streaming_table(self, name, **_options):
         self.tables.append(name)
-
-    def temporary_view(self, name, **_options):
-        def register(function):
-            self.views[name] = function
-            return function
-
-        return register
 
     def append_flow(self, target, name):
         def register(function):
@@ -188,13 +189,13 @@ def test_metrics_pipeline_adds_one_append_flow_per_event_log():
     metrics.register(dp, spark, "framework_dev")
     assert dp.tables == ["flow_events"]
     assert dp.flows == [
-        ("flow_events", "abs_daily_events"),
-        ("flow_events", "erp_hourly_events"),
+        ("flow_events", "abs_daily_event_log_flow"),
+        ("flow_events", "erp_hourly_event_log_flow"),
     ]
-    assert "abs_daily_event_log_src" in dp.views
-    assert "erp_hourly_event_log_src" in dp.views
     assert "abs_daily_event_log" not in {name for _target, name in dp.flows}
     assert "FROM flow_events" in dp.views["table_load_metrics"]()
+    assert "bronze_loads" in dp.views
+    assert "rows_read" in dp.views["bronze_loads"]()
 
 
 def test_metrics_pipeline_with_no_event_log_yet_keeps_an_empty_table():
@@ -203,6 +204,7 @@ def test_metrics_pipeline_with_no_event_log_yet_keeps_an_empty_table():
     metrics.register(dp, spark, "framework_dev")
     assert dp.tables == [] and dp.flows == []
     assert "WHERE false) no_events" in dp.views["table_load_metrics"]()
+    assert "bronze_loads" in dp.views
     with pytest.raises(ValueError):
         metrics.register(dp, spark, "bad catalog")
 
