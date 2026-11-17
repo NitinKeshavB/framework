@@ -29,10 +29,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from lakeflow_framework.config import EMAIL, IDENTIFIER, ConfigValidationError
-from lakeflow_framework.ingestion import SourceTable, load_sources
+from lakeflow_framework.config import EMAIL, IDENTIFIER, ConfigValidationError, read_mapping
+from lakeflow_framework.ingestion import (
+    SourceTable,
+    identifier_problems,
+    load_sources,
+    node_id,
+    refuse_existing,
+    write_generated,
+)
 
 PROJECT_FILE = "project.yaml"
 MAP_NAME = "PROJECT_MAP.md"
@@ -109,33 +114,20 @@ def generate(root: Path, ingestion: Path, check: bool = False) -> list[str]:
     """Write the project maps. With ``check``, change nothing. Returns stale paths."""
 
     projects, bronze = load_projects(root, ingestion)
-    stale: list[str] = []
-    for relative, text in render_files(projects, bronze).items():
-        target = root / relative
-        if not target.exists() or target.read_text(encoding="utf-8") != text:
-            stale.append(relative)
-            if not check:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding="utf-8")
-    return sorted(stale)
+    return sorted(write_generated(root, render_files(projects, bronze), check))
 
 
 def new_project(root: Path, domain: str, project: str, *, owner: str) -> Path:
     """Create a project folder: a small bundle file and an empty ``project.yaml``."""
 
-    problems = [
-        f"{key} must be an identifier, not {value!r}"
-        for key, value in {"domain": domain, "project": project}.items()
-        if not IDENTIFIER.match(value)
-    ]
+    problems = identifier_problems({"domain": domain, "project": project})
     if not EMAIL.match(owner):
         problems.append("owner must be an email address")
     if problems:
         raise ConfigValidationError(problems)
     folder = root / domain / project
     target = folder / PROJECT_FILE
-    if target.exists():
-        raise ConfigValidationError([f"{target} already exists"])
+    refuse_existing(target)
     folder.mkdir(parents=True, exist_ok=True)
     target.write_text(
         f"project: {project}\ndomain: {domain}\nowner: {owner}\n\n"
@@ -198,13 +190,8 @@ def _bronze_index(ingestion: Path, errors: list[str]) -> dict[tuple[str, str], S
 
 
 def _read_project(path: Path, domain: str, name: str, errors: list[str]) -> Project | None:
-    try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        errors.append(f"{path}: {exc}")
-        return None
-    if not isinstance(document, dict):
-        errors.append(f"{path}: the document must be a mapping")
+    document = read_mapping(path, errors)
+    if document is None:
         return None
     found: list[str] = []
     if document.get("project") != name:
@@ -414,12 +401,12 @@ def _render_project(
     lines += [f"- {text}" for text in used_by] or ["- None."]
     lines += ["", "```mermaid", "flowchart LR"]
     for table in sorted(project.tables, key=lambda t: (RANK[t.layer], t.name)):
-        node = _node(table.layer, table.name)
+        node = node_id(table.layer, table.name)
         lines.append(f"  {node}[{table.layer}.{table.name}]")
         for ref in table.triggered_by:
-            lines.append(f"  {_ref_node(ref, project)} --> {node}")
+            lines.append(f"  {_refnode_id(ref, project)} --> {node}")
         for ref in table.reads:
-            lines.append(f"  {_ref_node(ref, project)} -.-> {node}")
+            lines.append(f"  {_refnode_id(ref, project)} -.-> {node}")
     lines.append("```")
     return "\n".join(lines) + "\n"
 
@@ -474,12 +461,8 @@ def _deadline(table: ProjectTable) -> str:
     return f"{table.deadline['at']} UTC, {table.deadline['on_miss'].replace('_', ' ')}"
 
 
-def _ref_node(ref: str, project: Project) -> str:
+def _refnode_id(ref: str, project: Project) -> str:
     parts = ref.split(".")
     if len(parts) == 2 and parts[0] in OWNED_LAYERS:
-        return _node(*parts)
-    return f"{_node(*parts)}([{ref}])"
-
-
-def _node(*parts: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_]", "_", "_".join(parts))
+        return node_id(*parts)
+    return f"{node_id(*parts)}([{ref}])"

@@ -251,6 +251,9 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
             return spark.read.table(config.source_reference())
         if raw is None:
             raise MetadataNotFound(f"{config.pipeline_id} has no source table to read")
+        return _read_raw()
+
+    def _read_raw() -> Any:
         if config.is_batch:
             return spark.read.table(raw.name)
         return spark.readStream.table(raw.name)
@@ -264,9 +267,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
             return spark.readStream.table(landing_name)
         if raw is None:
             return _read_origin()
-        if config.is_batch:
-            return spark.read.table(raw.name)
-        return spark.readStream.table(raw.name)
+        return _read_raw()
 
     def _lineage(frame: Any) -> Any:
         if raw is not None or not hasattr(frame, "selectExpr"):
@@ -347,22 +348,7 @@ class UnityMetadata:
         self.catalog = catalog
 
     def get_pipeline(self, pipeline_id: str) -> dict[str, Any] | None:
-        if not IDENTIFIER.fullmatch(pipeline_id):
-            raise MetadataNotFound(f"{pipeline_id} is not a pipeline id")
-        # Inside a pipeline, spark.sql is wrapped by Lakeflow and takes only the statement, so a
-        # bound parameter (args=) fails. The id is safe to inline: it matched IDENTIFIER above,
-        # so it holds only letters, digits, and underscores.
-        frame = self.spark.sql(
-            "SELECT config_json FROM framework_meta.v_object_current "
-            f"WHERE object_kind = 'pipeline' AND full_name = '{pipeline_id}'"
-        )
-        rows = frame.collect() if hasattr(frame, "collect") else list(frame)
-        if not rows:
-            return None
-        import json
-
-        payload = rows[0]["config_json"] if isinstance(rows[0], dict) else rows[0].config_json
-        return json.loads(payload)["config"]
+        return self.get_pipelines([pipeline_id]).get(pipeline_id)
 
     def get_pipelines(self, pipeline_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Current config for each id. One query, so a delivery does not scan the registry per table."""
@@ -377,6 +363,9 @@ class UnityMetadata:
                 ids.append(pipeline_id)
         if not ids:
             return {}
+        # Inside a pipeline, spark.sql is wrapped by Lakeflow and takes only the statement, so a
+        # bound parameter (args=) fails. Each id is safe to inline: it matched IDENTIFIER above,
+        # so it holds only letters, digits, and underscores.
         quoted = ", ".join(f"'{pipeline_id}'" for pipeline_id in ids)
         frame = self.spark.sql(
             "SELECT full_name, config_json FROM framework_meta.v_object_current "

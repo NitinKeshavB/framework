@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from lakeflow_framework.config import PipelineConfig
-
-RESCUE_FORMATS = {"csv", "delimited", "json", "text"}
+from lakeflow_framework.load import RESCUE_FORMATS
 
 
 @dataclass(frozen=True)

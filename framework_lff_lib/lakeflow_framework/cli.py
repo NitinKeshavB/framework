@@ -9,10 +9,8 @@ from pathlib import Path
 
 from lakeflow_framework.config import ConfigValidationError, validate_configs
 from lakeflow_framework.metadata import (
-    new_object_rows,
-    object_rows,
+    definition_rows,
     step_payload,
-    workflow_rows,
     write_definition_files,
     write_step_file,
 )
@@ -159,12 +157,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("sync --out must be a directory", file=sys.stderr)
                 return 1
             configs = validate_configs(_yaml_files(args.paths), catalog=args.catalog)
-            rows: list[dict] = []
-            seen: set[tuple[str, str, str]] = set()
-            for config in configs:
-                rows.extend(new_object_rows(object_rows(config), seen))
-            rows.extend(new_object_rows(workflow_rows(configs), seen))
-            written = write_definition_files(args.out, rows)
+            written = write_definition_files(args.out, definition_rows(configs))
             print(f"wrote {len(written)} definition file(s) to {args.out}")
             return 0
         if args.command == "await-registry":
