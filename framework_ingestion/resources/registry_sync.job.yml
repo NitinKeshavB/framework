@@ -1,4 +1,5 @@
-# Registers every spec in this bundle into framework_meta. ./run.sh bundle:deploy runs it.
+# Registers every spec in this bundle into framework_meta and applies its Unity Catalog tags
+# and column comments. ./run.sh bundle:deploy runs it. It is the only writer of definitions.
 # Hand-written: it covers the whole bundle, not one delivery, so generate does not own it.
 resources:
   jobs:

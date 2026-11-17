@@ -21,11 +21,13 @@ from typing import Any
 import yaml
 
 from lakeflow_framework.config import (
+    CATALOG_SETTING,
     CLOUD_PATH,
     DATABASE_KIND,
     EMAIL,
     FILE_KINDS,
     IDENTIFIER,
+    SPECS_SETTING,
     VOLUME_PATH,
     ConfigValidationError,
     PipelineConfig,
@@ -58,9 +60,6 @@ PERFORMANCE_TARGET = "STANDARD"
 # Each pipeline publishes its event log to framework_meta as <job name><suffix>.
 EVENT_LOG_SUFFIX = "_event_log"
 WORKFLOW_TAG = "lakeflow_framework_workflow"
-# How long a job waits for the collector to register its pipelines before the run fails.
-REGISTRY_WAIT_SECONDS = 900
-EVENTS = "/Volumes/${var.catalog}/framework_meta/framework_events"
 
 
 @dataclass
@@ -137,19 +136,21 @@ def load_sources(
     return systems
 
 
-def registry_rows(bundle: Path, catalog: str) -> list[dict[str, Any]]:
-    """Every definition this bundle deploys, named in ``catalog``.
-
-    Deploy writes these rows into the registry after the files are uploaded, so a pipeline can
-    read what was just deployed without waiting for the next delivery run.
-    """
-
-    from lakeflow_framework.metadata import definition_rows
+def deployed_configs(bundle: Path, catalog: str) -> list[PipelineConfig]:
+    """Every spec this bundle deploys, named in ``catalog``."""
 
     if not catalog or not re.fullmatch(r"[A-Za-z0-9_-]+", catalog):
         raise ConfigValidationError(["catalog is required"])
     systems = load_sources(bundle, catalog=catalog)
-    return definition_rows([table.config for system in systems for table in system.tables])
+    return [table.config for system in systems for table in system.tables]
+
+
+def registry_rows(bundle: Path, catalog: str) -> list[dict[str, Any]]:
+    """Every definition this bundle deploys. registry_sync writes them at deploy."""
+
+    from lakeflow_framework.metadata import definition_rows
+
+    return definition_rows(deployed_configs(bundle, catalog))
 
 
 def render_map(systems: list[SourceSystem]) -> str:
@@ -197,7 +198,7 @@ def render_files(systems: list[SourceSystem]) -> dict[str, str]:
             tables.sort(key=lambda item: item.config.pipeline_id)
             name = f"{system.name}_{delivery}"
             files[f"pipelines/{name}.py"] = _pipeline_source(tables)
-            files[f"resources/{name}.pipeline.yml"] = _yaml(_pipeline_resource(name))
+            files[f"resources/{name}.pipeline.yml"] = _yaml(_pipeline_resource(name, tables))
             files[f"resources/{name}.job.yml"] = _yaml(_job_resource(system, delivery, tables))
     return files
 
@@ -262,7 +263,6 @@ def _generated_files(bundle: Path) -> list[str]:
 
 
 def _pipeline_source(tables: list[SourceTable]) -> str:
-    # One call reads every pipeline document in this delivery. A call per table repeats that scan.
     ids = ", ".join(f'"{table.config.pipeline_id}"' for table in tables)
     lines = [
         GENERATED,
@@ -284,7 +284,11 @@ def _uploaded_wheel() -> str:
     )
 
 
-def _pipeline_resource(name: str) -> dict[str, Any]:
+def _spec_paths(tables: list[SourceTable]) -> list[str]:
+    return ["${workspace.file_path}/" + _spec_rel(table.path) for table in tables]
+
+
+def _pipeline_resource(name: str, tables: list[SourceTable]) -> dict[str, Any]:
     return {
         "resources": {
             "pipelines": {
@@ -302,6 +306,12 @@ def _pipeline_resource(name: str) -> dict[str, Any]:
                         "schema": "framework_meta",
                         "name": f"{name}{EVENT_LOG_SUFFIX}",
                     },
+                    # build_pipelines reads these deployed specs, so a run does not wait on the
+                    # registry.
+                    "configuration": {
+                        SPECS_SETTING: ",".join(_spec_paths(tables)),
+                        CATALOG_SETTING: "${var.catalog}",
+                    },
                     "libraries": [{"file": {"path": f"../pipelines/{name}.py"}}],
                     # A pipeline does not accept whl libraries, and the CLI does not rewrite a
                     # local path in its pip dependencies, so name the wheel `bundle deploy` uploads.
@@ -315,67 +325,16 @@ def _pipeline_resource(name: str) -> dict[str, Any]:
 def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]) -> dict[str, Any]:
     name = f"{system.name}_{delivery}"
     configs = [table.config for table in tables]
-    spec_paths = ["${workspace.file_path}/" + _spec_rel(table.path) for table in tables]
     batch_paths = [
         path
-        for path, config in zip(spec_paths, configs)
+        for path, config in zip(_spec_paths(tables), configs)
         if config.load_method in {"copy_into", "ctas"}
     ]
-
-    def run_cli(task: str, after: list[str], arguments: list[str], **extra: Any) -> dict[str, Any]:
-        entry: dict[str, Any] = {"task_key": task}
-        if after:
-            entry["depends_on"] = [{"task_key": key} for key in after]
-        entry.update(extra)
-        entry["environment_key"] = "framework_env"
-        entry["spark_python_task"] = {"python_file": "../src/run_cli.py", "parameters": arguments}
-        return entry
-
-    def step(task: str, after: list[str], number: int, status: str, *more: str, **extra: Any):
-        arguments = [
-            "step",
-            "--owner-kind",
-            "source_system",
-            "--owner",
-            system.name,
-            "--object-kind",
-            "workflow",
-            "--full-name",
-            name,
-            "--run-id",
-            "{{job.run_id}}",
-            "--step-no",
-            str(number),
-            "--step-name",
-            task,
-            "--status",
-            status,
-            *more,
-            "--out",
-            EVENTS,
-        ]
-        return run_cli(task, after, arguments, **extra)
-
-    tasks = [
-        step("mark_running", [], 10, "RUNNING"),
-        run_cli(
-            "sync",
-            ["mark_running"],
-            ["sync", *spec_paths, "--catalog", "${var.catalog}", "--out", EVENTS],
-        ),
-        run_cli(
-            "await_registry",
-            ["sync"],
-            ["await-registry", *spec_paths, "--catalog", "${var.catalog}"]
-            + ["--timeout-seconds", str(REGISTRY_WAIT_SECONDS)],
-        ),
-    ]
-    last = "await_registry"
+    tasks: list[dict[str, Any]] = []
     if batch_paths:
         tasks.append(
             {
                 "task_key": "batch_load",
-                "depends_on": [{"task_key": last}],
                 "environment_key": "framework_env",
                 "spark_python_task": {
                     "python_file": "../src/run_batch.py",
@@ -383,34 +342,11 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
                 },
             }
         )
-        last = "batch_load"
-    tasks.append(
-        {
-            "task_key": "refresh_pipeline",
-            "depends_on": [{"task_key": last}],
-            "pipeline_task": {"pipeline_id": f"${{resources.pipelines.{name}_pipeline.id}}"},
-        }
-    )
-    # After the refresh, so every table exists to be tagged.
-    tasks.append(
-        run_cli(
-            "apply_metadata",
-            ["refresh_pipeline"],
-            ["apply-metadata", *spec_paths, "--catalog", "${var.catalog}"],
-        )
-    )
-    tasks.append(step("record_success", ["apply_metadata"], 50, "SUCCEEDED"))
-    tasks.append(
-        step(
-            "record_failure",
-            [item["task_key"] for item in tasks],
-            90,
-            "FAILED",
-            "--failure-reason",
-            "task failed",
-            run_if="AT_LEAST_ONE_FAILED",
-        )
-    )
+    refresh: dict[str, Any] = {"task_key": "refresh_pipeline"}
+    if tasks:
+        refresh["depends_on"] = [{"task_key": "batch_load"}]
+    refresh["pipeline_task"] = {"pipeline_id": f"${{resources.pipelines.{name}_pipeline.id}}"}
+    tasks.append(refresh)
 
     # Deployed names carry a dev or prod prefix, so the run views join system tables on this tag.
     job: dict[str, Any] = {"name": name, "tags": {WORKFLOW_TAG: name}}
@@ -426,12 +362,13 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         job["trigger"] = {"file_arrival": {"url": f"/Volumes/${{var.catalog}}/{schema}/{volume}/"}}
     else:
         job["trigger"] = {"file_arrival": {"url": detail["path"]}}
-    job["environments"] = [
-        {
-            "environment_key": "framework_env",
-            "spec": {"environment_version": ENVIRONMENT_VERSION, "dependencies": [WHEEL]},
-        }
-    ]
+    if batch_paths:
+        job["environments"] = [
+            {
+                "environment_key": "framework_env",
+                "spec": {"environment_version": ENVIRONMENT_VERSION, "dependencies": [WHEEL]},
+            }
+        ]
     job["performance_target"] = PERFORMANCE_TARGET
     job["tasks"] = tasks
     return {"resources": {"jobs": {name: job}}}

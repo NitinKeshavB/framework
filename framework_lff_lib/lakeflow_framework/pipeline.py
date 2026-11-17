@@ -11,13 +11,17 @@ Two shapes, chosen by the load method:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from lakeflow_framework.config import (
+    CATALOG_SETTING,
     IDENTIFIER,
     MAX_CLUSTER_KEYS,
+    SPECS_SETTING,
     PipelineConfig,
     config_from_document,
+    validate_configs,
 )
 from lakeflow_framework.load import _projection, get_strategy, projection_exprs
 from lakeflow_framework.quality import (
@@ -79,13 +83,33 @@ def build_pipelines(
     pipelines: Any = None,
     metadata: Any = None,
 ) -> list[Graph]:
-    """Register every table in a delivery. The registry is queried once for the whole list."""
+    """Register every table in a delivery.
+
+    The generated pipeline sets ``lff.specs`` to its deployed spec files, so the specs are read
+    from the bundle. Without it, the registry is queried once for the whole list.
+    """
 
     if not pipeline_ids:
         return []
     if spark is None and pipelines is None and metadata is None:
         pipelines = _cluster_pipelines()
         spark = _cluster_session()
+    if metadata is None:
+        configured = bundle_configs(spark)
+        if configured is not None:
+            graphs = []
+            for pipeline_id in pipeline_ids:
+                if pipeline_id not in configured:
+                    raise MetadataNotFound(f"{pipeline_id} is not in {SPECS_SETTING}")
+                graphs.append(
+                    build_pipeline(
+                        pipeline_id,
+                        spark=spark,
+                        pipelines=pipelines,
+                        config=configured[pipeline_id],
+                    )
+                )
+            return graphs
     reader = metadata
     if reader is None:
         if spark is None:
@@ -104,6 +128,20 @@ def build_pipelines(
             build_pipeline(pipeline_id, spark=spark, pipelines=pipelines, config=document)
         )
     return graphs
+
+
+def bundle_configs(spark: Any) -> dict[str, PipelineConfig] | None:
+    """The specs named in the pipeline's ``lff.specs`` setting, or None when it is not set."""
+
+    conf = getattr(spark, "conf", None)
+    if conf is None:
+        return None
+    specs = conf.get(SPECS_SETTING, None)
+    if not specs:
+        return None
+    paths = [Path(path.strip()) for path in specs.split(",") if path.strip()]
+    catalog = conf.get(CATALOG_SETTING, None) or None
+    return {config.pipeline_id: config for config in validate_configs(paths, catalog=catalog)}
 
 
 def _cluster_session() -> Any:
@@ -378,7 +416,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
 
 class UnityMetadata:
-    """Read the current pipeline document from framework_meta. Inserts happen in the collector."""
+    """Read the current pipeline document from framework_meta. registry_sync writes it at deploy."""
 
     def __init__(self, spark: Any, catalog: str | None = None):
         self.spark = spark

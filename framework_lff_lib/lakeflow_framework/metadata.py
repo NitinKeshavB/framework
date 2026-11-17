@@ -369,46 +369,6 @@ _SAFE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SAFE_INSTANT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
-def write_definition_files(directory: Path, rows: list[dict[str, Any]]) -> list[Path]:
-    """One JSON-lines file per owner.
-
-    A sync used to write one file per column, flow, and link. At thousands of jobs that listing
-    is the collector's bottleneck. One file per owner is one Auto Loader file; each line is one
-    definition. The name is the hash of the body, so an unchanged sync overwrites the same file
-    and is not collected again.
-    """
-
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for row in rows:
-        grouped.setdefault((str(row["owner_kind"]), str(row["owner"])), []).append(row)
-    written: list[Path] = []
-    for (owner_kind, owner), group in sorted(grouped.items()):
-        lines = [
-            json.dumps({"kind": "definition", **row}, sort_keys=True, separators=(",", ":"))
-            for row in group
-        ]
-        body = "\n".join(lines) + "\n"
-        digest = _digest(body)[:16]
-        target = directory / owner_kind / owner / "definitions" / f"{digest}.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body, encoding="utf-8")
-        written.append(target)
-    return written
-
-
-def split_payloads(
-    payloads: list[Mapping[str, Any]],
-) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
-    steps: list[Mapping[str, Any]] = []
-    definitions: list[dict[str, Any]] = []
-    for payload in payloads:
-        if payload.get("kind") == "step":
-            steps.append(payload)
-        elif payload.get("kind") == "definition":
-            definitions.append({column: payload.get(column) for column in OBJECT_COLUMNS})
-    return steps, definitions
-
-
 def new_object_rows(
     rows: list[dict[str, Any]], seen_hashes: set[tuple[str, str, str]]
 ) -> list[dict[str, Any]]:
@@ -469,20 +429,6 @@ def step_payload(
     }
 
 
-def step_file_name(payload: Mapping[str, Any]) -> str:
-    return (
-        f"{payload['owner_kind']}/{payload['owner']}/{payload['full_name']}/"
-        f"{payload['run_id']}_{payload['step_no']}_{payload['status']}.json"
-    )
-
-
-def write_step_file(directory: Path, payload: Mapping[str, Any]) -> Path:
-    target = directory / step_file_name(payload)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-    return target
-
-
 def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     recorded = str(payload.get("recorded_at") or _now())
     return {
@@ -498,7 +444,7 @@ def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
         "started_at": payload.get("started_at"),
         "ended_at": payload.get("ended_at"),
         "failure_reason": payload.get("failure_reason"),
-        # Step files written before load counts moved to table_load_metrics can carry this.
+        # Rows recorded before load counts moved to table_load_metrics can carry this.
         "recon_json": payload.get("recon_json"),
         "recorded_at": recorded,
         "event_date": recorded[:10],
@@ -522,16 +468,6 @@ def ingest_steps(
         seen_keys.add(key)
         rows.append(ledger_row(payload))
     return rows
-
-
-def registered_sql(pipeline_ids: list[str], catalog: str) -> str:
-    _require_catalog(catalog)
-    if not pipeline_ids or any(not _SAFE_TOKEN.match(pipeline_id) for pipeline_id in pipeline_ids):
-        raise ValueError("pipeline id is required")
-    return (
-        f"SELECT full_name, content_hash FROM {catalog}.framework_meta.v_object_current "
-        f"WHERE object_kind = 'pipeline' AND full_name IN ({_sql_in(pipeline_ids)})"
-    )
 
 
 def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:

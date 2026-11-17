@@ -13,7 +13,7 @@ source system ──delivery──▶ bronze ──▶ silver / gold / product
 | Folder | Role | Owner |
 | --- | --- | --- |
 | `framework_lff_lib` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
-| `framework_bundle` | The deployed framework: the wheel, the `framework_meta` registry DDL, the collector, the `framework_metrics` pipeline, and daily `OPTIMIZE` and table health | Platform team |
+| `framework_bundle` | The deployed framework: the wheel, the `framework_meta` registry DDL, the `framework_metrics` pipeline, and daily `OPTIMIZE` and table health | Platform team |
 | `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
 | `framework_curation` | One bundle per project for silver, gold, and data products, with ownership checks and maps | One project each |
 | `framework_examples/ingestion` | Specs for each ingestion kind: a raw volume, SharePoint, a database, and cloud files | None |
@@ -35,7 +35,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 - A **source system** belongs to a domain. Its bronze tables are owned by the source system, never by the team that asked for them. The registry records `requested_by` beside the owner.
 - A **project** owns its silver, gold, and data-product tables. A table name is owned once; another project reads it as `<project>.silver.<name>` or `<project>.product.<name>`.
-- The collector refuses a definition for a table another owner holds and records a failed `ownership_check` step. `v_ownership_conflicts` stays empty.
+- `registry_sync` refuses a definition for a table another owner holds and records a failed `ownership_check` step. `v_ownership_conflicts` stays empty.
 
 ## Add a table to a source system
 
@@ -70,11 +70,10 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 ## Deploy order
 
 1. `./run.sh bundle:deploy framework_bundle <target> <profile>`. After the upload it runs `framework_ddl`, so the registry tables and views exist when the command returns. It then runs `framework_system_views`, which needs `SELECT` on `system.lakeflow`, `system.billing`, and `system.access`; without those grants it warns and the deploy still succeeds.
-2. Start `framework_collector`. It stays the writer for run steps. It is paused by default.
-3. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry.
-4. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
+2. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry and applies the specs' tags and column comments in Unity Catalog. It is the only writer of definitions.
+3. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
 
-`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery run still syncs its own specs; an unchanged hash does not add another history row.
+`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job is one `refresh_pipeline` task: the pipeline reads its deployed specs from its `lff.specs` setting, and a run does not write the registry.
 
 ## See what is running
 
@@ -91,8 +90,8 @@ Query `<catalog>.framework_meta`:
 | `v_object_history` | Every version of a pipeline, workflow, flow, table, link, or column, with `valid_from` and `valid_to`. Filter it to see the system at a moment. |
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
-| `v_run_current`, `v_process` | Latest step of every job, and every step of a run |
-| `v_job_status` | Each job with its latest run step: `RUNNING`, `SUCCEEDED`, or `FAILED` |
+| `v_job_status` | Each job with its latest run from the system tables: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` |
+| `v_run_current`, `v_process` | Ownership refusals, and job steps from before runs moved to the system tables |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 | `table_load_metrics` | Rows written, upserted, deleted, and dropped, expectation counts, backlog, and duration per pipeline update, flow, and table |
 | `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run state, termination code, durations, and list cost from the system tables |
@@ -100,11 +99,11 @@ Query `<catalog>.framework_meta`:
 | `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
 | `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source |
 
-Filter by `owner` and, for runs, `event_date`. History is insert-only.
+Filter by `owner`. History is insert-only.
 
 ```sql
 -- latest status for every job owned by billing
-SELECT job_name, status, step_name, run_id, failure_reason
+SELECT job_name, status, termination_code, run_id, started_at
 FROM aal_dev_fdh.framework_meta.v_job_status
 WHERE owner = 'billing';
 

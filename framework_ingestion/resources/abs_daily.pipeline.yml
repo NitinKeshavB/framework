@@ -12,6 +12,9 @@ resources:
         catalog: ${var.catalog}
         schema: framework_meta
         name: abs_daily_event_log
+      configuration:
+        lff.specs: ${workspace.file_path}/sources/abs/fdh/abs_accounting.yaml
+        lff.catalog: ${var.catalog}
       libraries:
       - file:
           path: ../pipelines/abs_daily.py

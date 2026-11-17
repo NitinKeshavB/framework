@@ -91,6 +91,39 @@ LEFT JOIN costs cost
  AND cost.job_id = run.job_id
  AND cost.run_id = run.run_id;
 
+-- Each workflow and its latest run. A run with no result yet is RUNNING.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_status AS
+WITH latest AS (
+  SELECT *
+  FROM ${catalog}.framework_meta.v_job_runs
+  QUALIFY row_number() OVER (PARTITION BY job_name ORDER BY started_at DESC) = 1
+)
+SELECT
+  workflow.job_name,
+  workflow.owner_kind,
+  workflow.owner,
+  workflow.requested_by,
+  workflow.delivery,
+  workflow.pipeline_ids,
+  workflow.requesters,
+  run.workspace_id,
+  run.job_id,
+  run.run_id,
+  CASE
+    WHEN run.run_id IS NULL THEN NULL
+    WHEN run.result_state IS NULL THEN 'RUNNING'
+    WHEN run.result_state = 'SUCCEEDED' THEN 'SUCCEEDED'
+    WHEN run.result_state = 'SKIPPED' THEN 'SKIPPED'
+    ELSE 'FAILED'
+  END AS status,
+  run.result_state,
+  run.termination_code,
+  run.started_at,
+  run.ended_at,
+  run.run_seconds
+FROM ${catalog}.framework_meta.v_workflows workflow
+LEFT JOIN latest run ON run.job_name = workflow.job_name;
+
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_task_runs AS
 WITH runs AS (
   SELECT DISTINCT workspace_id, job_id, job_name, owner_kind, owner

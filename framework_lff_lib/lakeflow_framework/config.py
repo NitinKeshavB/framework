@@ -21,6 +21,9 @@ FROZEN_METHODS = ("autoloader", "copy_into", "ctas")
 FILE_EVENT_METHODS = ("autoloader", "volume_files")
 # Liquid clustering takes up to four keys, and none of these types.
 MAX_CLUSTER_KEYS = 4
+# Pipeline configuration keys: the deployed spec files, comma-separated, and the catalog.
+SPECS_SETTING = "lff.specs"
+CATALOG_SETTING = "lff.catalog"
 UNCLUSTERABLE = ("boolean", "array", "map", "struct", "binary")
 FILE_KINDS = ("sftp_files", "sharepoint_files")
 DATABASE_KIND = "database"

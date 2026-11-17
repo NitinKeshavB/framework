@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 
-from lakeflow_framework.collector import apply_ddl
+from lakeflow_framework.registry import apply_ddl
 
 
 def main() -> None:

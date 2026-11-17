@@ -7,12 +7,6 @@ import sys
 from pathlib import Path
 
 from lakeflow_framework.config import ConfigValidationError, validate_configs
-from lakeflow_framework.metadata import (
-    definition_rows,
-    step_payload,
-    write_definition_files,
-    write_step_file,
-)
 from lakeflow_framework.pipeline import MetadataNotFound, assemble
 
 
@@ -23,11 +17,6 @@ def main(argv: list[str] | None = None) -> int:
     validate = commands.add_parser("validate")
     validate.add_argument("paths", nargs="+", type=Path)
     validate.add_argument("--catalog", help="catalog for specs that do not name one")
-
-    sync = commands.add_parser("sync")
-    sync.add_argument("paths", nargs="+", type=Path)
-    sync.add_argument("--out", type=Path, required=True)
-    sync.add_argument("--catalog", help="catalog for this environment; overrides the spec")
 
     new_source = commands.add_parser("new-source")
     new_source.add_argument("bundle", type=Path)
@@ -62,30 +51,6 @@ def main(argv: list[str] | None = None) -> int:
     projects.add_argument("--domain")
     projects.add_argument("--project")
     projects.add_argument("--owner", help="owner email address")
-
-    step = commands.add_parser("step")
-    step.add_argument("--owner", required=True, help="the source system or project that owns it")
-    step.add_argument("--owner-kind", default="source_system", choices=["source_system", "project"])
-    step.add_argument(
-        "--object-kind",
-        default="pipeline",
-        help="workflow for a job run; pipeline for a table load or ownership check",
-    )
-    step.add_argument("--full-name", required=True)
-    step.add_argument("--run-id", required=True)
-    step.add_argument("--step-no", required=True, type=int)
-    step.add_argument("--step-name", required=True)
-    step.add_argument("--status", required=True)
-    step.add_argument("--out", type=Path, required=True)
-    step.add_argument("--failure-reason")
-    step.add_argument("--parent-run-id")
-
-    waiting = commands.add_parser(
-        "await-registry", help="wait until the registry holds the version of each spec synced"
-    )
-    waiting.add_argument("paths", nargs="+", type=Path, help="the same spec files sync was given")
-    waiting.add_argument("--catalog", required=True)
-    waiting.add_argument("--timeout-seconds", type=float, default=300)
 
     unity = commands.add_parser(
         "apply-metadata", help="set each spec's tags and column comments in Unity Catalog"
@@ -158,31 +123,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(f"updated {', '.join(stale)}" if stale else "generated files are up to date")
             return 0
-        if args.command == "sync":
-            if args.out.exists() and not args.out.is_dir():
-                print("sync --out must be a directory", file=sys.stderr)
-                return 1
-            configs = validate_configs(_yaml_files(args.paths), catalog=args.catalog)
-            written = write_definition_files(args.out, definition_rows(configs))
-            print(f"wrote {len(written)} definition file(s) to {args.out}")
-            return 0
-        if args.command == "await-registry":
-            from pyspark.sql import SparkSession
-
-            from lakeflow_framework.collector import await_registered
-
-            configs = validate_configs(_yaml_files(args.paths), catalog=args.catalog)
-            expected = {
-                row["full_name"]: row["content_hash"]
-                for row in definition_rows(configs)
-                if row["object_kind"] == "pipeline"
-            }
-            if not expected:
-                raise ConfigValidationError(["await-registry was given no pipeline specs"])
-            spark = SparkSession.builder.getOrCreate()
-            await_registered(spark, expected, args.catalog, timeout_seconds=args.timeout_seconds)
-            print(f"registry has the synced {', '.join(expected)}")
-            return 0
         if args.command == "apply-metadata":
             from pyspark.sql import SparkSession
 
@@ -191,22 +131,6 @@ def main(argv: list[str] | None = None) -> int:
             configs = validate_configs(_yaml_files(args.paths), catalog=args.catalog)
             applied = apply_metadata(SparkSession.builder.getOrCreate(), configs, args.catalog)
             print(f"applied {len(applied)} metadata change(s)")
-            return 0
-        if args.command == "step":
-            payload = step_payload(
-                owner=args.owner,
-                owner_kind=args.owner_kind,
-                object_kind=args.object_kind,
-                full_name=args.full_name,
-                run_id=args.run_id,
-                step_no=args.step_no,
-                step_name=args.step_name,
-                status=args.status,
-                failure_reason=args.failure_reason,
-                parent_run_id=args.parent_run_id,
-            )
-            path = write_step_file(args.out, payload)
-            print(path)
             return 0
         configs = validate_configs(_yaml_files(args.paths))
         selected = next(config for config in configs if config.pipeline_id == args.pipeline)

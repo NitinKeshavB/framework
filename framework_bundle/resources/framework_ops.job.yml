@@ -42,24 +42,6 @@ resources:
       queue:
         enabled: true
 
-    framework_collector:
-      name: framework_collector
-      continuous:
-        pause_status: PAUSED
-      tasks:
-        - task_key: collect_events
-          environment_key: framework_env
-          spark_python_task:
-            python_file: ../src/collect_events.py
-            parameters:
-              - ${var.catalog}
-      environments:
-        - environment_key: framework_env
-          spec:
-            environment_version: "4"
-            dependencies:
-              - ../../framework_lff_lib/dist/*.whl
-
     framework_optimize:
       name: framework_optimize
       performance_target: STANDARD

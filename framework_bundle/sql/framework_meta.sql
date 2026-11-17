@@ -1,8 +1,9 @@
 -- Registry for Lakeflow workflows, pipelines, flows, securables, runs, and table health.
 -- ${catalog} is replaced by the DDL task. History tables are insert-only.
--- object_current and run_current hold one row per key so a job status check does not
--- window the history. The collector replaces those rows. The backfill below runs only
--- while the current table is empty.
+-- object_current and run_current hold one row per key so a lookup does not window the
+-- history. registry_sync writes definitions at deploy and merges those rows. The backfill
+-- below runs only while the current table is empty. Job run outcomes are not stored here.
+-- v_job_runs and v_job_status in system_views.sql read them from the system tables.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
@@ -14,8 +15,6 @@
 -- through parse_json(config_json).
 
 CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_meta;
-
-CREATE VOLUME IF NOT EXISTS ${catalog}.framework_meta.framework_events;
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
   object_kind STRING,
@@ -38,7 +37,7 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'false'
 );
 
--- recon_json is no longer written. It stays so older rows and step files still load.
+-- recon_json is no longer written. It stays so older rows still read.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
   run_id STRING,
   parent_run_id STRING,
@@ -352,32 +351,6 @@ SELECT
   config:pii::STRING AS pii
 FROM ${catalog}.framework_meta.v_object_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
-
--- Latest job run step joined to the current workflow definition.
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_status AS
-SELECT
-  workflow.job_name,
-  workflow.owner_kind,
-  workflow.owner,
-  workflow.requested_by,
-  workflow.delivery,
-  workflow.pipeline_ids,
-  workflow.requesters,
-  run.run_id,
-  run.step_no,
-  run.step_name,
-  run.status,
-  run.started_at,
-  run.ended_at,
-  run.failure_reason,
-  run.recorded_at AS run_recorded_at,
-  run.event_date
-FROM ${catalog}.framework_meta.v_workflows workflow
-LEFT JOIN ${catalog}.framework_meta.v_run_current run
-  ON run.object_kind = 'workflow'
- AND run.full_name = workflow.job_name
- AND run.owner_kind = workflow.owner_kind
- AND run.owner = workflow.owner;
 
 -- A table has one current owner. This view is empty when that holds. A row here means
 -- object_current was written by hand with two rows for the same name.

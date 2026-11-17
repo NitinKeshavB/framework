@@ -108,6 +108,12 @@ def _tasks(bundle: Path, name: str = "billing_daily") -> dict:
     return {task["task_key"]: task for task in _job(bundle, name)["tasks"]}
 
 
+def _settings(bundle: Path, name: str = "billing_daily") -> dict:
+    text = (bundle / "resources" / f"{name}.pipeline.yml").read_text("utf-8")
+    (pipeline,) = yaml.safe_load(text)["resources"]["pipelines"].values()
+    return pipeline["configuration"]
+
+
 def test_every_source_kind_is_in_the_sample() -> None:
     systems = {system.name: system for system in load_sources(SAMPLE)}
     kinds = {name: system.kind for name, system in systems.items()}
@@ -180,38 +186,14 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     generate(bundle)
     source = (bundle / "pipelines" / "billing_daily.py").read_text("utf-8")
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
-    tasks = _tasks(bundle)
-    assert tasks["sync"]["spark_python_task"]["parameters"].count("--out") == 1
+    # The job only refreshes the pipeline: no sync, step, or registry wait tasks.
+    assert [task["task_key"] for task in _job(bundle)["tasks"]] == ["refresh_pipeline"]
     job = _job(bundle)
     assert job["performance_target"] == "STANDARD"
-    assert job["environments"][0]["spec"]["environment_version"] == "4"
-    synced = tasks["sync"]["spark_python_task"]["parameters"]
-    awaited = tasks["await_registry"]["spark_python_task"]["parameters"]
-    specs = [item for item in synced if item.endswith(".yaml")]
+    assert "environments" not in job
+    specs = _settings(bundle)["lff.specs"].split(",")
     assert len(specs) == 2
-    assert [item for item in awaited if item.endswith(".yaml")] == specs
-    assert awaited[awaited.index("--catalog") + 1] == "${var.catalog}"
-    assert awaited[awaited.index("--timeout-seconds") + 1] == "900"
-    assert "pipeline_task" in tasks["refresh_pipeline"]
-    failed_after = {item["task_key"] for item in tasks["record_failure"]["depends_on"]}
-    assert failed_after == {
-        "mark_running",
-        "sync",
-        "await_registry",
-        "refresh_pipeline",
-        "apply_metadata",
-        "record_success",
-    }
-    metadata = tasks["apply_metadata"]
-    assert metadata["depends_on"] == [{"task_key": "refresh_pipeline"}]
-    assert metadata["spark_python_task"]["parameters"][0] == "apply-metadata"
-    assert [
-        item for item in metadata["spark_python_task"]["parameters"] if item.endswith(".yaml")
-    ] == specs
-    assert tasks["record_success"]["depends_on"] == [{"task_key": "apply_metadata"}]
-    running = tasks["mark_running"]["spark_python_task"]["parameters"]
-    assert running[running.index("--object-kind") + 1] == "workflow"
-    assert running[running.index("--full-name") + 1] == "billing_daily"
+    assert all(spec.startswith("${workspace.file_path}/sources/billing/") for spec in specs)
 
 
 def test_file_sources_fire_when_files_land_in_the_raw_volume(bundle: Path) -> None:
@@ -227,8 +209,7 @@ def test_database_job_has_a_schedule_and_syncs_both_tables(tmp_path: Path) -> No
     job = _job(tmp_path, "erp_nightly")
     assert job["schedule"]["quartz_cron_expression"] == "0 0 2 * * ?"
     assert "trigger" not in job
-    synced = _tasks(tmp_path, "erp_nightly")["sync"]["spark_python_task"]["parameters"]
-    assert sum(item.endswith(".yaml") for item in synced) == 2
+    assert len(_settings(tmp_path, "erp_nightly")["lff.specs"].split(",")) == 2
     source = (tmp_path / "pipelines" / "erp_nightly.py").read_text("utf-8")
     assert 'build_pipelines(["erp_customers", "erp_orders"])' in source
 
@@ -296,8 +277,7 @@ def test_specs_do_not_name_a_catalog_and_jobs_pass_the_environment_catalog(bundl
     spec = bundle / "sources/billing/billing/billing_invoices.yaml"
     assert "catalog:" not in spec.read_text("utf-8")
     generate(bundle)
-    parameters = _tasks(bundle)["sync"]["spark_python_task"]["parameters"]
-    assert parameters[parameters.index("--catalog") + 1] == "${var.catalog}"
+    assert _settings(bundle)["lff.catalog"] == "${var.catalog}"
     (system,) = load_sources(bundle)
     assert all(table.config.catalog == "catalog" for table in system.tables)
 

@@ -7,14 +7,14 @@ How the framework is put together: the folders, the code, every table it writes,
 Folders at the repository root start with `framework_`.
 
 - `framework_lff_lib` is the wheel. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`.
-- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, the collector, the `framework_metrics` pipeline, and the daily `framework_optimize` job (compaction and table health).
+- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, the `framework_metrics` pipeline, and the daily `framework_optimize` job (compaction and table health).
 - `framework_ingestion` is source to bronze: source systems, table specs, and the pipelines and jobs generated from them.
 - `framework_curation/<domain>/<project>` is one bundle per project for silver, gold, and data products.
 - `framework_examples/ingestion` is the set of specs to copy for each source kind. `framework_examples/consumer` is the original single-bundle example and is reference only.
 - `framework_tests` holds package tests. They copy sample YAML and use fake Spark objects; they do not start a cluster.
 - `framework_docs` is this documentation.
 
-Three things are kept apart on purpose: the **meta framework** (registry, collector, metrics), **source ingestion** (domain-owned, shared), and **curation** (silver, gold, and data products, one project owner each). They deploy separately and have different owners.
+Three things are kept apart on purpose: the **meta framework** (registry and metrics), **source ingestion** (domain-owned, shared), and **curation** (silver, gold, and data products, one project owner each). They deploy separately and have different owners.
 
 ## Modules
 
@@ -25,9 +25,9 @@ Each module imports only the ones listed:
 | `config` | nothing | Validates specs, joins a spec with its `source.yaml`, and holds `PipelineConfig` |
 | `load` | `config` | Load strategies: Auto Loader options, `schemaHints`, and batch SQL. No `pyspark` |
 | `quality` | `config`, `load` | Rules to SQL predicates, `_dq_failed_rules`, and the warn expectations |
-| `pipeline` | `config`, `load`, `quality` | `assemble` builds the dataset graph; `build_pipeline` registers it with `pyspark.pipelines` |
-| `metadata` | `config`, `quality` | Registry rows, definition and step files, and the registry SQL lookups |
-| `collector` | `metadata`, `pipeline` | The only registry writer: lands event files, applies DDL, waits for a synced hash |
+| `pipeline` | `config`, `load`, `quality` | `assemble` builds the dataset graph; `build_pipelines` reads the specs in `lff.specs` and registers the graph with `pyspark.pipelines` |
+| `metadata` | `config`, `quality` | Registry rows, step payloads for ownership refusals, and the registry SQL lookups |
+| `registry` | `metadata` | The only registry writer: definitions with the ownership check, and the DDL |
 | `unity` | `config`, `metadata` | Applies table and column tags and column comments to Unity Catalog |
 | `health` | nothing | Records `DESCRIBE DETAIL` and `DESCRIBE HISTORY` figures per bronze table |
 | `ingestion` | `config` | Reads `source.yaml` and specs, generates pipelines, jobs, and `SOURCE_MAP.md` |
@@ -50,37 +50,25 @@ flowchart LR
   deploy[bundle:deploy] --> registrySync[registry_sync job]
   spec --> registrySync
   registrySync --> registry[(object_registry and object_current)]
+  registrySync --> uc[(Unity Catalog tags and column comments)]
 ```
 
-One delivery of one source system is one pipeline and one job, named `<source_system>_<delivery>`. `framework_bundle` deploys first and runs `framework_ddl` and then `framework_system_views`. `framework_ingestion` deploys next and runs `registry_sync`, which writes every deployed spec into the registry with the collector's writer.
+One delivery of one source system is one pipeline and one job, named `<source_system>_<delivery>`. `framework_bundle` deploys first and runs `framework_ddl` and then `framework_system_views`. `framework_ingestion` deploys next and runs `registry_sync`, the only writer of definitions. It writes every deployed spec into the registry and applies the specs' tags and column comments in Unity Catalog.
 
 ### A delivery run
 
 ```mermaid
 flowchart TD
-  trigger[schedule or file arrival] --> markRunning[mark_running]
-  markRunning --> sync[sync]
-  sync --> awaitRegistry[await_registry]
-  awaitRegistry --> batchLoad["batch_load (COPY INTO and CTAS specs only)"]
+  trigger[schedule or file arrival] --> batchLoad["batch_load (COPY INTO and CTAS specs only)"]
   batchLoad --> refresh[refresh_pipeline]
-  awaitRegistry -. no batch specs .-> refresh
-  refresh --> applyMetadata[apply_metadata]
-  applyMetadata --> recordSuccess[record_success]
-  refresh -. any task fails .-> recordFailure[record_failure]
-  markRunning --> stepFiles[step files]
-  sync --> definitionFiles[definition files]
-  recordSuccess --> stepFiles
-  recordFailure --> stepFiles
-  stepFiles --> volume[(framework_events volume)]
-  definitionFiles --> volume
-  volume --> collector[framework_collector]
-  collector --> registryTables[(registry tables)]
-  registryTables --> awaitRegistry
-  registryTables --> refresh
-  applyMetadata --> uc[(Unity Catalog tags and comments)]
+  trigger -. no batch specs .-> refresh
+  specs["deployed spec files (lff.specs)"] --> refresh
+  refresh --> tables[(staged, bronze, and quarantine tables)]
+  refresh --> eventLog[("&lt;job&gt;_event_log")]
+  refresh --> systemTables[(system.lakeflow and system.billing)]
 ```
 
-`record_failure` runs when any earlier task fails. Job tasks write JSON files only. The collector is the single Delta writer of the registry. `await_registry` holds the run until the registry has the content hash `sync` wrote, and the pipeline then reads each spec back from `object_current`.
+The job is one task, plus `batch_load` for frozen `cloud_files` methods. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry. Its outcome lands in the system tables and its row counts in its event log.
 
 ### Inside one pipeline: source to bronze and quarantine
 
@@ -116,10 +104,10 @@ flowchart LR
 
 | Table | Schema | Written by | Grain | Kind |
 | --- | --- | --- | --- | --- |
-| `object_registry` | `framework_meta` | collector, `registry_sync` | One version of one definition | Delta, insert-only |
-| `object_current` | `framework_meta` | collector, `registry_sync` | One row per `(object_kind, full_name)` | Delta, merged |
-| `run_ledger` | `framework_meta` | collector | One job step status | Delta, insert-only |
-| `run_current` | `framework_meta` | collector | One row per `(owner_kind, owner, object_kind, full_name)` | Delta, merged |
+| `object_registry` | `framework_meta` | `registry_sync` | One version of one definition | Delta, insert-only |
+| `object_current` | `framework_meta` | `registry_sync` | One row per `(object_kind, full_name)` | Delta, merged |
+| `run_ledger` | `framework_meta` | `registry_sync` | One ownership refusal, or a job step from before steps moved to the system tables | Delta, insert-only |
+| `run_current` | `framework_meta` | `registry_sync` | One row per `(owner_kind, owner, object_kind, full_name)` | Delta, merged |
 | `table_health` | `framework_meta` | `framework_optimize` | One bronze table per day | Delta, append |
 | `<job>_event_log` | `framework_meta` | each ingestion pipeline | One pipeline event | Event log table |
 | `flow_events` | `framework_meta` | `framework_metrics` | One `flow_definition` or `flow_progress` event | Streaming table |
@@ -217,7 +205,7 @@ erDiagram
 | `run_current` | `(owner, object_kind, full_name)` |
 | `table_health` | `(owner, event_date, table_name)` |
 
-`config` is `config_json` parsed to `VARIANT`; `content_hash` is computed over `config_json`, so both are kept. `recon_json` is no longer written; it stays so older rows and step files still load.
+`config` is `config_json` parsed to `VARIANT`; `content_hash` is computed over `config_json`, so both are kept. `recon_json` is no longer written; it stays so older rows still read.
 
 ### Registry, logical
 
@@ -226,7 +214,7 @@ Every box is a row in `object_registry`, except `RUN_STEP`, which is a row in `r
 ```mermaid
 erDiagram
   WORKFLOW |o--o{ PIPELINE : owns
-  WORKFLOW ||--o{ RUN_STEP : "job run steps"
+  PIPELINE ||--o{ RUN_STEP : "ownership refusals"
   PIPELINE ||--|| DATAFLOW : contains
   DATAFLOW ||--|{ FLOW : "reads writes rejects_to"
   FLOW ||--o| SECURABLE : "writes or rejects_to"
@@ -244,7 +232,7 @@ erDiagram
 | `streaming_table`, `table`, `materialized_view` | `<catalog>.<schema>.<table>` | the flow name | `writes` or `rejects_to` | Layer, domain, data domain, team, technical owner, classification, PII |
 | `link` | `<pipeline_id>-><table>` | pipeline | `writes` or `rejects_to` | Child table name |
 | `column` | `<table>.<column>` | table name | `column_of` | Ordinal, type, description, classification, PII |
-| `run_ledger` step | the job name | none | none | Status `RUNNING` / `SUCCEEDED` / `FAILED`, step name, failure text |
+| `run_ledger` step | the refused pipeline or table | none | none | `ownership_check`, `FAILED`, and the holder in `failure_reason` |
 
 A file source whose raw layer is a volume still has a `raw` flow. That flow records the volume path and has no securable. A `cloud_files` raw flow has a securable, because its raw layer is a Delta table. A database load has no raw flow. Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
 
@@ -260,7 +248,7 @@ What each table the pipeline writes holds, beyond the spec's `columns`:
 | bronze | The same lineage columns, without `_dq_failed_rules` | Rows with no failed rule; with Auto CDC, the latest row per key by the watermark |
 | quarantine | The same lineage columns and `failed_rules` | Rows with at least one failed rule |
 
-Every published table gets a comment, `table_properties` (`quality` = its layer, and `lakeflow_framework.pipeline_id`), and liquid clustering. `apply_metadata` then sets the Unity Catalog tags `classification`, `domain`, `owner`, and `pii` on each table, `classification` and `pii` on each column, and each column's `description` as its comment.
+Every published table gets a comment, `table_properties` (`quality` = its layer, and `lakeflow_framework.pipeline_id`), and liquid clustering. At deploy, `registry_sync` sets the Unity Catalog tags `classification`, `domain`, `owner`, and `pii` on each table, `classification` and `pii` on each column, and each column's `description` as its comment.
 
 ### Metrics, physical
 
@@ -328,7 +316,7 @@ flowchart TD
   run_ledger --> v_process
   run_current --> v_run_current
   v_workflows --> v_job_status
-  v_run_current --> v_job_status
+  v_job_runs --> v_job_status
   v_workflows --> v_job_runs
   v_workflows --> v_pipeline_updates
   v_job_runs --> v_job_task_runs
@@ -339,7 +327,7 @@ flowchart TD
   system_tables --> v_observed_lineage
 ```
 
-`framework_meta.sql` creates every view on the left of the system tables; `system_views.sql` creates `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_observed_lineage`, in their own job because they need system table grants. The views read fields from `config` with `config:path`. `v_run_current` is every job's latest step however long ago it ran. `v_job_status` joins each workflow to that step. Job run steps are stored with `object_kind = workflow` and `full_name = job_name`.
+`framework_meta.sql` creates every view on the left of the system tables; `system_views.sql` creates `v_job_runs`, `v_job_task_runs`, `v_job_status`, `v_pipeline_updates`, and `v_observed_lineage`, in their own job because they need system table grants. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_run_current` holds the latest ownership refusal per object.
 
 `v_object_history` windows by `owner_kind`, `owner`, `object_kind`, and `full_name`. Filter those columns, and `owner` in particular, or the window reads every version in the table. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row.
 
@@ -356,7 +344,7 @@ How the views join the system tables:
 
 **The Unity Catalog volume is the raw layer for file kinds.** `sftp_files` and `sharepoint_files` keep the files as delivered and have no raw Delta table. A database has no raw layer. `cloud_files` writes a raw table first. Its path may be `abfss://`, `s3://`, or a `/Volumes/<catalog>/<schema>/<volume>` path. Quarantine and bronze are always built, and both are filtered by the quality rules.
 
-**The source system owns bronze.** Many teams can add specs under one source. The registry records `requested_by` for the team that asked. The collector refuses a second source system for the same table. Silver, gold, and data products are owned by a project.
+**The source system owns bronze.** Many teams can add specs under one source. The registry records `requested_by` for the team that asked. `registry_sync` refuses a second source system for the same table. Silver, gold, and data products are owned by a project.
 
 **A delivery is the pipeline.** Every table in a delivery loads in one Lakeflow pipeline and one job. A second schedule is a second delivery in that source's `source.yaml`. A new table in an existing delivery is a spec file and nothing else. Cross-table waits belong to curation, not to bronze.
 
@@ -370,9 +358,9 @@ How the views join the system tables:
 
 **Quality rules are functions from config to SQL.** The template does not know how a not-null rule was produced.
 
-**The registry records intent; the platform records what happened.** Definitions, owners, and job steps are in the registry. Row counts come from the event logs, run durations and cost from `system.lakeflow` and `system.billing`, and observed lineage from `system.access`. The views join the two.
+**The registry records intent; the platform records what happened.** Definitions and owners are in the registry, written once per deploy. Row counts come from the event logs, run durations and cost from `system.lakeflow` and `system.billing`, and observed lineage from `system.access`. The views join the two.
 
-**Unity Catalog holds the governance metadata.** The spec is the source; `apply_metadata` writes it to Unity Catalog after every refresh and changes only what differs. `v_metadata_drift` shows anything that disagrees.
+**Unity Catalog holds the governance metadata.** The spec is the source; `registry_sync` writes it to Unity Catalog at every deploy and changes only what differs. `v_metadata_drift` shows anything that disagrees.
 
 **Auto Loader options are a fixed map.** A format allow-list, `max_files_per_trigger` (1000 when the spec omits it), JSON `multiline` only when the spec sets it, a required CSV delimiter, Excel `header_rows` of 0 or 1, and a required Excel `data_address`. The pipeline owns the checkpoint and `cloudFiles.schemaLocation`. CSV, delimited text, and JSON get `cloudFiles.schemaHints` from `columns`, and `source.file_events: true` sets `cloudFiles.useManagedFileEvents`.
 

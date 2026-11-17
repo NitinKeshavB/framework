@@ -1,15 +1,13 @@
-"""One writer for the registry. Auto Loader calls this from the collector job."""
+"""The registry writer. registry_sync calls it at deploy; framework_ddl calls apply_ddl."""
 
 from __future__ import annotations
 
 import re
-import time
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 from lakeflow_framework.metadata import (
     LEDGER_COLUMNS,
     OBJECT_COLUMNS,
-    OWNED_KINDS,
     current_objects_sql,
     ddl_statements,
     ingest_steps,
@@ -17,12 +15,10 @@ from lakeflow_framework.metadata import (
     owners_sql,
     ownership_conflicts,
     recorded_versions_sql,
-    registered_sql,
     step_key,
     step_keys_sql,
     step_payload,
 )
-from lakeflow_framework.pipeline import MetadataNotFound
 
 RUN_KEYS = ("owner_kind", "owner", "object_kind", "full_name")
 OBJECT_KEYS = ("object_kind", "full_name")
@@ -145,37 +141,6 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
         )
         held.add((row["object_kind"], row["full_name"], row["content_hash"]))
     return written
-
-
-def await_registered(
-    spark,
-    expected: Mapping[str, str],
-    catalog: str,
-    timeout_seconds: float = 300,
-    pause_seconds: float = 5,
-    sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-) -> None:
-    """Wait until each pipeline's current registry row has the content hash this run synced.
-
-    A row with the right name but an older hash is an outdated spec, so it does not count.
-    """
-
-    pending = list(expected)
-    deadline = clock() + timeout_seconds
-    while pending:
-        found = {
-            str(row["full_name"]): str(row["content_hash"])
-            for row in _rows(spark.sql(registered_sql(pending, catalog)))
-        }
-        pending = [name for name in pending if found.get(name) != expected[name]]
-        if not pending:
-            return
-        if clock() >= deadline:
-            raise MetadataNotFound(
-                "registry does not have the synced version of " + ", ".join(pending)
-            )
-        sleep(pause_seconds)
 
 
 def _refuse_other_owners(spark, catalog: str, rows: list[dict]) -> list[dict]:
@@ -391,121 +356,3 @@ def _event_time(column: str) -> str:
         f"COALESCE(to_timestamp({column}, 'yyyy-MM-dd''T''HH:mm:ss''Z'''), "
         f"CAST({column} AS TIMESTAMP))"
     )
-
-
-def _latest(kind: str, keys: str) -> str:
-    return (
-        f"SELECT * FROM _framework_events WHERE kind = '{kind}' "
-        f"QUALIFY row_number() OVER (PARTITION BY {keys} ORDER BY recorded_at DESC) = 1"
-    )
-
-
-def event_statements(catalog: str) -> list[str]:
-    """Land one Auto Loader batch in Spark.
-
-    The driver never collects the batch. History is insert-only and checked for two days.
-    Current tables are merged so a status read is one row.
-    """
-
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", catalog or ""):
-        raise ValueError("catalog is required")
-    meta = f"{catalog}.framework_meta"
-    recorded = _event_time("e.recorded_at")
-    event_date = "CAST(substr(e.recorded_at, 1, 10) AS DATE) AS event_date"
-    recent = "r.event_date >= date_sub(current_date(), 2)"
-    ledger = ", ".join(LEDGER_COLUMNS)
-    owned = ", ".join(f"'{kind}'" for kind in sorted(OWNED_KINDS))
-    other_owner = (
-        f"e.object_kind IN ({owned}) AND (c.owner_kind <> e.owner_kind OR c.owner <> e.owner)"
-    )
-    latest_definition = _latest("definition", "object_kind, full_name")
-
-    def steps(source: str) -> str:
-        return (
-            f"SELECT e.run_id, e.parent_run_id, e.object_kind, e.full_name, e.owner_kind, "
-            f"e.owner, CAST(e.step_no AS INT) AS step_no, e.step_name, e.status, "
-            f"{_event_time('e.started_at')} AS started_at, "
-            f"{_event_time('e.ended_at')} AS ended_at, e.failure_reason, e.recon_json, "
-            f"{recorded} AS recorded_at, {event_date} FROM ({source}) e"
-        )
-
-    ledger_insert = (
-        f"INSERT INTO {meta}.run_ledger "
-        f"SELECT {ledger} FROM ({steps(_latest('step', 'run_id, step_no, status'))}) s "
-        f"WHERE NOT EXISTS (SELECT 1 FROM {meta}.run_ledger r "
-        f"WHERE r.run_id = s.run_id AND r.step_no = s.step_no AND r.status = s.status "
-        f"AND {recent})"
-    )
-    run_merge = _merge_sql(
-        f"{meta}.run_current",
-        steps(_latest("step", ", ".join(RUN_KEYS))),
-        RUN_KEYS,
-        LEDGER_COLUMNS,
-        "recorded_at",
-    )
-    # A definition another owner already holds becomes a FAILED ownership_check step.
-    refused = (
-        f"SELECT concat('ownership-', substr(e.content_hash, 1, 16)) AS run_id, "
-        f"CAST(NULL AS STRING) AS parent_run_id, e.object_kind, e.full_name, e.owner_kind, "
-        f"e.owner, CAST(1 AS INT) AS step_no, 'ownership_check' AS step_name, 'FAILED' AS status, "
-        f"{recorded} AS started_at, {recorded} AS ended_at, "
-        f"concat(e.full_name, ' is owned by ', c.owner_kind, ' ', c.owner, '; ', "
-        f"e.owner_kind, ' ', e.owner, ' cannot register it') AS failure_reason, "
-        f"CAST(NULL AS STRING) AS recon_json, {recorded} AS recorded_at, {event_date} "
-        f"FROM ({latest_definition}) e "
-        f"JOIN {meta}.object_current c "
-        f"ON c.object_kind = e.object_kind AND c.full_name = e.full_name "
-        f"WHERE {other_owner}"
-    )
-    ownership = (
-        f"INSERT INTO {meta}.run_ledger SELECT {ledger} FROM ({refused}) s "
-        f"WHERE NOT EXISTS (SELECT 1 FROM {meta}.run_ledger r "
-        f"WHERE r.run_id = s.run_id AND r.step_name = 'ownership_check' AND {recent})"
-    )
-    ownership_current = _merge_sql(
-        f"{meta}.run_current", refused, RUN_KEYS, LEDGER_COLUMNS, "recorded_at"
-    )
-    definition_columns = ", ".join(
-        [
-            f"{recorded} AS recorded_at" if column == "recorded_at" else f"e.{column}"
-            for column in OBJECT_COLUMNS
-        ]
-        + ["parse_json(e.config_json) AS config"]
-    )
-    object_columns = ", ".join(OBJECT_TABLE_COLUMNS)
-    accepted = (
-        f"SELECT {definition_columns} "
-        f"FROM ({latest_definition}) e "
-        f"LEFT JOIN {meta}.object_current c "
-        f"ON c.object_kind = e.object_kind AND c.full_name = e.full_name "
-        f"WHERE (c.full_name IS NULL OR (c.content_hash <> e.content_hash "
-        f"AND {recorded} >= c.recorded_at)) "
-        f"AND NOT (c.full_name IS NOT NULL AND {other_owner})"
-    )
-    object_insert = (
-        f"INSERT INTO {meta}.object_registry ({object_columns}) "
-        f"SELECT {object_columns} FROM ({accepted}) a "
-        f"WHERE NOT EXISTS ("
-        f"SELECT 1 FROM {meta}.object_registry h "
-        f"WHERE h.owner = a.owner AND h.object_kind = a.object_kind "
-        f"AND h.full_name = a.full_name AND h.content_hash = a.content_hash "
-        f"AND h.recorded_at = a.recorded_at)"
-    )
-    object_merge = _merge_sql(
-        f"{meta}.object_current", accepted, OBJECT_KEYS, OBJECT_TABLE_COLUMNS, "recorded_at"
-    )
-    return [
-        ledger_insert,
-        run_merge,
-        ownership,
-        ownership_current,
-        object_insert,
-        object_merge,
-    ]
-
-
-def land_events(spark, catalog: str) -> None:
-    """Apply one micro-batch that is already registered as _framework_events."""
-
-    for statement in event_statements(catalog):
-        spark.sql(statement)

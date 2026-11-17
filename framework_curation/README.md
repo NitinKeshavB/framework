@@ -61,7 +61,7 @@ Then run `./run.sh projects:generate`. It checks every reference and rewrites th
 
 ## In the registry
 
-A project's tables will be registered with `owner_kind = project` and `owner = <project>`, and the collector's one-owner check applies to them as it does to bronze. Bronze tables stay owned by their source system, so a project that reads `erp.orders` never owns it.
+A project's tables will be registered with `owner_kind = project` and `owner = <project>`, and `registry_sync`'s one-owner check applies to them as it does to bronze. Bronze tables stay owned by their source system, so a project that reads `erp.orders` never owns it.
 
 ## Not built yet (phase 1)
 

@@ -10,13 +10,6 @@ import pytest
 
 from lakeflow_framework import ConfigValidationError, build_pipeline, validate_configs
 from lakeflow_framework.cli import main
-from lakeflow_framework.collector import (
-    _cast,
-    append_definitions,
-    apply_ddl,
-    await_registered,
-    event_statements,
-)
 from lakeflow_framework.config import config_from_document, email_notifications
 from lakeflow_framework.load import get_strategy
 from lakeflow_framework.metadata import (
@@ -29,15 +22,18 @@ from lakeflow_framework.metadata import (
     object_rows,
     owners_sql,
     ownership_conflicts,
-    split_payloads,
-    step_file_name,
     step_keys_sql,
     step_payload,
-    write_definition_files,
 )
 from lakeflow_framework.pipeline import MetadataNotFound, UnityMetadata, assemble, build_pipelines
 from lakeflow_framework.quality import compile_rules, fail_sql
+from lakeflow_framework.registry import (
+    _cast,
+    append_definitions,
+    apply_ddl,
+)
 
+INGESTION = Path(__file__).resolve().parents[1] / "framework_ingestion"
 EXAMPLES = (
     Path(__file__).resolve().parents[1] / "framework_examples" / "consumer" / "configs" / "bronze"
 )
@@ -404,7 +400,6 @@ def test_registry_hash_is_stable_and_steps_do_not_duplicate():
     keys: set = set()
     assert len(ingest_steps([running, success], keys)) == 2
     assert ingest_steps([success], keys) == []
-    assert step_file_name(running).endswith("100_10_RUNNING.json")
     assert "recon" not in success and "recon_json" not in success
 
 
@@ -513,7 +508,8 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "v_pipelines" in text
     assert "v_dataflows" in text
     assert "v_flows" in text
-    assert "v_job_status" in text
+    assert "v_job_status" not in text
+    assert "framework_events" not in text
     assert "v_tables" in text
     assert "v_object_history" in text
     assert "PARTITION BY object_kind, full_name" in text
@@ -714,54 +710,6 @@ def test_example_columns_keep_descriptions_and_sensitivity():
     assert recorded["classification"] == "confidential"
 
 
-def test_definition_files_are_one_file_per_owner(tmp_path: Path):
-    rows = object_rows(config_from_document(_billing()))
-    written = write_definition_files(tmp_path, rows)
-    assert len(written) == 1
-    lines = [line for line in written[0].read_text(encoding="utf-8").splitlines() if line]
-    assert len(lines) == len(rows)
-    payloads = [json.loads(line) for line in lines]
-    assert {payload["kind"] for payload in payloads} == {"definition"}
-    steps, definitions = split_payloads(
-        payloads + [{"kind": "step", "run_id": "1"}, {"kind": "other"}]
-    )
-    assert len(steps) == 1
-    assert len(definitions) == len(rows)
-    assert "kind" not in definitions[0]
-    again = write_definition_files(tmp_path, rows)
-    assert again == written
-
-
-def test_cli_writes_a_step_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    arguments = [
-        "step",
-        "--owner",
-        "billing",
-        "--object-kind",
-        "workflow",
-        "--full-name",
-        "billing_daily",
-        "--run-id",
-        "100",
-        "--step-no",
-        "50",
-        "--step-name",
-        "record_success",
-        "--status",
-        "SUCCEEDED",
-        "--out",
-        str(tmp_path),
-    ]
-    assert main(arguments) == 0
-    payload = json.loads(Path(capsys.readouterr().out.strip()).read_text(encoding="utf-8"))
-    assert payload["object_kind"] == "workflow"
-    assert payload["full_name"] == "billing_daily"
-    assert "recon_json" not in payload
-    # Load counts come from table_load_metrics now, so the step no longer takes them.
-    with pytest.raises(SystemExit):
-        main([*arguments, "--recon-json", "{}"])
-
-
 def test_a_step_file_written_with_counts_still_lands():
     row = ingest_steps(
         [
@@ -778,66 +726,6 @@ def test_a_step_file_written_with_counts_still_lands():
         ]
     )[0]
     assert row["recon_json"] == '{"source_count": 10}'
-
-
-def _registry_polls(*answers: list[dict]):
-    """A Spark double whose registry lookups return each answer in turn, then the last again."""
-
-    calls = {"n": 0}
-
-    class Frame:
-        def collect(self):
-            calls["n"] += 1
-            return answers[min(calls["n"], len(answers)) - 1]
-
-    class Spark:
-        def sql(self, text):
-            assert "framework_dev.framework_meta.v_object_current" in text
-            assert "content_hash" in text
-            return Frame()
-
-    return Spark(), calls
-
-
-def _wait(spark, expected: dict[str, str], timeout_seconds: float = 30) -> None:
-    clock = {"t": 0.0}
-
-    def pause(seconds):
-        clock["t"] += seconds
-
-    await_registered(
-        spark,
-        expected,
-        "framework_dev",
-        timeout_seconds=timeout_seconds,
-        pause_seconds=5,
-        sleep=pause,
-        clock=lambda: clock["t"],
-    )
-
-
-def test_await_registry_polls_until_the_synced_version_arrives():
-    spark, calls = _registry_polls([], [{"full_name": "billing_invoices", "content_hash": "new"}])
-    _wait(spark, {"billing_invoices": "new"})
-    assert calls["n"] == 2
-
-
-def test_await_registry_does_not_accept_an_outdated_spec():
-    outdated = [{"full_name": "billing_invoices", "content_hash": "old"}]
-    current = [{"full_name": "billing_invoices", "content_hash": "new"}]
-    spark, calls = _registry_polls(outdated, outdated, current)
-    _wait(spark, {"billing_invoices": "new"})
-    assert calls["n"] == 3
-
-    spark, _ = _registry_polls(outdated)
-    with pytest.raises(MetadataNotFound, match="synced version of billing_invoices"):
-        _wait(spark, {"billing_invoices": "new"}, timeout_seconds=10)
-
-
-def test_await_registry_fails_when_the_row_never_arrives():
-    spark, _ = _registry_polls([])
-    with pytest.raises(MetadataNotFound):
-        _wait(spark, {"billing_invoices": "new"}, timeout_seconds=0)
 
 
 def test_a_table_version_stays_open_when_only_the_job_name_changes():
@@ -866,7 +754,7 @@ def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
         inserted.append(rows)
         return len(rows)
 
-    monkeypatch.setattr("lakeflow_framework.collector._insert", fake_insert)
+    monkeypatch.setattr("lakeflow_framework.registry._insert", fake_insert)
     row = {
         "object_kind": "pipeline",
         "full_name": "billing_invoices",
@@ -984,7 +872,7 @@ def test_collector_records_a_failed_check_instead_of_writing_another_owners_tabl
                 )
             return Frame([])
 
-    monkeypatch.setattr("lakeflow_framework.collector._insert", fake_insert)
+    monkeypatch.setattr("lakeflow_framework.registry._insert", fake_insert)
     taken = _owned_row(owner="erp", content_hash="d" * 64)
     fine = _owned_row(
         full_name="framework_dev.erp_bronze.orders", owner="erp", content_hash="e" * 64
@@ -998,18 +886,44 @@ def test_collector_records_a_failed_check_instead_of_writing_another_owners_tabl
     assert "owned by source_system billing" in step["failure_reason"]
 
 
-def test_definition_and_step_files_are_filed_under_their_owner(tmp_path: Path):
-    rows = object_rows(config_from_document(_billing()))
-    written = write_definition_files(tmp_path, rows)
-    assert all(
-        path.relative_to(tmp_path).parts[:2] == ("source_system", "billing") for path in written
-    )
-    step = step_payload(owner="finance", owner_kind="project", full_name="x", run_id="1",
-                        step_no=1, step_name="a", status="RUNNING")  # fmt: skip
-    assert step_file_name(step).startswith("project/finance/x/")
+def test_a_step_needs_a_known_owner_kind():
     with pytest.raises(ValueError):
         step_payload(owner="x", owner_kind="team", full_name="x", run_id="1", step_no=1,
                      step_name="a", status="RUNNING")  # fmt: skip
+
+
+def test_per_run_commands_are_gone(capsys: pytest.CaptureFixture[str]):
+    # Definitions are written at deploy by registry_sync, and run outcomes come from the
+    # system tables, so a job no longer syncs, records steps, or waits for the registry.
+    for command in ("sync", "step", "await-registry"):
+        with pytest.raises(SystemExit):
+            main([command, "--help"])
+        assert "invalid choice" in capsys.readouterr().err
+
+
+def test_a_delivery_reads_its_specs_from_the_pipeline_configuration():
+    paths = [INGESTION / "sources" / "abs" / "fdh" / "abs_accounting.yaml"]
+
+    class Conf:
+        def get(self, key, default=None):
+            return {
+                "lff.specs": ",".join(str(path) for path in paths),
+                "lff.catalog": "framework_test",
+            }.get(key, default)
+
+    class Reader:
+        def get_pipelines(self, pipeline_ids):
+            raise AssertionError("the registry is not read when lff.specs is set")
+
+    spark, pipelines = _FakeSpark(), _FakePipelines()
+    spark.conf = Conf()
+    graphs = build_pipelines(["abs_accounting"], spark=spark, pipelines=pipelines)
+    assert [graph.pipeline_id for graph in graphs] == ["abs_accounting"]
+    assert any(name.startswith("framework_test.") for name in pipelines.names)
+    with pytest.raises(MetadataNotFound, match="not in lff.specs"):
+        build_pipelines(["not_deployed"], spark=spark, pipelines=pipelines)
+    with pytest.raises(AssertionError):
+        build_pipelines(["abs_accounting"], spark=spark, pipelines=pipelines, metadata=Reader())
 
 
 def test_a_delivery_reads_every_pipeline_document_once():
@@ -1057,44 +971,6 @@ def test_step_lookup_prunes_by_owner_and_event_date():
     assert "to_timestamp" in _cast("recorded_at", ("recorded_at",), (), ())
 
 
-def test_collector_bounds_the_micro_batch():
-    text = (
-        Path(__file__).resolve().parents[1] / "framework_bundle" / "src" / "collect_events.py"
-    ).read_text(encoding="utf-8")
-    assert 'option("cloudFiles.maxFilesPerTrigger", _MAX_FILES_PER_TRIGGER)' in text
-    assert 'option("pathGlobFilter", "*.json")' in text
-    assert "_checkpoints/collector" in text
-    assert '_MAX_FILES_PER_TRIGGER = "5000"' in text
-    assert "land_events" in text
-    assert "availableNow=True" in text
-    assert ".collect()" not in text
-    statements = event_statements("framework_dev")
-    landed = "\n".join(statements)
-    assert "framework_dev.framework_meta.object_current" in landed
-    assert "framework_dev.framework_meta.run_current" in landed
-    assert "date_sub(current_date(), 2)" in landed
-    assert "INSERT INTO framework_dev.framework_meta.object_registry" in landed
-    history = next(
-        statement
-        for statement in statements
-        if statement.startswith("INSERT INTO framework_dev.framework_meta.object_registry")
-    )
-    assert "NOT EXISTS" in history and "h.content_hash = a.content_hash" in history
-    # Columns are named, so a column added to an older table cannot shift the insert.
-    assert history.startswith(
-        "INSERT INTO framework_dev.framework_meta.object_registry (object_kind, full_name, "
-    )
-    assert "parse_json(e.config_json) AS config" in history
-    current = next(
-        statement
-        for statement in statements
-        if statement.startswith("MERGE INTO framework_dev.framework_meta.object_current")
-    )
-    assert "NOT EXISTS" not in current
-    with pytest.raises(ValueError):
-        event_statements("framework dev")
-
-
 def test_a_retried_definition_repairs_the_current_row_without_a_second_history_row(monkeypatch):
     inserted: list[list[dict]] = []
     merged: list[list[dict]] = []
@@ -1106,8 +982,8 @@ def test_a_retried_definition_repairs_the_current_row_without_a_second_history_r
     def fake_merge(_spark, _table, rows, *_args, **_kwargs):
         merged.append(rows)
 
-    monkeypatch.setattr("lakeflow_framework.collector._insert", fake_insert)
-    monkeypatch.setattr("lakeflow_framework.collector._merge_current", fake_merge)
+    monkeypatch.setattr("lakeflow_framework.registry._insert", fake_insert)
+    monkeypatch.setattr("lakeflow_framework.registry._merge_current", fake_merge)
     row = _owned_row()
 
     class Frame:
@@ -1170,7 +1046,7 @@ def test_definitions_written_from_python_parse_config_to_variant():
         def sql(self, statement):
             statements.append(statement)
 
-    from lakeflow_framework.collector import OBJECT_DERIVED, _insert, _merge_current
+    from lakeflow_framework.registry import OBJECT_DERIVED, _insert, _merge_current
 
     row = _owned_row()
     _insert(Spark(), "t", [row], OBJECT_COLUMNS, derived=OBJECT_DERIVED)

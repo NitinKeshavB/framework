@@ -22,7 +22,7 @@ domain-owned, shared                  project-owned in framework_curation
 | Bronze table | The source system | the same, plus `requested_by` and `delivery` |
 | Silver, gold, or data product | One project | `owner_kind = project`, `owner = <project>` |
 
-A table is registered once. Two requests for the same file share one bronze table. Another project reads a silver, gold, or product as `<project>.silver.<name>` (or `.gold.` / `.product.`) and never creates it again. The checks are in three places: `generate` and `projects:generate` before merge, the collector at registration, and `v_ownership_conflicts` for anything that slipped through. See [END_TO_END.md](END_TO_END.md#ownership).
+A table is registered once. Two requests for the same file share one bronze table. Another project reads a silver, gold, or product as `<project>.silver.<name>` (or `.gold.` / `.product.`) and never creates it again. The checks are in three places: `generate` and `projects:generate` before merge, `registry_sync` at registration, and `v_ownership_conflicts` for anything that slipped through. See [END_TO_END.md](END_TO_END.md#ownership).
 
 ## What is built
 

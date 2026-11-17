@@ -6,11 +6,11 @@ Domain-owned ingestion into bronze. Projects do not own anything here. Any team 
 
 | Bundle | Holds | Owner |
 | --- | --- | --- |
-| `framework_bundle` | The registry (`framework_meta`), the collector, load metrics, and `OPTIMIZE` | Platform team |
+| `framework_bundle` | The registry (`framework_meta`), load metrics, run views, and `OPTIMIZE` | Platform team |
 | `framework_ingestion` (this one) | Source to bronze | Domain, per source system |
 | `framework_curation/<domain>/<project>` | Silver, gold, and data products | One project each |
 
-Deploy order: `framework_bundle`, then run its `framework_ddl` job and start `framework_collector`, then this bundle, then the projects.
+Deploy order: `framework_bundle` (its deploy runs `framework_ddl`), then this bundle, then the projects.
 
 ## Source kinds
 
@@ -63,7 +63,7 @@ The spec's `raw_to_bronze` section holds the bronze table, keys, columns, and qu
 
 ## One delivery, one pipeline, one job
 
-A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job syncs the specs into the registry, waits until they are visible, refreshes the pipeline, applies the specs' tags and column comments in Unity Catalog, and records the result. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `table_load_metrics`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
+A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline, and the pipeline reads the delivery's deployed spec files, listed in its `lff.specs` setting. Deploy writes the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `table_load_metrics`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
 
 ## Add a table to a source system
 
@@ -87,7 +87,7 @@ That is all. The generator validates every source and spec, then rewrites the ma
 ./run.sh bundle:deploy framework_ingestion dev <profile>
 ```
 
-Deploy uploads the bundle, then runs `registry_sync`. That job writes every spec into `framework_meta` under the target catalog. The framework bundle must already be deployed, because that deploy creates the registry.
+Deploy uploads the bundle, then runs `registry_sync`. That job writes every spec into `framework_meta` under the target catalog, then sets the tags and column comments in Unity Catalog. A table whose pipeline has not run yet is tagged on the next deploy. The framework bundle must already be deployed, because that deploy creates the registry.
 
 ## Prerequisites
 
@@ -101,9 +101,9 @@ The framework does not create these. The domain makes sure they exist before a d
 
 ## Ownership and the registry
 
-Bronze is owned by the **source system**. The registry stores `owner_kind = source_system` and `owner = <source system>` on every row, with `requested_by` (the team that asked for the table) and `delivery` beside it. A table has one owner, and the collector refuses a second owner's registration and records a failed `ownership_check` step. The team that asked for a table never owns it.
+Bronze is owned by the **source system**. The registry stores `owner_kind = source_system` and `owner = <source system>` on every row, with `requested_by` (the team that asked for the table) and `delivery` beside it. A table has one owner, and `registry_sync` refuses a second owner's registration and records a failed `ownership_check` step. The team that asked for a table never owns it.
 
-Each delivery syncs a workflow, one pipeline and dataflow per table, the layer flows, securables, links, and columns. Job run steps use `object_kind = workflow`. Query status with `v_job_status`, definitions with `v_workflows` / `v_pipelines` / `v_dataflows` / `v_flows`, and filter by `owner`. The full view list is in the [root README](../README.md#see-what-is-running).
+Deploy registers each delivery's workflow, one pipeline and dataflow per table, the layer flows, securables, links, and columns. Query run status with `v_job_status`, definitions with `v_workflows` / `v_pipelines` / `v_dataflows` / `v_flows`, and filter by `owner`. The full view list is in the [root README](../README.md#see-what-is-running).
 
 `requested_by` is the project folder. Omit it only when the spec sits next to `source.yaml`. A spec that says `project:` instead of `requested_by:` is rejected.
 

@@ -220,6 +220,21 @@ def test_run_views_join_system_tables_on_the_workflow_tag_and_pipeline_name():
     assert "usage_metadata.dlt_pipeline_id" in text and "usage_metadata.job_run_id" in text
 
 
+def test_job_status_is_the_latest_system_table_run_per_workflow():
+    statements = ddl_statements(
+        "framework_dev", (BUNDLE / "sql" / "system_views.sql").read_text("utf-8")
+    )
+    status = next(s for s in statements if "VIEW framework_dev.framework_meta.v_job_status" in s)
+    assert "FROM framework_dev.framework_meta.v_job_runs" in status
+    assert "PARTITION BY job_name ORDER BY started_at DESC" in status
+    assert "WHEN run.result_state IS NULL THEN 'RUNNING'" in status
+    assert "LEFT JOIN latest run ON run.job_name = workflow.job_name" in status
+    # v_job_runs must exist first, in the same file.
+    names = [s.split(" AS", 1)[0] for s in statements]
+    runs = next(i for i, name in enumerate(names) if name.endswith("v_job_runs"))
+    assert runs < statements.index(status)
+
+
 def test_ops_bundle_wires_metrics_system_views_and_table_health():
     resources = yaml.safe_load((BUNDLE / "resources" / "framework_ops.job.yml").read_text("utf-8"))
     jobs, pipelines = resources["resources"]["jobs"], resources["resources"]["pipelines"]

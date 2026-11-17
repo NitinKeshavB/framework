@@ -17,7 +17,7 @@ The DDL task splits the file on `;`, so a SQL comment in it, or in `system_views
 
 ## Deploy
 
-Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), start `framework_collector`, then `framework_ingestion` (deploy runs `registry_sync`), then each project. `framework_metrics` (hourly) and `framework_optimize` (daily) are scheduled by the framework bundle. `framework_metrics` finds new `<job>_event_log` tables on its next run, so a new delivery needs no change there.
+Order: `framework_bundle` (deploy runs `framework_ddl`, then `framework_system_views`), then `framework_ingestion` (deploy runs `registry_sync`), then each project. `framework_metrics` (hourly) and `framework_optimize` (daily) are scheduled by the framework bundle. `framework_metrics` finds new `<job>_event_log` tables on its next run, so a new delivery needs no change there.
 
 ```bash
 ./run.sh bundle:deploy framework_bundle <target> <profile>
@@ -37,13 +37,13 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 
 ## What not to change
 
-- Delivery jobs write JSON files only. The collector inserts those into `object_registry` and `run_ledger` and merges `object_current` and `run_current`. `registry_sync`, which deploy runs, calls the same insert for the specs just uploaded. Do not `UPDATE` or `DELETE` the history tables. Do not add another writer.
-- Do not weaken the ownership check. The collector must keep refusing a pipeline or table another owner holds.
-- Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines. The collector is the exception: its checkpoint is under the events volume because it is a job, and it lists only `*.json` so that checkpoint is not ingested.
+- `registry_sync`, which deploy runs, is the only writer of definitions. It calls `append_definitions` in `registry.py`, which inserts `object_registry`, merges `object_current`, and records ownership refusals in `run_ledger` and `run_current`. Delivery jobs do not write the registry and must not wait on it: the pipeline reads its specs from `lff.specs`. Do not `UPDATE` or `DELETE` the history tables. Do not add another writer.
+- Do not weaken the ownership check. `registry_sync` must keep refusing a pipeline or table another owner holds.
+- Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines.
 - Do not schedule a `VACUUM` that shortens retention.
 - Do not create a table or schema in a spec's name from a pipeline. Schemas and volumes are prepared outside the framework.
-- Do not add a Unity Catalog tag key outside `classification`, `domain`, `owner`, and `pii` to `apply_metadata` without listing it in `unity.py`. It unsets only those keys, so tags set by others stay.
-- Do not drop the `event_log` block or the `lakeflow_framework_workflow` tag from generated pipelines and jobs. `table_load_metrics` and the run views depend on them.
+- Do not add a Unity Catalog tag key outside `classification`, `domain`, `owner`, and `pii` without listing it in `unity.py`. It unsets only those keys, so tags set by others stay.
+- Do not drop the `event_log` block, the `lff.specs` and `lff.catalog` settings, or the `lakeflow_framework_workflow` tag from generated pipelines and jobs. The pipeline, `table_load_metrics`, and the run views depend on them.
 
 ## Adding a source kind
 
