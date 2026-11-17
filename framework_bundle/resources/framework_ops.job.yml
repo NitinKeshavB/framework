@@ -9,12 +9,13 @@ resources:
             python_file: ../src/apply_ddl.py
             parameters:
               - ${var.catalog}
+              - ${workspace.file_path}/sql/framework_meta.sql
       environments:
         - environment_key: framework_env
           spec:
             environment_version: "2"
             dependencies:
-              - ../../framework_src/dist/*.whl
+              - ../../framework_lff_lib/dist/*.whl
       queue:
         enabled: true
 
@@ -34,7 +35,7 @@ resources:
           spec:
             environment_version: "2"
             dependencies:
-              - ../../framework_src/dist/*.whl
+              - ../../framework_lff_lib/dist/*.whl
 
     framework_optimize:
       name: framework_optimize
@@ -53,4 +54,4 @@ resources:
           spec:
             environment_version: "2"
             dependencies:
-              - ../../framework_src/dist/*.whl
+              - ../../framework_lff_lib/dist/*.whl

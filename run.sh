@@ -7,7 +7,7 @@ set -euo pipefail
 #####################
 
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-PKG_DIR="$THIS_DIR/framework_src"
+PKG_DIR="$THIS_DIR/framework_lff_lib"
 PYTHON="${PYTHON:-python3}"
 
 
@@ -41,7 +41,7 @@ function test:all {
     "$PYTHON" -m pytest -c "$PKG_DIR/pyproject.toml" -q "$@"
 }
 
-# build the wheel into framework_src/dist (same command the bundle artifact uses)
+# build the wheel into framework_lff_lib/dist (same command the bundle artifact uses)
 function build {
     rm -rf "$PKG_DIR/dist"
     (cd "$PKG_DIR" && "$PYTHON" -m pip wheel --no-deps --wheel-dir dist .)
@@ -76,17 +76,17 @@ function new-table {
         "${requested_args[@]}" "${delivery_args[@]}"
 }
 
-# validate every project against the ingestion bundle and the other projects, then rewrite
+# validate every project against the example bronze sources and the other projects, then rewrite
 # framework_curation/PROJECTS_INDEX.md and each project's PROJECT_MAP.md
 function projects:generate {
     "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
-        --sources "$THIS_DIR/framework_ingestion"
+        --sources "$THIS_DIR/framework_examples/ingestion"
 }
 
 # fail if a project map is out of date (for CI); changes nothing
 function projects:check {
     "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
-        --sources "$THIS_DIR/framework_ingestion" --check
+        --sources "$THIS_DIR/framework_examples/ingestion" --check
 }
 
 # create a project folder with its bundle file: ./run.sh new-project <domain> <project> <owner-email>
@@ -140,14 +140,13 @@ function bundle:deploy {
 }
 
 # steps that must finish before a bundle is validated or deployed, so maps match what is deployed
-# ingestion: validate every spec, regenerate the map, pipelines, and jobs, then check that every
-#   project still finds the bronze tables it reads
+# ingestion: validate every spec, regenerate the map, pipelines, and jobs. Curation is a separate
+#   bundle: deploying ingestion neither reads nor checks it (run projects:generate for that)
 # a project (framework_curation/<domain>/<project>): validate it and regenerate the project maps
 function _prepare-bundle {
     case "$1" in
         framework_ingestion)
             generate
-            projects:generate
             ;;
         framework_curation/*)
             projects:generate

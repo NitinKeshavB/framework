@@ -40,4 +40,3 @@ raw_to_bronze:
 
 quarantine:
   schema: drops_quarantine
-  table: rates

@@ -24,7 +24,7 @@ from lakeflow_framework.ingestion import (
 from lakeflow_framework.metadata import object_rows, workflow_rows
 from lakeflow_framework.pipeline import build_pipeline
 
-SAMPLE = Path(__file__).resolve().parents[1] / "framework_ingestion"
+SAMPLE = Path(__file__).resolve().parents[1] / "framework_examples" / "ingestion"
 
 LEGACY_SOURCE = """\
 source_system: legacy
@@ -69,7 +69,6 @@ raw_to_bronze:
       type: string
 quarantine:
   schema: legacy_quarantine
-  table: credits
 """
 
 
@@ -109,13 +108,16 @@ def _tasks(bundle: Path, name: str = "billing_daily") -> dict:
     return {task["task_key"]: task for task in _job(bundle, name)["tasks"]}
 
 
-def test_every_source_kind_is_in_the_sample(tmp_path: Path) -> None:
+def test_every_source_kind_is_in_the_sample() -> None:
     systems = {system.name: system for system in load_sources(SAMPLE)}
-    assert {name: system.kind for name, system in systems.items()} == {
-        "billing": "sftp_files",
-        "erp": "database",
-        "hr_docs": "sharepoint_files",
-    }
+    kinds = {name: system.kind for name, system in systems.items()}
+    assert kinds["billing"] == "sftp_files"
+    assert kinds["erp"] == "database"
+    assert kinds["hr_docs"] == "sharepoint_files"
+    assert kinds["abs"] == "sftp_files"
+    assert kinds["policies"] == "sharepoint_files"
+    assert kinds["claims_db"] == "database"
+    assert kinds["drops"] == "cloud_files"
     assert [t.config.load_method for t in systems["billing"].tables] == ["volume_files"]
     assert {t.config.load_method for t in systems["erp"].tables} == {"database_table"}
     assert len(systems["erp"].tables) == 2
@@ -177,6 +179,7 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     assert tasks["sync"]["spark_python_task"]["parameters"].count("--out") == 1
     awaited = tasks["await_registry"]["spark_python_task"]["parameters"]
     assert awaited.count("--pipeline") == 2
+    assert awaited[awaited.index("--timeout-seconds") + 1] == "900"
     assert "pipeline_task" in tasks["refresh_pipeline"]
     failed_after = {item["task_key"] for item in tasks["record_failure"]["depends_on"]}
     assert failed_after == {
@@ -300,7 +303,12 @@ def test_scaffolds_work_for_every_kind_and_are_refused_until_finished(
     table = new_table(tmp_path, "retail", "orders", "events", requested_by="sales", delivery=None)
     assert table == tmp_path / "sources/orders/sales/orders_events.yaml"
     text = table.read_text("utf-8")
-    assert "delivery: hourly" in text and "requested_by: sales" in text
+    if kind == "cloud_files":
+        # A cloud_files spec carries its own source_to_raw, so it is not filled in from source.yaml.
+        assert "delivery: hourly" in text and "requested_by: sales" in text
+    else:
+        # The folder, source.yaml and its only delivery already say these.
+        assert "delivery:" not in text and "requested_by:" not in text
     with pytest.raises(ConfigValidationError) as caught:
         generate(tmp_path)
     assert any("replace every TODO" in error for error in caught.value.errors)
@@ -315,6 +323,7 @@ def test_a_finished_scaffold_generates(tmp_path: Path) -> None:
     folder = tmp_path / "sources/orders"
     for path in folder.rglob("*.yaml"):
         text = path.read_text("utf-8").replace("TODO_column_name", "event_id")
+        text = text.replace("TODO_volume", "landing")  # the table names its own volume
         path.write_text(text.replace("TODO describe the column", "Event identifier"), "utf-8")
     assert "resources/orders_hourly.job.yml" in generate(tmp_path)
 
@@ -331,8 +340,14 @@ def test_scaffold_refuses_to_overwrite_and_to_guess_a_delivery(tmp_path: Path) -
     with pytest.raises(ConfigValidationError):
         new_table(tmp_path, "retail", "orders", "bad name", requested_by="sales", delivery=None)
     source = tmp_path / "sources/orders/source.yaml"
+    # A second delivery, added right after the first.
+    first = '    schedule: "0 0 2 * * ?"\n'
+    assert first in source.read_text("utf-8")
     source.write_text(
-        source.read_text("utf-8") + "  weekly:\n    schedule: '0 0 3 ? * MON'\n", "utf-8"
+        source.read_text("utf-8").replace(
+            first, first + "  weekly:\n    schedule: '0 0 3 ? * MON'\n"
+        ),
+        "utf-8",
     )
     with pytest.raises(ConfigValidationError) as caught:
         new_table(tmp_path, "retail", "orders", "events", requested_by="sales", delivery=None)
@@ -368,9 +383,19 @@ def test_table_must_name_a_known_delivery(bundle: Path) -> None:
     assert "delivery must be one of daily" in " ".join(caught.value.errors)
 
 
-def test_table_must_say_who_requested_it(bundle: Path) -> None:
+def test_requester_is_the_folder_when_the_spec_leaves_it_out(bundle: Path) -> None:
     path = _add_table(bundle, "credits", "collections")
     text = path.read_text(encoding="utf-8").replace("requested_by: collections\n", "")
+    path.write_text(text, encoding="utf-8")
+    (system,) = load_sources(bundle)
+    assert sorted(table.requested_by for table in system.tables) == ["billing", "collections"]
+
+
+def test_a_requester_that_is_not_the_folder_is_rejected(bundle: Path) -> None:
+    path = _add_table(bundle, "credits", "collections")
+    text = path.read_text(encoding="utf-8").replace(
+        "requested_by: collections", "requested_by: someone_else"
+    )
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
@@ -407,9 +432,14 @@ def test_source_kind_rules_are_enforced(bundle: Path) -> None:
     assert "kind must be one of" in _source_problems(bundle, "kind: sftp_files", "kind: ftp")
 
 
-def test_file_source_needs_a_raw_volume(bundle: Path) -> None:
+def test_file_source_needs_a_raw_volume_schema(bundle: Path) -> None:
+    errors = _source_problems(bundle, "  schema: billing_raw\n", "")
+    assert "needs raw_volume with a schema" in errors
+
+
+def test_a_table_needs_a_volume_when_source_yaml_names_none(bundle: Path) -> None:
     errors = _source_problems(bundle, "  volume: landing\n", "")
-    assert "needs raw_volume with a schema and a volume" in errors
+    assert "source.volume is required" in errors
 
 
 def test_fetch_is_refused_until_it_is_built(bundle: Path) -> None:
@@ -570,7 +600,7 @@ def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) 
     }
     assert not any("billing_raw" in name for name in securables)
     assert any(name.endswith("billing_bronze.invoices") for name in securables)
-    assert any(name.endswith("billing_quarantine.invoices") for name in securables)
+    assert any(name.endswith("billing_quarantine.invoices_qrntn") for name in securables)
     (job,) = workflow_rows([config])
     assert job["object_kind"] == "workflow" and job["full_name"] == "billing_daily"
     assert json.loads(job["config_json"]) == {

@@ -13,6 +13,7 @@ from lakeflow_framework.collector import (
     _cast,
     append_definitions,
     await_registered,
+    decode_events,
     event_statements,
 )
 from lakeflow_framework.config import config_from_document, email_notifications
@@ -75,7 +76,7 @@ def _billing(**overrides):
             ],
             "rules": [{"name": "amount_non_negative", "expression": "amount >= 0"}],
         },
-        "quarantine": {"schema": "billing_quarantine", "table": "invoices"},
+        "quarantine": {"schema": "billing_quarantine"},
     }
     _apply(document, overrides)
     return document
@@ -111,7 +112,7 @@ def _ledger():
             "primary_keys": ["account_id"],
             "rules": [{"name": "account_present", "expression": "length(trim(account_id)) > 0"}],
         },
-        "quarantine": {"schema": "ledger_quarantine", "table": "entries"},
+        "quarantine": {"schema": "ledger_quarantine"},
     }
 
 
@@ -141,7 +142,8 @@ def _apply(document: dict, overrides: dict) -> None:
     }
     for key, value in overrides.items():
         if key == "table":
-            for section in (source_to_raw["raw"], bronze_hop["bronze"], document["quarantine"]):
+            # The quarantine table name is derived from the bronze table, never authored.
+            for section in (source_to_raw["raw"], bronze_hop["bronze"]):
                 section["table"] = value
             continue
         mapping, field = places[key]
@@ -202,6 +204,24 @@ def test_failure_mail_defaults_to_the_technical_owner():
     assert config.notify_success == []
 
 
+def test_quarantine_table_defaults_to_bronze_plus_suffix_and_can_be_named():
+    document = _billing()
+    document["quarantine"].pop("table", None)
+    config = config_from_document(document)
+    assert config.quarantine_table == "invoices_qrntn"
+
+    document["quarantine"]["table"] = "invoice_rejects"
+    assert config_from_document(document).quarantine_table == "invoice_rejects"
+
+    del document["quarantine"]
+    assert config_from_document(document).quarantine_table == "invoices_qrntn"
+
+    document["quarantine"] = {"table": "bad name"}
+    with pytest.raises(ConfigValidationError) as caught:
+        config_from_document(document)
+    assert "quarantine table must be an identifier" in str(caught.value)
+
+
 def test_unknown_pii_and_classification_are_rejected():
     document = _billing()
     document["data"] = {"classification": "secret", "pii": ["ssn"]}
@@ -246,7 +266,7 @@ def test_validation_reports_every_error():
                     "bronze": {"schema": "billing_bronze", "table": "invoices"},
                     "dedup": True,
                 },
-                "quarantine": {"schema": "billing_quarantine", "table": "invoices"},
+                "quarantine": {"schema": "billing_quarantine"},
             }
         )
     text = "\n".join(caught.value.errors)
@@ -486,7 +506,7 @@ def test_ctas_securables_match_the_graph():
     kinds = {row["full_name"]: row["object_kind"] for row in rows}
     assert kinds["framework_dev.ledger_raw.entries"] == "table"
     assert kinds["framework_dev.ledger_bronze.entries"] == "materialized_view"
-    assert kinds["framework_dev.ledger_quarantine.entries"] == "materialized_view"
+    assert kinds["framework_dev.ledger_quarantine.entries_qrntn"] == "materialized_view"
     table = next(row for row in rows if row["full_name"] == "framework_dev.ledger_bronze.entries")
     recorded = json.loads(table["config_json"])
     assert recorded["domain"] == "finance"
@@ -518,9 +538,9 @@ def test_column_metadata_versions_type_comment_and_tags():
     quarantine_names = {
         row["full_name"]
         for row in object_rows(config)
-        if row["parent_full_name"] == "framework_dev.billing_quarantine.invoices"
+        if row["parent_full_name"] == "framework_dev.billing_quarantine.invoices_qrntn"
     }
-    assert "framework_dev.billing_quarantine.invoices.failed_rules" in quarantine_names
+    assert "framework_dev.billing_quarantine.invoices_qrntn.failed_rules" in quarantine_names
     amount = json.loads(rows[1]["config_json"])
     assert amount == {
         "classification": "confidential",
@@ -970,6 +990,7 @@ def test_collector_bounds_the_micro_batch():
     assert "_checkpoints/collector" in text
     assert '_MAX_FILES_PER_TRIGGER = "5000"' in text
     assert "land_events" in text
+    assert "availableNow=True" in text
     assert ".collect()" not in text
     statements = event_statements("framework_dev")
     landed = "\n".join(statements)
@@ -1072,21 +1093,52 @@ def test_batch_sql_escapes_quotes_in_paths_and_excel_addresses():
     assert "'''Sheet1''!A1'" in get_strategy("ctas").batch_sql(config_from_document(excel))[0]
 
 
+def test_event_files_are_read_whole_and_parsed_without_a_schema(tmp_path: Path, capsys):
+    """The collector reads each file as text, so steps and definitions need no shared schema."""
+
+    step = step_payload(
+        owner="billing", full_name="billing_daily", run_id="7", step_no=10,
+        step_name="mark_running", status="RUNNING", object_kind="workflow",
+    )  # fmt: skip
+    definition = object_rows(config_from_document(_billing()))[0]
+    texts = [
+        json.dumps(step, sort_keys=True),
+        json.dumps({"kind": "definition", **definition}, sort_keys=True),
+        "not json at all",
+        json.dumps(["not", "an", "object"]),
+        "",
+    ]
+    payloads = decode_events(texts)
+    assert [payload["kind"] for payload in payloads] == ["step", "definition"]
+    assert "skipped" in capsys.readouterr().out
+
+    steps, definitions = split_payloads(payloads)
+    (row,) = ingest_steps(steps)
+    assert (row["run_id"], row["step_no"], row["status"]) == ("7", 10, "RUNNING")
+    assert row["parent_run_id"] is None and row["recon_json"] is None
+    assert definitions[0]["full_name"] == definition["full_name"]
+    assert set(definitions[0]) == set(OBJECT_COLUMNS)
+
+
 def test_pipeline_lookup_binds_the_id_and_rejects_sql():
     class Frame:
         def collect(self):
             return []
 
+    statements = []
+
     class Spark:
-        def sql(self, statement, args=None):
-            assert ":pipeline_id" in statement
-            assert "billing_invoices" not in statement
-            assert args == {"pipeline_id": "billing_invoices"}
+        # Inside a pipeline, spark.sql is wrapped by Lakeflow and accepts no args= keyword.
+        def sql(self, statement):
+            statements.append(statement)
             return Frame()
 
     assert UnityMetadata(Spark()).get_pipeline("billing_invoices") is None
-    with pytest.raises(MetadataNotFound):
-        UnityMetadata(Spark()).get_pipeline("billing' OR '1'='1")
+    assert "full_name = 'billing_invoices'" in statements[0]
+    for hostile in ("billing' OR '1'='1", "a;b", "x y", "", "a\n"):
+        with pytest.raises(MetadataNotFound):
+            UnityMetadata(Spark()).get_pipeline(hostile)
+    assert len(statements) == 1  # nothing hostile reached spark.sql
 
 
 def _column_list(text: str, table: str) -> list[str]:

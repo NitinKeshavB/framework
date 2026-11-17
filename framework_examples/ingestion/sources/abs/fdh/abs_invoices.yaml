@@ -45,4 +45,3 @@ raw_to_bronze:
 
 quarantine:
   schema: abs_quarantine
-  table: invoices

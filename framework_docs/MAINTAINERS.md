@@ -2,7 +2,7 @@
 
 ## Versioning
 
-The version in [framework_src/pyproject.toml](../framework_src/pyproject.toml) is the wheel version. A minor version may add an optional field to a spec. A major version may rename or remove a required one. Deploy the bundles again after a version change. Each bundle uploads the wheel it just built.
+The version in [framework_lff_lib/pyproject.toml](../framework_lff_lib/pyproject.toml) is the wheel version. A minor version may add an optional field to a spec. A major version may rename or remove a required one. Deploy the bundles again after a version change. Each bundle uploads the wheel it just built.
 
 The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `object_registry` row.
 
@@ -22,7 +22,7 @@ Order: `framework_bundle` (deploy runs `framework_ddl`), start `framework_collec
 
 All bundles must use the same catalog for a given target, because the ingestion jobs read the registry in the platform bundle's catalog. Check the `catalog` variable in each `databricks.yml` when you add a target.
 
-PyPI and a wheel volume are not part of this phase. Every bundle builds `framework_src` with the same artifact block. The wheel depends on PyYAML only. Databricks Connect and the DLT package are not installed into serverless environments.
+PyPI and a wheel volume are not part of this phase. Every bundle builds `framework_lff_lib` with the same artifact block. The wheel depends on PyYAML only. Databricks Connect and the DLT package are not installed into serverless environments.
 
 ## Generated files
 

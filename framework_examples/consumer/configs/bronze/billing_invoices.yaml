@@ -59,5 +59,4 @@ raw_to_bronze:
 
 quarantine:
   schema: billing_quarantine
-  table: invoices
   classification: highly_confidential

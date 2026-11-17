@@ -9,10 +9,21 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "framework_examples" / "ingesti
 
 def test_ingestion_examples_cover_each_kind() -> None:
     systems = {system.name: system for system in load_sources(EXAMPLES)}
-    assert set(systems) == {"abs", "policies", "claims_db", "drops"}
+    assert set(systems) == {
+        "abs",
+        "billing",
+        "claims_db",
+        "drops",
+        "erp",
+        "hr_docs",
+        "policies",
+    }
     assert systems["abs"].kind == "sftp_files"
+    assert systems["billing"].kind == "sftp_files"
     assert systems["policies"].kind == "sharepoint_files"
+    assert systems["hr_docs"].kind == "sharepoint_files"
     assert systems["claims_db"].kind == "database"
+    assert systems["erp"].kind == "database"
     assert systems["drops"].kind == "cloud_files"
 
     abs_tables = {table.config.pipeline_id: table for table in systems["abs"].tables}

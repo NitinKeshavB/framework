@@ -31,4 +31,3 @@ raw_to_bronze:
 
 quarantine:
   schema: policies_quarantine
-  table: quotes

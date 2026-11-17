@@ -46,4 +46,3 @@ raw_to_bronze:
 
 quarantine:
   schema: orders_quarantine
-  table: events

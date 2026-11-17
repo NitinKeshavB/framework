@@ -38,6 +38,7 @@ TYPE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_(), ]*$")
 UNRESOLVED = re.compile(r"\$\{[^}]+\}")
 CLOUD_PATH = re.compile(r"^(abfss|s3)://", re.IGNORECASE)
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+QUARANTINE_SUFFIX = "_qrntn"
 CLASSIFICATIONS = ("internal", "confidential", "highly_confidential")
 PII_LABELS = ("pii_health", "pii_basic", "pii_finance", "pii_biometric", "pii_personal")
 
@@ -276,7 +277,7 @@ def validate_configs(paths: list[Path], catalog: str | None = None) -> list[Pipe
             source_file = path.parent / "source.yaml"
             if not source_file.is_file():
                 source_file = path.parent.parent / "source.yaml"
-            document, composed = compose_document(document, source_file, str(path))
+            document, composed = compose_document(document, source_file, str(path), path)
             if composed:
                 errors.extend(composed)
                 continue
@@ -290,14 +291,51 @@ def validate_configs(paths: list[Path], catalog: str | None = None) -> list[Pipe
     return configs
 
 
+def inherit_from_source(
+    spec: dict[str, Any], source: Mapping[str, Any], source_file: Path, spec_path: Path | None
+) -> dict[str, Any]:
+    """Fill in what a table spec would only repeat from its source system or its folder.
+
+    From the source system: domain, owner as technical_owner, the only delivery and the job it
+    makes. From the folder: requested_by, and team as that requester. Nothing about a file or its
+    sensitivity is shared, because one source system can deliver files of different kinds. A spec
+    that states a value keeps it.
+    """
+
+    merged = dict(spec)
+    system = str(source.get("source_system") or "")
+
+    def fill(key: str, value: Any) -> None:
+        if value and not merged.get(key):
+            merged[key] = value
+
+    fill("domain", source.get("domain"))
+    fill("layer", "bronze")
+    fill("technical_owner", source.get("owner"))
+    if (
+        spec_path is not None
+        and not merged.get("project")
+        and spec_path.resolve().parent.parent == source_file.resolve().parent
+    ):
+        fill("requested_by", spec_path.resolve().parent.name)
+    fill("team", merged.get("requested_by") or system)
+    deliveries = source.get("deliveries")
+    if isinstance(deliveries, dict) and len(deliveries) == 1:
+        fill("delivery", next(iter(deliveries)))
+    if merged.get("delivery") and system:
+        fill("job_name", f"{system}_{merged['delivery']}")
+    return merged
+
+
 def compose_document(
-    spec: dict[str, Any], source_file: Path, label: str
+    spec: dict[str, Any], source_file: Path, label: str, spec_path: Path | None = None
 ) -> tuple[dict[str, Any], list[str]]:
     """Join a table spec with its source system's ``source.yaml`` into one pipeline document.
 
-    The spec holds only what is true of the table (``source.raw_path`` or ``source.table``). The
-    kind, raw volume, and foreign catalog are facts of the source system, so they live once in
-    ``source.yaml`` and every table in that source inherits them.
+    The spec holds what is true of the table: its files (``source.volume``, ``raw_path``, format)
+    or its database table. The kind, the raw volume schema, and the foreign catalog are facts of
+    the source system, so they live once in ``source.yaml``. A source.yaml may also name a default
+    volume, which a spec uses when it does not name its own.
     """
 
     if not source_file.exists():
@@ -312,22 +350,33 @@ def compose_document(
     kind = str(source.get("kind") or "")
     system = str(source.get("source_system") or "")
     catalog = str(spec.get("catalog") or "")
+    spec = inherit_from_source(spec, source, source_file, spec_path)
     document = {key: value for key, value in spec.items() if key != "source"}
-    authored = dict(authored)
+    authored = dict(spec["source"])
     if kind in FILE_KINDS:
         volume = source.get("raw_volume") if isinstance(source.get("raw_volume"), dict) else {}
-        schema, name = str(volume.get("schema") or ""), str(volume.get("volume") or "")
+        schema = str(volume.get("schema") or "")
+        # The volume sits next to the table's other file settings; source.yaml only names the schema
+        # (and optionally a default volume for tables that do not name their own).
+        name = str(authored.pop("volume", "") or volume.get("volume") or "")
         raw_path = str(authored.pop("raw_path", "") or "").strip("/")
         problems = []
-        if not (IDENTIFIER.match(schema) and IDENTIFIER.match(name)):
-            problems.append(f"{label}: {source_file} needs raw_volume with a schema and a volume")
-        if not raw_path:
-            problems.append(f"{label}: source.raw_path is required (the folder in the raw volume)")
+        if not IDENTIFIER.match(schema):
+            problems.append(f"{label}: {source_file} needs raw_volume with a schema")
+        if not IDENTIFIER.match(name):
+            problems.append(
+                f"{label}: source.volume is required (the volume in {schema or 'the raw schema'})"
+            )
+        if raw_path.lower().startswith("volumes/") or "//" in raw_path:
+            problems.append(
+                f"{label}: source.raw_path is a folder inside the volume, not a full path; "
+                "leave it out when the files are in the volume itself"
+            )
         if not catalog:
             problems.append(f"{label}: catalog is required")
         if problems:
             return spec, problems
-        path = f"/Volumes/{catalog}/{schema}/{name}/{raw_path}/"
+        path = f"/Volumes/{catalog}/{schema}/{name}/" + (f"{raw_path}/" if raw_path else "")
         source_section = {"system": system, "path": path, **authored}
         document["source_to_raw"] = {"method": "volume_files", "source": source_section}
     elif kind == DATABASE_KIND:
@@ -401,7 +450,12 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
 
     source_to_raw = _section(document, "source_to_raw", label, errors)
     raw_to_bronze = _section(document, "raw_to_bronze", label, errors)
-    quarantine = _section(document, "quarantine", label, errors)
+    # Everything in quarantine has a default now, so the block may be left out.
+    quarantine = (
+        {}
+        if document.get("quarantine") is None
+        else _section(document, "quarantine", label, errors)
+    )
     source = _section(source_to_raw, "source", f"{label}: source_to_raw", errors)
     load_method = str(source_to_raw.get("method") or "autoloader")
     has_raw = load_method not in RAWLESS_METHODS
@@ -445,12 +499,13 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
 
     raw_table = _target_table(raw_target, "raw", pipeline_id, label, errors) if has_raw else ""
     bronze_table = _target_table(bronze_target, "bronze", raw_table or pipeline_id, label, errors)
-    quarantine_table = _target_table(
-        quarantine, "quarantine", bronze_table or pipeline_id, label, errors
-    )
+    quarantine_table = _quarantine_table(quarantine, bronze_table, label, errors)
     raw_schema = _target_schema(raw_target, "raw", source_system, label, errors) if has_raw else ""
     bronze_schema = _target_schema(bronze_target, "bronze", source_system, label, errors)
-    quarantine_schema = _target_schema(quarantine, "quarantine", source_system, label, errors)
+    # Quarantine sits beside bronze unless the spec names another schema.
+    quarantine_schema = _target_schema(
+        quarantine, "quarantine", source_system, label, errors, default=bronze_schema
+    )
 
     dedup = bool(raw_to_bronze.get("dedup", False))
     primary_keys = _name_list(raw_to_bronze.get("primary_keys"), "primary_keys", label, errors)
@@ -754,14 +809,29 @@ def _target_table(
     return str(table)
 
 
+def _quarantine_table(
+    section: Mapping[str, Any], bronze_table: str | None, label: str, errors: list[str]
+) -> str | None:
+    """The bronze table name plus the suffix, unless the spec names its own quarantine table."""
+
+    if not bronze_table:
+        return None
+    return _target_table(section, "quarantine", f"{bronze_table}{QUARANTINE_SUFFIX}", label, errors)
+
+
 def _target_schema(
     section: Mapping[str, Any],
     layer: str,
     source_system: str | None,
     label: str,
     errors: list[str],
+    default: str | None = None,
 ) -> str | None:
-    schema = section.get("schema") or (f"{source_system}_{layer}" if source_system else None)
+    """The schema the spec names, else ``default``, else ``<source system>_<layer>``."""
+
+    schema = (
+        section.get("schema") or default or (f"{source_system}_{layer}" if source_system else None)
+    )
     if not schema:
         errors.append(f"{label}: {layer} schema is required")
         return None

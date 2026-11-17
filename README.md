@@ -12,7 +12,7 @@ source system ──delivery──▶ bronze ──▶ silver / gold / product
 
 | Folder | Role | Owner |
 | --- | --- | --- |
-| `framework_src` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
+| `framework_lff_lib` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
 | `framework_bundle` | The deployed framework: the wheel, the `framework_meta` registry DDL, the collector, and daily `OPTIMIZE` | Platform team |
 | `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
 | `framework_curation` | One bundle per project for silver, gold, and data products, with ownership checks and maps | One project each |

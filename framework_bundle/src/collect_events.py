@@ -6,6 +6,7 @@ A batch stays in Spark: the driver does not collect it.
 """
 
 import sys
+import time
 
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StringType, StructField, StructType
@@ -14,7 +15,14 @@ from lakeflow_framework.collector import land_events
 
 # A definition file and a step file do not share columns. An explicit string schema keeps
 # both, and a later batch cannot change the types. Extra fields land in _rescued.
+# Serverless allows only an availableNow trigger, so each pass drains the new files and ends.
+# Starting a new job run for every pass costs minutes of compute start-up, and a pipeline waits
+# for its definition to reach the registry. So one run loops: drain, pause briefly, drain again,
+# on the same session and checkpoint. The run ends after MAX_RUN_SECONDS and the continuous job
+# starts a fresh one, which keeps a long-lived session from growing without limit.
 _MAX_FILES_PER_TRIGGER = "5000"
+IDLE_SECONDS = 10
+MAX_RUN_SECONDS = 4 * 3600
 _EVENT_FIELDS = (
     "kind",
     "object_kind",
@@ -53,23 +61,26 @@ def main() -> None:
         batch.createOrReplaceTempView("_framework_events")
         land_events(spark, catalog)
 
-    (
-        spark.readStream.format("cloudFiles")
-        .option("cloudFiles.format", "json")
-        .option("cloudFiles.maxFilesPerTrigger", _MAX_FILES_PER_TRIGGER)
-        .option("cloudFiles.inferColumnTypes", "false")
-        .option("cloudFiles.schemaEvolutionMode", "rescue")
-        .option("cloudFiles.rescuedDataColumn", "_rescued")
-        # Checkpoint files live under this volume. Only event JSON is a registry payload.
-        .option("pathGlobFilter", "*.json")
-        .schema(schema)
-        .load(volume)
-        .writeStream.foreachBatch(consume)
-        .option("checkpointLocation", volume + "/_checkpoints/collector")
-        .trigger(processingTime="30 seconds")
-        .start()
-        .awaitTermination()
-    )
+    started = time.monotonic()
+    while time.monotonic() - started < MAX_RUN_SECONDS:
+        (
+            spark.readStream.format("cloudFiles")
+            .option("cloudFiles.format", "json")
+            .option("cloudFiles.maxFilesPerTrigger", _MAX_FILES_PER_TRIGGER)
+            .option("cloudFiles.inferColumnTypes", "false")
+            .option("cloudFiles.schemaEvolutionMode", "rescue")
+            .option("cloudFiles.rescuedDataColumn", "_rescued")
+            # Checkpoint files live under this volume. Only event JSON is a registry payload.
+            .option("pathGlobFilter", "*.json")
+            .schema(schema)
+            .load(volume)
+            .writeStream.foreachBatch(consume)
+            .option("checkpointLocation", volume + "/_checkpoints/collector")
+            .trigger(availableNow=True)
+            .start()
+            .awaitTermination()
+        )
+        time.sleep(IDLE_SECONDS)
 
 
 if __name__ == "__main__":

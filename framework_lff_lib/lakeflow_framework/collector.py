@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Any, Callable
@@ -37,6 +38,28 @@ def apply_ddl(spark, catalog: str, text: str | None = None) -> None:
                 continue
             continue
         spark.sql(statement)
+
+
+def decode_events(texts: list[str]) -> list[dict]:
+    """Turn the text of event files into payloads. A file that is not a JSON object is skipped.
+
+    Files are read whole and parsed here, so the collector needs no inferred schema: step files
+    and definition files have different fields, and a new field must not stop the stream.
+    One unreadable file must not block every file behind it either.
+    """
+
+    payloads: list[dict] = []
+    for text in texts:
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            print(f"skipped an event file that is not JSON: {str(text)[:80]!r}")
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+        else:
+            print("skipped an event file that is not a JSON object")
+    return payloads
 
 
 def append_events(

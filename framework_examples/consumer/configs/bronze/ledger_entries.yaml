@@ -52,4 +52,3 @@ raw_to_bronze:
 
 quarantine:
   schema: ledger_quarantine
-  table: entries
