@@ -1,7 +1,8 @@
-"""Write this bundle's definitions into the registry, then their tags into Unity Catalog.
+"""Write this bundle's definitions into the registry.
 
 Deploy runs this after the upload. It is the only writer of definitions. A changed spec gets a
-new SCD Type 2 version; a spec removed from the bundle gets a deletion version.
+new SCD Type 2 version; a spec removed from the bundle gets a deletion version. Unity Catalog
+tag assignment is parked for phase 1; see APPLY_TAGS in unity.py.
 """
 
 import sys
@@ -34,10 +35,13 @@ def main() -> None:
     # deploys was removed from it.
     with step(log, "retire definitions no longer deployed"):
         retire_definitions(spark, rows, catalog)
-    # A schema or table that does not exist yet is skipped and tagged on the next deploy.
+    # Phase 1 parks tag assignment (tag policies). The call is a no-op until APPLY_TAGS is true.
     with step(log, "apply tags and comments in Unity Catalog"):
         applied = apply_metadata(spark, rows, catalog)
-    log.info("applied %d Unity Catalog metadata change(s)", len(applied))
+    if applied:
+        log.info("applied %d Unity Catalog metadata change(s)", len(applied))
+    else:
+        log.info("Unity Catalog tags parked for phase 1; registry is up to date")
 
 
 if __name__ == "__main__":

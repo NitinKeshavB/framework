@@ -29,7 +29,7 @@ Definitions change only when specs change, and specs change only at deploy, so t
 1. `bundle:deploy framework_bundle` runs `framework_ddl`, which creates or migrates `framework_meta` and the run tables and views, then `framework_system_views`, which creates the cost and observed lineage views only when the target sets `system_views` to `true`.
 2. `bundle:deploy framework_ingestion` regenerates, uploads the bundle, and runs `registry_sync`. Its one task validates every spec under the target catalog and:
    - writes each source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column into `object_registry` and `object_current`, and retires what the bundle no longer defines. An unchanged definition is not a new history row. A table or pipeline another owner holds is refused and recorded as a `FAILED` `ownership_check` row in `run_ledger`;
-   - sets the schema, table, and column tags and column comments in Unity Catalog, listed under [Unity Catalog tags](#unity-catalog-tags). It reads `information_schema` first, changes only what differs, and unsets a framework tag the spec dropped. Other tags are left alone. These are plain tags. Making them governed needs an account admin to create a tag policy for the keys; `pii` holds the labels joined with `, `, so its allowed values must list each combination in use.
+   - would set the schema, table, and column tags and column comments in Unity Catalog (see [Unity Catalog tags](#unity-catalog-tags)), but phase 1 parks that step: tag policies on the same keys refuse the deploy identity. Declared tags stay in the registry and in `v_metadata_drift`. Set `APPLY_TAGS` in `unity.py` once the account grants assignment (or drops the policies).
 
 If `registry_sync` fails, the deploy command fails.
 
@@ -221,7 +221,7 @@ Deploying the same document again does not insert. Putting an older document bac
 
 ## Unity Catalog tags
 
-`registry_sync` sets the tags at every deploy, after it writes the registry. It reads `information_schema` first and changes only what differs.
+`registry_sync` is built to set the tags at every deploy, after it writes the registry. Phase 1 leaves `APPLY_TAGS` false, so that step is a no-op until tag-policy grants are in place. When enabled, it reads `information_schema` first and changes only what differs.
 
 - Each schema the source uses: `domain`, `owner`, `owner_email`, `source_kind`, `layer`, `foreign_catalog`, and `engine`, from `source.yaml`.
 - Each table: `classification`, `domain`, `pii`, `data_domain`, `team`, `technical_owner`, `layer`, `pipeline_id`, `job_name`, `load_method`, `owner`, `requested_by`, and `delivery`.

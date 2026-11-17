@@ -1,9 +1,10 @@
 """Apply schema tags, table tags, column tags, and column comments to Unity Catalog.
 
-The registry rows are the declared metadata. registry_sync runs this at deploy, after the
-definitions are written. It reads what Unity Catalog already holds and changes only what
-differs, so an unchanged deploy costs five lookups and no ALTER statements. A schema, table,
-or column that does not exist yet is skipped and applied on the next deploy.
+The registry rows are the declared metadata. registry_sync calls this at deploy after the
+definitions are written. Phase 1 parks the calls: some workspaces have tag policies on the
+same keys, and the deploy identity is not allowed to set those assignments. Set APPLY_TAGS
+to True (or pass apply=True) once an account admin has granted that, or removed the policies.
+Until then the declared tags still land in the registry and show in v_metadata_drift.
 """
 
 from __future__ import annotations
@@ -17,6 +18,9 @@ from typing import Any, Iterable
 from lakeflow_framework.logs import statement_summary
 
 log = logging.getLogger(__name__)
+
+# Phase 1: do not ALTER tags or comments. Tag policies on these keys fail the deploy identity.
+APPLY_TAGS = False
 
 # The tags this framework owns. Other tags on the same schemas, tables, and columns stay.
 SCHEMA_TAGS = (
@@ -218,9 +222,21 @@ def plan_statements(declared: Declared, applied: Applied, existing: set) -> list
     return statements
 
 
-def apply_metadata(spark, rows: list[dict[str, Any]], catalog: str) -> list[str]:
-    """Make Unity Catalog hold the tags and comments ``rows`` declare. Returns the statements."""
+def apply_metadata(
+    spark, rows: list[dict[str, Any]], catalog: str, *, apply: bool | None = None
+) -> list[str]:
+    """Make Unity Catalog hold the tags and comments ``rows`` declare. Returns the statements.
 
+    When ``apply`` is omitted, ``APPLY_TAGS`` decides. Phase 1 leaves that false so deploy does
+    not need tag-policy grants.
+    """
+
+    if not (APPLY_TAGS if apply is None else apply):
+        log.info(
+            "Unity Catalog tags are parked for phase 1 (APPLY_TAGS is false); "
+            "definitions are in the registry, tags are not set on schemas or tables"
+        )
+        return []
     declared = declared_metadata(rows)
     if not declared.kinds and not declared.schema_tags:
         log.info("Unity Catalog: no schema or table declares tags or comments")

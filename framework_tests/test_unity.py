@@ -73,7 +73,7 @@ class _Spark:
 
 def test_a_new_table_gets_its_tags_and_column_tags():
     spark = _Spark()
-    statements = apply_metadata(spark, _rows(), "framework_dev")
+    statements = apply_metadata(spark, _rows(), "framework_dev", apply=True)
     assert statements == spark.ran
     (table_tags,) = [s for s in statements if s.startswith(f"ALTER STREAMING TABLE {QUOTED} SET")]
     for pair in (
@@ -113,7 +113,7 @@ def test_an_unchanged_spec_changes_nothing():
             for name, value in (("classification", "confidential"), ("pii", "pii_finance"))
         ],
     )
-    assert apply_metadata(spark, rows, "framework_dev") == []
+    assert apply_metadata(spark, rows, "framework_dev", apply=True) == []
 
 
 def test_a_removed_tag_is_unset_and_a_changed_comment_is_set():
@@ -166,7 +166,7 @@ def test_a_schema_gets_its_source_tags_and_a_stale_one_is_unset():
     ]
     spark = _Spark(schema_tags=held, columns=[])
     statements = apply_metadata(
-        spark, [_schema_row({"domain": "finance", "owner": "billing"})], "framework_dev"
+        spark, [_schema_row({"domain": "finance", "owner": "billing"})], "framework_dev", apply=True
     )
     assert statements == [
         "ALTER SCHEMA `framework_dev`.`billing_bronze` UNSET TAGS ('engine')",
@@ -178,7 +178,10 @@ def test_a_schema_gets_its_source_tags_and_a_stale_one_is_unset():
 def test_a_schema_that_does_not_exist_yet_waits_for_the_next_deploy():
     spark = _Spark(columns=[])
     spark.answers["schemata"] = []
-    assert apply_metadata(spark, [_schema_row({"domain": "finance"})], "framework_dev") == []
+    assert (
+        apply_metadata(spark, [_schema_row({"domain": "finance"})], "framework_dev", apply=True)
+        == []
+    )
 
 
 def test_drift_and_observed_lineage_views_are_created():
@@ -200,3 +203,8 @@ def test_sql_comments_have_no_semicolon_because_the_ddl_task_splits_on_it():
     for path in (BUNDLE / "sql").glob("*.sql"):
         for line in path.read_text("utf-8").splitlines():
             assert not (line.strip().startswith("--") and ";" in line), f"{path.name}: {line}"
+
+
+def test_apply_metadata_is_parked_for_phase_1():
+    assert apply_metadata(object(), _rows(), "framework_dev") == []
+    assert apply_metadata(object(), _rows(), "framework_dev", apply=False) == []

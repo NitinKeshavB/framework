@@ -39,6 +39,7 @@ Start with one silver and one gold example and review the shape before building.
 
 ## Next after phase 1
 
+- Turn Unity Catalog tag and comment assignment back on. Set `APPLY_TAGS = True` in `unity.py` once the deploy identity can assign tags under any tag policies on the framework keys (or those policies are removed). Until then the tags are only in the registry and in `v_metadata_drift`.
 - At go-live, stop dropping `framework_meta` for table changes. From then on, each change is an `ALTER` in `framework_meta.sql` that is safe to repeat, as [MAINTAINERS.md](MAINTAINERS.md) describes.
 - Move every job back to `performance_target: STANDARD` once loads run unattended. Set `PERFORMANCE_TARGET` in `ingestion.py`, regenerate, and change `framework_ops.job.yml` and `registry_sync.job.yml`. `PERFORMANCE_OPTIMIZED` is used for now because it starts in seconds instead of minutes.
 - Optional split of a busy delivery, so one bad spec cannot fail the other teams' tables in it.
