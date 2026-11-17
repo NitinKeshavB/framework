@@ -37,7 +37,7 @@ Every framework job task writes timestamped log lines to its run's output: the a
 
 ## What a delivery job does
 
-A delivery job is one task, **refresh_pipeline**. A `cloud_files` table that uses `copy_into` or `ctas` adds **batch_load** before it; those methods are frozen, so no generated job has that task yet. The job writes nothing to the registry.
+A delivery job runs **refresh_pipeline**, then **record_load_metrics**, which appends `rows_read` / `rows_bronze` / `rows_quarantine` for that update into `bronze_load_ledger` (insert only, no MERGE, no scan of bronze). A `cloud_files` table that uses `copy_into` or `ctas` adds **batch_load** before the refresh; those methods are frozen, so no generated job has that task yet. The job does not write definitions to the registry.
 
 The pipeline reads its specs from the deployed bundle. The generated pipeline sets `lff.specs` to the workspace paths of its spec files and `lff.catalog` to the target catalog, and `build_pipelines` validates those files with `validate_configs`. A pipeline id missing from `lff.specs` is an error. A pipeline without `lff.specs` falls back to reading `framework_meta.v_object_current`.
 
@@ -153,8 +153,8 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | Table or view | Built by | What it holds |
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
-| `table_load_metrics` | The `framework_metrics` pipeline, hourly | One row per job, pipeline, update, flow, and table: rows written, upserted, deleted, and dropped, each expectation's passed and failed counts, the last backlog bytes and files, status, and duration |
-| `bronze_loads` | The same pipeline | One row per bronze table load (job, update, dataflow): `rows_read` from staged, `rows_bronze`, `rows_quarantine`, and `rows_processed` (bronze + quarantine) |
+| `table_load_metrics` | The `framework_metrics` pipeline, hourly | One row per job, pipeline, update, flow, and table: detail from every event log |
+| `bronze_load_ledger`, `v_bronze_loads` | Each delivery job, task `record_load_metrics` after the pipeline refresh | Append-only per-load counts: `rows_read`, `rows_bronze`, `rows_quarantine`, `rows_processed`. No MERGE; the view keeps the latest row per job, update, and dataflow |
 | `job_runs`, `v_job_runs` | `framework_runs`, hourly, from the Jobs API | Each run of a framework job: status, result state, termination code, trigger, setup, queue, execution, and run seconds, and the run page URL |
 | `job_task_runs`, `v_job_task_runs` | The same | Each task run: task key, status, result state, and termination code |
 | `pipeline_updates`, `v_pipeline_updates` | `framework_runs`, from the `update_progress` events in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
@@ -167,18 +167,12 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). `framework_runs` matches a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline update on the name of the event log it is in. It needs no system table grants: the identity that runs it needs `CAN_VIEW` on the delivery jobs, which the deploying identity has. The Jobs API keeps 60 days of runs, and `job_runs` keeps them after that.
 
 ```sql
--- rows read and loaded for each bronze table load
+-- rows read and loaded for each bronze table load (append-only ledger, not a table scan)
 SELECT job_name, bronze_table, quarantine_table, started_at,
        rows_read, rows_bronze, rows_quarantine, rows_processed, expectations
-FROM framework_meta.bronze_loads
+FROM framework_meta.v_bronze_loads
 WHERE bronze_table ILIKE '%finance_abs'
 ORDER BY started_at DESC;
-
--- per-flow detail (staged / bronze / quarantine) when you need it
-SELECT update_id, started_at, layer, table_name, rows_written, expectations
-FROM framework_meta.table_load_metrics
-WHERE dataflow = 'abs_accounting' AND started_at >= current_date() - INTERVAL 7 DAYS
-ORDER BY started_at DESC
 ```
 
 A delivery run does not touch the registry, so the number of jobs running at once is limited only by the workspace's pipeline quota.

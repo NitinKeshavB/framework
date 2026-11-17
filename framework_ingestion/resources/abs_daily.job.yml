@@ -19,8 +19,23 @@ resources:
       schedule:
         quartz_cron_expression: 0 0 2 * * ?
         timezone_id: UTC
+      environments:
+      - environment_key: framework_env
+        spec:
+          environment_version: '4'
+          dependencies:
+          - ../../framework_lff_lib/dist/*.whl
       performance_target: PERFORMANCE_OPTIMIZED
       tasks:
       - task_key: refresh_pipeline
         pipeline_task:
           pipeline_id: ${resources.pipelines.abs_daily_pipeline.id}
+      - task_key: record_load_metrics
+        depends_on:
+        - task_key: refresh_pipeline
+        environment_key: framework_env
+        spark_python_task:
+          python_file: ../src/record_load_metrics.py
+          parameters:
+          - ${var.catalog}
+          - abs_daily

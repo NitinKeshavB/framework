@@ -127,7 +127,7 @@ flowchart LR
 | `<job>_event_log` | `framework_meta` | each ingestion pipeline | One pipeline event | Event log table |
 | `flow_events` | `framework_meta` | `framework_metrics` | One `flow_definition` or `flow_progress` event | Streaming table |
 | `table_load_metrics` | `framework_meta` | `framework_metrics` | One job, pipeline, update, and flow | Materialized view |
-| `bronze_loads` | `framework_meta` | `framework_metrics` | One job, update, and dataflow (bronze table load) | Materialized view |
+| `bronze_load_ledger` | `framework_meta` | each delivery job (`record_load_metrics`) | One job, update, and dataflow (append-only) | Table |
 | `<pipeline_id>_staged` | none (private) | ingestion pipeline | One source row | Private streaming table or materialized view |
 | bronze, `<schema>.<table>` | `<source>_bronze` | ingestion pipeline | One passing row, or one row per key with Auto CDC | Streaming table or materialized view |
 | quarantine, `<table>_qrntn` | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |

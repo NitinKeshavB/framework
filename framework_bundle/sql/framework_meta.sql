@@ -12,7 +12,7 @@
 -- so a lookup does not window the history. job_runs, job_task_runs, and pipeline_updates are written hourly by
 -- framework_runs from the Jobs API and the pipeline event logs, merged on their run or update
 -- key, so a run that was still going is updated when it ends. They need no system table
--- grants. Row counts are in table_load_metrics. Cost is in system_views.sql.
+-- grants. Per-load row counts are in bronze_load_ledger (appended by each delivery job). Cost is in system_views.sql.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
@@ -206,6 +206,37 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates (
   ended_at TIMESTAMP,
   state STRING,
   status STRING,
+  recorded_at TIMESTAMP
+)
+CLUSTER BY (job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+-- Append-only counts for each bronze table load. Each delivery job inserts a few rows after its
+-- pipeline refresh, from that update's event log only. No MERGE. A retry may append again. The
+-- view below keeps the latest recorded_at per job, update, and dataflow.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.bronze_load_ledger (
+  job_name STRING,
+  pipeline_id STRING,
+  pipeline_name STRING,
+  update_id STRING,
+  dataflow STRING,
+  owner_kind STRING,
+  owner STRING,
+  bronze_table STRING,
+  quarantine_table STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  duration_seconds DOUBLE,
+  rows_read BIGINT,
+  rows_bronze BIGINT,
+  rows_quarantine BIGINT,
+  rows_processed BIGINT,
+  bronze_status STRING,
+  quarantine_status STRING,
+  expectations STRING,
   recorded_at TIMESTAMP
 )
 CLUSTER BY (job_name, started_at)
@@ -743,3 +774,33 @@ SELECT
   pu.status
 FROM ${catalog}.framework_meta.pipeline_updates pu
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;
+
+-- Latest append for each load. Retries of record_load_metrics may insert again; this view
+-- keeps one row per job, update, and dataflow.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_loads AS
+SELECT
+  job_name,
+  pipeline_id,
+  pipeline_name,
+  update_id,
+  dataflow,
+  owner_kind,
+  owner,
+  bronze_table,
+  quarantine_table,
+  started_at,
+  ended_at,
+  duration_seconds,
+  rows_read,
+  rows_bronze,
+  rows_quarantine,
+  rows_processed,
+  bronze_status,
+  quarantine_status,
+  expectations,
+  recorded_at
+FROM ${catalog}.framework_meta.bronze_load_ledger
+QUALIFY row_number() OVER (
+  PARTITION BY job_name, update_id, dataflow
+  ORDER BY recorded_at DESC
+) = 1;

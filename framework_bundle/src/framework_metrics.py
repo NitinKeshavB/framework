@@ -3,9 +3,9 @@
 Every ingestion pipeline publishes its event log to framework_meta as <job name>_event_log.
 Each update of this pipeline lists those tables and streams their flow_definition and
 flow_progress events into flow_events, one append flow per log. table_load_metrics groups
-those events by pipeline, update, and flow. bronze_loads pivots staged, bronze, and
-quarantine into one row per table load with rows_read and rows_processed. A log added since the last update gets its
-flow on the next one.
+those events by pipeline, update, and flow. Per-load rows_read / bronze / quarantine counts are
+appended by each delivery job into bronze_load_ledger (see load_metrics), not by this pipeline.
+A log added since the last update gets its flow on the next one.
 
 Quality rules are checked on the private <pipeline_id>_staged table, so expectation counts
 are on the staged row; its dataflow column names the spec, as on the bronze row.
@@ -19,7 +19,6 @@ CATALOG_CONF = "lakeflow_framework.catalog"
 EVENT_LOG_SUFFIX = "_event_log"
 EVENTS = "flow_events"
 METRICS = "table_load_metrics"
-BRONZE_LOADS = "bronze_loads"
 EVENT_SCHEMA = (
     "job_name STRING, pipeline_id STRING, pipeline_name STRING, update_id STRING, "
     "flow_name STRING, event_id STRING, event_type STRING, event_at TIMESTAMP, details STRING"
@@ -188,38 +187,6 @@ LEFT JOIN {meta}.object_current d
 """
 
 
-def bronze_loads_sql(metrics: str) -> str:
-    """One row per bronze table load: rows read (staged) and rows written to bronze and quarantine."""
-
-    return f"""
-SELECT
-  job_name,
-  pipeline_id,
-  max(pipeline_name) AS pipeline_name,
-  update_id,
-  dataflow,
-  max(owner_kind) AS owner_kind,
-  max(owner) AS owner,
-  max(CASE WHEN layer = 'bronze' THEN table_name END) AS bronze_table,
-  max(CASE WHEN layer = 'quarantine' THEN table_name END) AS quarantine_table,
-  min(started_at) AS started_at,
-  max(ended_at) AS ended_at,
-  (unix_millis(max(ended_at)) - unix_millis(min(started_at))) / 1000.0 AS duration_seconds,
-  max(CASE WHEN layer = 'staged' THEN rows_written END) AS rows_read,
-  max(CASE WHEN layer = 'bronze' THEN rows_written END) AS rows_bronze,
-  max(CASE WHEN layer = 'quarantine' THEN rows_written END) AS rows_quarantine,
-  coalesce(max(CASE WHEN layer = 'bronze' THEN rows_written END), 0)
-    + coalesce(max(CASE WHEN layer = 'quarantine' THEN rows_written END), 0) AS rows_processed,
-  max(CASE WHEN layer = 'bronze' THEN status END) AS bronze_status,
-  max(CASE WHEN layer = 'quarantine' THEN status END) AS quarantine_status,
-  max(CASE WHEN layer = 'staged' THEN expectations END) AS expectations
-FROM {metrics}
-WHERE dataflow IS NOT NULL
-  AND layer IN ('staged', 'bronze', 'quarantine')
-GROUP BY job_name, pipeline_id, update_id, dataflow
-"""
-
-
 def register(dp, spark, catalog: str) -> None:
     if not _IDENTIFIER.match(catalog):
         raise ValueError(f"{CATALOG_CONF} must name a catalog")
@@ -248,14 +215,6 @@ def register(dp, spark, catalog: str) -> None:
     )
     def _metrics():
         return spark.sql(table_load_metrics_sql(source, meta))
-
-    @dp.materialized_view(
-        name=BRONZE_LOADS,
-        comment="Rows read and rows written to bronze and quarantine for each table load",
-        cluster_by_auto=True,
-    )
-    def _bronze_loads():
-        return spark.sql(bronze_loads_sql(METRICS))
 
 
 def _append(dp, spark, log: str, job: str) -> None:

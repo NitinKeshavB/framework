@@ -457,6 +457,18 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         refresh["depends_on"] = [{"task_key": "batch_load"}]
     refresh["pipeline_task"] = {"pipeline_id": f"${{resources.pipelines.{name}_pipeline.id}}"}
     tasks.append(refresh)
+    # Append-only insert of rows_read / bronze / quarantine for this update. No MERGE.
+    tasks.append(
+        {
+            "task_key": "record_load_metrics",
+            "depends_on": [{"task_key": "refresh_pipeline"}],
+            "environment_key": "framework_env",
+            "spark_python_task": {
+                "python_file": "../src/record_load_metrics.py",
+                "parameters": ["${var.catalog}", name],
+            },
+        }
+    )
 
     # Deployed names carry a dev or prod prefix, so the run views join system tables on this tag.
     job: dict[str, Any] = {"name": name, "tags": job_tags(system, delivery, configs)}
@@ -472,13 +484,12 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         job["trigger"] = {"file_arrival": {"url": f"/Volumes/${{var.catalog}}/{schema}/{volume}/"}}
     else:
         job["trigger"] = {"file_arrival": {"url": detail["path"]}}
-    if batch_paths:
-        job["environments"] = [
-            {
-                "environment_key": "framework_env",
-                "spec": {"environment_version": ENVIRONMENT_VERSION, "dependencies": [WHEEL]},
-            }
-        ]
+    job["environments"] = [
+        {
+            "environment_key": "framework_env",
+            "spec": {"environment_version": ENVIRONMENT_VERSION, "dependencies": [WHEEL]},
+        }
+    ]
     job["performance_target"] = PERFORMANCE_TARGET
     job["tasks"] = tasks
     return {"resources": {"jobs": {name: job}}}
