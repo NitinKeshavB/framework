@@ -39,18 +39,20 @@ Deploy also updates the registry before it returns. `bundle:deploy framework_bun
 
 ## How each kind loads
 
-Each table reads its source once. The dataset that reads it adds `_dq_failed_rules`, the names of the rules the row failed, so each rule is evaluated once per row. Nothing is dropped with `expect_or_drop`.
+Each table reads its source once, into a private `<pipeline_id>_staged` table that is not published to Unity Catalog. A pipeline cannot send one read to two tables, and a temporary view runs again for every dataset that reads it, so the staging table is what lets bronze and quarantine share one read. It adds `_dq_failed_rules`, the names of the rules the row failed, so each rule is evaluated once per row. Nothing is dropped with `expect_or_drop`.
 
-- **Append loads** (no `dedup`, database `snapshot`): bronze holds every row with `_dq_failed_rules`. Quarantine reads bronze `WHERE size(_dq_failed_rules) > 0`. Readers who want only clean rows filter bronze on `size(_dq_failed_rules) = 0`.
-- **Auto CDC loads** (`dedup: true`, database `merge`): a CDC target keeps one row per key and cannot hold a row with a null key. So the checked rows land once in a private `<pipeline_id>_staged` table, which is not published to Unity Catalog. A temporary view keeps the passing rows for Auto CDC, and quarantine reads the failing rows from the staging table. Bronze holds only passing rows.
+- **Bronze** holds only passing rows. It reads the staging table `WHERE size(_dq_failed_rules) = 0`, without that column, through the `<pipeline_id>_valid` temporary view. With `dedup: true` or a database `merge`, Auto CDC reads the same view.
+- **Quarantine** reads the staging table `WHERE size(_dq_failed_rules) > 0`, with the column renamed to `failed_rules`.
 
-Each rule is also a warn expectation, `NOT array_contains(_dq_failed_rules, '<rule>')`, on the dataset that reads the source, so pass and fail counts reach the pipeline event log without evaluating the rule again.
+The cost is one extra Delta write of every row, and the staging table's storage. It is cheaper than listing and parsing the files, or querying the database, a second time.
+
+Each rule is also a warn expectation on the staging table, `NOT array_contains(_dq_failed_rules, '<rule>')`, so pass and fail counts reach the pipeline event log without evaluating the rule again.
 
 | Kind and method | Reads | Quarantine | Bronze |
 | --- | --- | --- | --- |
-| Files, `volume_files` | Auto Loader on the raw volume path, once. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table read from bronze (or the staging table) | Streaming table of every row, or Auto CDC on the keys when `dedup: true` |
-| Database, `snapshot` | The foreign-catalog table, in batch, once | Materialized view read from bronze | Materialized view of every row |
-| Database, `merge` | The same, into the private staging materialized view | Materialized view read from the staging view | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
+| Files, `volume_files` | Auto Loader on the raw volume path, once, into a private staging streaming table. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table of failing rows | Streaming table of passing rows, or Auto CDC on the keys when `dedup: true` |
+| Database, `snapshot` | The foreign-catalog table, in batch, once, into a private staging materialized view | Materialized view of failing rows | Materialized view of passing rows |
+| Database, `merge` | The same | Materialized view of failing rows | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
 | Cloud files, `autoloader` | Auto Loader once into a raw streaming table. The projection, including `_source_file` and `_ingested_at`, is applied on that read. | Streaming table, read from the raw table | Streaming table read from the valid view, or Auto CDC from that view when `dedup: true` |
 | Cloud files, `copy_into` | `COPY INTO` a raw table (`force = false`) before the pipeline | Streaming table | Streaming table |
 | Cloud files, `ctas` | `CREATE OR REPLACE TABLE` raw | Materialized view | Materialized view |
@@ -72,7 +74,7 @@ Rules in the spec become SQL predicates before a cluster starts.
 - Each declared type gets `TRY_CAST(column AS type) IS NOT NULL OR column IS NULL`, so a null is not also a cast failure.
 - Auto Loader on CSV, delimited text, JSON, and text adds `_rescued_data IS NULL`.
 
-A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Bronze and quarantine rows carry `_dq_failed_rules`, the names of every predicate that failed.
+A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `failed_rules`, the names of every predicate that failed.
 
 ## The registry
 

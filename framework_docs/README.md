@@ -186,7 +186,7 @@ For source system `billing` and table `invoices`:
 - Files from a raw volume or a database: `<catalog>.billing_bronze.invoices` and `<catalog>.billing_bronze.invoices_qrntn`. The quarantine table is the bronze table name plus `_qrntn`, in the bronze schema, unless the spec sets `quarantine.table` or `quarantine.schema`.
 - Cloud files also write `<catalog>.billing_raw.invoices`.
 
-Bronze and quarantine carry `_dq_failed_rules`, the names of the rules that failed. Bronze keeps every row, so filter it on `size(_dq_failed_rules) = 0` for clean rows; with `dedup` or a database `merge`, bronze holds only passing rows. Quarantine holds the rows that failed any rule. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.
+Quarantine carries `failed_rules`, the names of the rules that failed. Rows that pass go to bronze. Both are read from one private staging table, so the source is read once. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.
 
 ## Operations
 

@@ -112,7 +112,7 @@ erDiagram
 
 A file source whose raw layer is a volume still has a `raw` flow. That flow records the volume path and has no securable. A `cloud_files` raw flow has a securable, because its raw layer is a Delta table. A database load has no raw flow. Every row carries `owner_kind`, `owner`, `requested_by`, and `delivery`. A raw table is a `streaming_table` for Auto Loader and a `table` for COPY INTO and CTAS. Bronze and quarantine are a `materialized_view` for CTAS and for a database `snapshot`, and a `streaming_table` otherwise. Bronze written by Auto CDC (dedup, or database `merge`) stays a `streaming_table`.
 
-Each object is hashed on its own document, so a job rename versions the pipeline and the workflow but not a table or column whose own fields did not change. A column hash covers ordinal, data type, description, classification, and PII. The column name is the key, so a rename is a different column. Columns are recorded for every table the pipeline writes: raw (with `_source_file` and `_ingested_at`), bronze, and `_dq_failed_rules` on bronze and quarantine. Without a raw table, bronze and quarantine carry the lineage columns the pipeline adds.
+Each object is hashed on its own document, so a job rename versions the pipeline and the workflow but not a table or column whose own fields did not change. A column hash covers ordinal, data type, description, classification, and PII. The column name is the key, so a rename is a different column. Columns are recorded for every table the pipeline writes: raw (with `_source_file` and `_ingested_at`), bronze, and quarantine (with `failed_rules`). Without a raw table, bronze and quarantine carry the lineage columns the pipeline adds.
 
 ## Views
 

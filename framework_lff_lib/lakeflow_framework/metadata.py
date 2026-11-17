@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from lakeflow_framework.config import PipelineConfig
-from lakeflow_framework.quality import DQ_COLUMN, compile_rules
+from lakeflow_framework.quality import compile_rules
 
 
 def ddl_text() -> str:
@@ -169,10 +169,10 @@ def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any
             ]
         elif not config.has_raw:
             extras += _lineage_fields(config, tags.classification)
-        if layer in {"bronze", "quarantine"}:
+        if layer == "quarantine":
             extras.append(
                 (
-                    DQ_COLUMN,
+                    "failed_rules",
                     "array<string>",
                     "Rules that failed for this row",
                     tags.classification,

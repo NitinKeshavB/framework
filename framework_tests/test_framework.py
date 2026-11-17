@@ -563,7 +563,6 @@ def test_column_metadata_versions_type_comment_and_tags():
         "framework_dev.billing_bronze.invoices.invoice_id",
         "framework_dev.billing_bronze.invoices.amount",
         "framework_dev.billing_bronze.invoices.updated_at",
-        "framework_dev.billing_bronze.invoices._dq_failed_rules",
     ]
     raw_names = {
         row["full_name"]
@@ -577,7 +576,7 @@ def test_column_metadata_versions_type_comment_and_tags():
         for row in object_rows(config)
         if row["parent_full_name"] == "framework_dev.billing_quarantine.invoices_qrntn"
     }
-    assert "framework_dev.billing_quarantine.invoices_qrntn._dq_failed_rules" in quarantine_names
+    assert "framework_dev.billing_quarantine.invoices_qrntn.failed_rules" in quarantine_names
     amount = json.loads(rows[1]["config_json"])
     assert amount == {
         "classification": "confidential",
@@ -624,7 +623,7 @@ def test_column_metadata_versions_type_comment_and_tags():
         row["full_name"]
         for row in ledger_rows
         if row["parent_full_name"] == "framework_dev.ledger_bronze.entries"
-    ] == ["framework_dev.ledger_bronze.entries._dq_failed_rules"]
+    ] == []
     assert [
         row["full_name"]
         for row in ledger_rows
@@ -1002,11 +1001,13 @@ def test_a_delivery_reads_every_pipeline_document_once():
     )
     assert calls == [["billing_invoices", "ledger_entries"]]
     assert [graph.pipeline_id for graph in graphs] == ["billing_invoices", "ledger_entries"]
-    # Auto Loader lists files once. The batch quarantine reads bronze, not the raw table again.
+    # Auto Loader lists files once. Bronze and quarantine read the staging table, not raw again.
     assert spark.readStream.loads == 1
     assert spark.read.tables == [
         "framework_dev.ledger_raw.entries",
-        "framework_dev.ledger_bronze.entries",
+        "ledger_entries_staged",
+        "ledger_entries_valid",
+        "ledger_entries_staged",
     ]
 
 

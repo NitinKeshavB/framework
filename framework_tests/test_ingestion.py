@@ -637,6 +637,11 @@ def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) 
     rules = [part for parts in spark.readStream.selects for part in parts if "amount >= 0" in part]
     assert rules == [rules[0]] and rules[0].endswith(" AS _dq_failed_rules")
     assert spark.readStream.wheres == ["size(_dq_failed_rules) = 0", "size(_dq_failed_rules) > 0"]
+    assert ("* EXCEPT (_dq_failed_rules)",) in spark.readStream.selects
+    assert (
+        "* EXCEPT (_dq_failed_rules)",
+        "_dq_failed_rules AS failed_rules",
+    ) in spark.readStream.selects
 
     _add_table(bundle, "credits", "billing")
     configs = [table.config for table in load_sources(bundle)[0].tables]

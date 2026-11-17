@@ -165,10 +165,15 @@ def test_volume_spec_reads_the_raw_volume_and_has_no_raw_table(tmp_path: Path) -
     with pytest.raises(ValueError):
         config.table_name("raw")
     graph = assemble(config)
-    assert [dataset.kind for dataset in graph.datasets] == ["bronze", "quarantine"]
+    assert [dataset.kind for dataset in graph.datasets] == [
+        "staged",
+        "valid",
+        "bronze",
+        "quarantine",
+    ]
     assert graph.datasets[0].detail["source"] == config.path
-    assert graph.datasets[1].detail == {
-        "source": "framework_dev.files_bronze.things",
+    assert graph.datasets[3].detail == {
+        "source": "files_things_staged",
         "where": "size(_dq_failed_rules) > 0",
     }
 
@@ -179,7 +184,12 @@ def test_database_spec_reads_the_foreign_catalog(tmp_path: Path) -> None:
     assert config.source_reference() == "db_federated.dbo.things"
     assert config.is_batch and not config.uses_auto_cdc
     graph = assemble(config)
-    assert [dataset.relation for dataset in graph.datasets] == ["batch", "batch"]
+    assert [dataset.relation for dataset in graph.datasets] == [
+        "batch",
+        "temporary_view",
+        "batch",
+        "batch",
+    ]
 
 
 def test_merge_mode_stages_once_then_uses_snapshot_cdc_on_the_keys(tmp_path: Path) -> None:
@@ -215,12 +225,14 @@ def test_snapshot_mode_replaces_bronze_with_a_materialized_view(tmp_path: Path) 
     assert pipelines.kinds["framework_dev.db_bronze.things"] == "materialized_view"
     assert pipelines.kinds["framework_dev.db_quarantine.things_qrntn"] == "materialized_view"
     assert spark.reads == [
-        ("framework_dev.db_bronze.things", "table", "db_federated.dbo.things"),
-        ("framework_dev.db_quarantine.things_qrntn", "table", "framework_dev.db_bronze.things"),
+        ("db_things_staged", "table", "db_federated.dbo.things"),
+        ("db_things_valid", "table", "db_things_staged"),
+        ("framework_dev.db_bronze.things", "table", "db_things_valid"),
+        ("framework_dev.db_quarantine.things_qrntn", "table", "db_things_staged"),
     ]
 
 
-def test_volume_files_read_the_volume_once_and_quarantine_reads_bronze(tmp_path: Path) -> None:
+def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path) -> None:
     config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
     spark = _Spark()
     pipelines = _Pipelines(spark)
@@ -229,10 +241,19 @@ def test_volume_files_read_the_volume_once_and_quarantine_reads_bronze(tmp_path:
         "framework_dev.files_bronze.things",
         "framework_dev.files_quarantine.things_qrntn",
     )
-    assert pipelines.kinds == {bronze: "table", quarantine: "table"}
+    staged = "files_things_staged"
+    assert pipelines.kinds == {
+        staged: "table",
+        "files_things_valid": "view",
+        bronze: "table",
+        quarantine: "table",
+    }
+    assert pipelines.options[staged]["private"] is True
     assert spark.reads == [
-        (bronze, "files", config.path),
-        (quarantine, "table", bronze),
+        (staged, "files", config.path),
+        ("files_things_valid", "table", staged),
+        (bronze, "table", "files_things_valid"),
+        (quarantine, "table", staged),
     ]
     assert pipelines.expectations == ["cast_thing_id", "schema_conformance"]
     assert spark.readStream.format_name == "cloudFiles"
