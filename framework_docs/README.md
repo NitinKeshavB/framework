@@ -132,7 +132,7 @@ quarantine: { schema: erp_quarantine}
 
 ## Table spec: cloud files (original shape)
 
-`cloud_files` keeps the first design: files land in a raw table, then bronze.
+`cloud_files` keeps the first design: files land in a raw table, then bronze. It is not in the MVP: validation rejects `autoloader`, `copy_into`, and `ctas`, and the code is kept for later.
 
 ```yaml
 source_to_raw:

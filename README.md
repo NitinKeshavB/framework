@@ -27,7 +27,7 @@ source system ──delivery──▶ bronze ──▶ silver / gold / product
 | --- | --- | --- | --- |
 | `sftp_files`, `sharepoint_files` | Many files | A Unity Catalog volume of files as delivered | Auto Loader reads the volume into bronze |
 | `database` | Tables in PostgreSQL, Azure SQL, SQL Server, or DB2 | None. A foreign catalog exposes the database | Each table loads into bronze: `snapshot` or `merge` |
-| `cloud_files` | Files on ADLS or S3 | A raw table | Auto Loader, COPY INTO, or CTAS, then bronze |
+| `cloud_files` | Files on ADLS or S3 | A raw table | Auto Loader, COPY INTO, or CTAS, then bronze. Not in the MVP: validation rejects these methods |
 
 Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePoint files into the raw volume is not built; it is the first phase 1 item ([ROADMAP](framework_docs/ROADMAP.md)).
 

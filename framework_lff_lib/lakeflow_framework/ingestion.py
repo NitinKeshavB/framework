@@ -77,7 +77,9 @@ class SourceSystem:
     engine: str = ""
 
 
-def load_sources(bundle: Path, catalog: str | None = None) -> list[SourceSystem]:
+def load_sources(
+    bundle: Path, catalog: str | None = None, *, allow_frozen: bool = False
+) -> list[SourceSystem]:
     """Read and validate every source system. Raises one error listing every problem.
 
     ``catalog`` is the environment catalog. Generate omits it and uses a stand-in, because a spec
@@ -112,7 +114,9 @@ def load_sources(bundle: Path, catalog: str | None = None) -> list[SourceSystem]
     if spec_files:
         try:
             configs = validate_configs(
-                [path for _, path in spec_files], catalog=catalog or PLACEHOLDER_CATALOG
+                [path for _, path in spec_files],
+                catalog=catalog or PLACEHOLDER_CATALOG,
+                allow_frozen=allow_frozen,
             )
         except ConfigValidationError as exc:
             errors.extend(exc.errors)
@@ -191,15 +195,15 @@ def render_files(systems: list[SourceSystem]) -> dict[str, str]:
     return files
 
 
-def generate(bundle: Path, check: bool = False) -> list[str]:
+def generate(bundle: Path, check: bool = False, *, allow_frozen: bool = False) -> list[str]:
     """Write the generated files, and remove generated files no source asks for.
 
     With ``check``, change nothing. Returns the paths that were (or would be) out of date, empty
     when the bundle already matches its sources. Files without the generated marker are never
-    touched.
+    touched. ``allow_frozen`` is for tests of the frozen load methods.
     """
 
-    files = render_files(load_sources(bundle))
+    files = render_files(load_sources(bundle, allow_frozen=allow_frozen))
     stale = write_generated(bundle, files, check)
     for relative in _generated_files(bundle):
         if relative not in files:

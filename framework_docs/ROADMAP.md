@@ -7,7 +7,7 @@ What is built, what phase 1 covers, and what has not been verified.
 | Area | State |
 | --- | --- |
 | Platform bundle | Registry DDL in `framework_bundle/sql/framework_meta.sql`, collector, daily `OPTIMIZE`. Ownership columns and checks. |
-| Ingestion kinds | `sftp_files` and `sharepoint_files` (raw volume to bronze), `database` (PostgreSQL, Azure SQL, SQL Server, DB2 through a foreign catalog, to bronze), and the original `cloud_files` path |
+| Ingestion kinds | `sftp_files` and `sharepoint_files` (raw volume to bronze), `database` (PostgreSQL, Azure SQL, SQL Server, DB2 through a foreign catalog, to bronze), and the original `cloud_files` path, which is frozen: the code is kept but validation rejects `autoloader`, `copy_into`, and `ctas` until they run end to end on serverless |
 | Config-driven output | One pipeline and one job per delivery, plus `SOURCE_MAP.md`, generated from `source.yaml` and the table specs |
 | Registry | Workflow, pipeline, dataflow, flow, securable, link, and column definitions. Job run steps with `RUNNING` / `SUCCEEDED` / `FAILED`. Views for definitions, lineage, history, recon, and `v_job_status`. |
 | Ownership | Bronze is owned by its source system. `requested_by` and `delivery` are recorded. The collector refuses a second owner. `v_ownership_conflicts` is empty when the rules hold. |

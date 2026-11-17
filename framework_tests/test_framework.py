@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -170,7 +171,7 @@ def test_only_bronze_loads_are_accepted():
 
 
 def test_one_domain_holds_many_projects_and_jobs_mail_their_owners():
-    configs = validate_configs(sorted(EXAMPLES.glob("*.yaml")))
+    configs = validate_configs(sorted(EXAMPLES.glob("*.yaml")), allow_frozen=True)
     finance = [config for config in configs if config.domain == "finance"]
     assert {config.requested_by for config in finance} == {"billing", "ledger"}
     billing = next(config for config in finance if config.requested_by == "billing")
@@ -233,7 +234,7 @@ def test_unknown_pii_and_classification_are_rejected():
 
 
 def test_example_configs_validate():
-    configs = validate_configs(sorted(EXAMPLES.glob("*.yaml")))
+    configs = validate_configs(sorted(EXAMPLES.glob("*.yaml")), allow_frozen=True)
     assert {config.pipeline_id for config in configs} == {
         "billing_invoices",
         "ledger_entries",
@@ -312,7 +313,7 @@ def test_two_pipelines_cannot_share_a_table(tmp_path: Path):
     first.write_text(_dump(shared), encoding="utf-8")
     second.write_text(_dump(other), encoding="utf-8")
     with pytest.raises(ConfigValidationError) as caught:
-        validate_configs([first, second])
+        validate_configs([first, second], allow_frozen=True)
     assert "billing_invoices and billing_copy" in "\n".join(caught.value.errors)
 
 
@@ -466,8 +467,12 @@ def test_one_line_pipeline_file_uses_the_running_session(monkeypatch: pytest.Mon
     assert any("_source_file" in expr for exprs in spark.readStream.exprs for expr in exprs)
 
 
-def test_one_line_pipeline_file_off_cluster_says_why():
-    with pytest.raises(MetadataNotFound):
+def test_one_line_pipeline_file_off_cluster_says_why(monkeypatch):
+    # pyspark 4.1 and later ship pyspark.pipelines, so hide it to stand in for an off-cluster run.
+    monkeypatch.setitem(sys.modules, "pyspark.pipelines", None)
+    if "pyspark" in sys.modules:
+        monkeypatch.delattr(sys.modules["pyspark"], "pipelines", raising=False)
+    with pytest.raises(MetadataNotFound, match="only a Lakeflow pipeline provides"):
         build_pipeline("billing_invoices")
 
 
@@ -674,7 +679,7 @@ def test_column_sensitivity_and_duplicates_are_rejected():
 
 
 def test_example_columns_keep_descriptions_and_sensitivity():
-    configs = validate_configs(sorted(EXAMPLES.glob("billing_invoices.yaml")))
+    configs = validate_configs(sorted(EXAMPLES.glob("billing_invoices.yaml")), allow_frozen=True)
     billing = configs[0]
     by_name = {column.name: column for column in billing.columns}
     assert by_name["invoice_id"].description == "Invoice identifier from the billing system"

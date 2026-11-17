@@ -16,6 +16,8 @@ import yaml
 # foreign catalog. Both go straight to bronze, so they have no raw table.
 LOAD_METHODS = ("autoloader", "copy_into", "ctas", "volume_files", "database_table")
 RAWLESS_METHODS = ("volume_files", "database_table")
+# Kept and tested, but a spec cannot use them until they are run end to end on serverless.
+FROZEN_METHODS = ("autoloader", "copy_into", "ctas")
 FILE_KINDS = ("sftp_files", "sharepoint_files")
 DATABASE_KIND = "database"
 DATABASE_MODES = ("snapshot", "merge")
@@ -274,9 +276,14 @@ def read_mapping(path: Path, errors: list[str]) -> dict[str, Any] | None:
     return document
 
 
-def validate_configs(paths: list[Path], catalog: str | None = None) -> list[PipelineConfig]:
+def validate_configs(
+    paths: list[Path], catalog: str | None = None, *, allow_frozen: bool = False
+) -> list[PipelineConfig]:
     """Validate spec files. ``catalog`` sets the environment's catalog for every spec, so a
-    spec does not hard-code dev or prod. Without it each spec must name its own catalog."""
+    spec does not hard-code dev or prod. Without it each spec must name its own catalog.
+
+    ``allow_frozen`` admits the FROZEN_METHODS. Only tests and the consumer reference set it.
+    """
 
     errors: list[str] = []
     configs: list[PipelineConfig] = []
@@ -296,7 +303,12 @@ def validate_configs(paths: list[Path], catalog: str | None = None) -> list[Pipe
                 continue
         found, parsed = _validate_one(document, str(path))
         errors.extend(found)
-        if parsed is not None:
+        if parsed is not None and parsed.load_method in FROZEN_METHODS and not allow_frozen:
+            errors.append(
+                f"{path}: {parsed.load_method} is not in the MVP; "
+                "land files in a volume (volume_files) or read a database (database_table)"
+            )
+        elif parsed is not None:
             configs.append(parsed)
     errors.extend(_target_conflicts(configs))
     if errors:

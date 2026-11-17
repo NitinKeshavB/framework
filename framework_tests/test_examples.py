@@ -13,7 +13,6 @@ def test_ingestion_examples_cover_each_kind() -> None:
         "abs",
         "billing",
         "claims_db",
-        "drops",
         "erp",
         "hr_docs",
         "policies",
@@ -24,7 +23,6 @@ def test_ingestion_examples_cover_each_kind() -> None:
     assert systems["hr_docs"].kind == "sharepoint_files"
     assert systems["claims_db"].kind == "database"
     assert systems["erp"].kind == "database"
-    assert systems["drops"].kind == "cloud_files"
 
     abs_tables = {table.config.pipeline_id: table for table in systems["abs"].tables}
     assert abs_tables["abs_reference"].requested_by == ""
@@ -32,5 +30,3 @@ def test_ingestion_examples_cover_each_kind() -> None:
 
     modes = {table.config.source_mode for table in systems["claims_db"].tables}
     assert modes == {"snapshot", "merge"}
-    methods = {table.config.load_method for table in systems["drops"].tables}
-    assert methods == {"autoloader", "copy_into"}

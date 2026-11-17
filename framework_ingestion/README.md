@@ -21,7 +21,7 @@ The kind is set once in the source system's `source.yaml`. Every table in that s
 | `sftp_files` | Many files | A Unity Catalog volume (`raw_volume`) holding the files as delivered | Auto Loader reads the volume into bronze (`volume_files`) |
 | `sharepoint_files` | Many files | The same raw volume | The same |
 | `database` | Tables in PostgreSQL, Azure SQL, SQL Server, or DB2 | None. The source is a foreign catalog | Each table is read into bronze (`database_table`), `snapshot` or `merge` |
-| `cloud_files` | Files on ADLS or S3 | A raw table | Auto Loader, COPY INTO, or CTAS into the raw table, then bronze. This is the original path |
+| `cloud_files` | Files on ADLS or S3 | A raw table | Auto Loader, COPY INTO, or CTAS into the raw table, then bronze. This is the original path. Not in the MVP: validation rejects these methods |
 
 Rows that fail a quality rule go to a quarantine table beside bronze.
 

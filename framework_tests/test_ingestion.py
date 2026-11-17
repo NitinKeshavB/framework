@@ -117,7 +117,6 @@ def test_every_source_kind_is_in_the_sample() -> None:
     assert kinds["abs"] == "sftp_files"
     assert kinds["policies"] == "sharepoint_files"
     assert kinds["claims_db"] == "database"
-    assert kinds["drops"] == "cloud_files"
     assert [t.config.load_method for t in systems["billing"].tables] == ["volume_files"]
     assert {t.config.load_method for t in systems["erp"].tables} == {"database_table"}
     assert len(systems["erp"].tables) == 2
@@ -228,12 +227,22 @@ def test_scheduled_delivery_gets_a_schedule_not_a_file_trigger(bundle: Path) -> 
     assert "trigger" not in job
 
 
+def test_cloud_files_methods_are_not_in_the_mvp(bundle: Path) -> None:
+    folder = bundle / "sources" / "legacy" / "legacy"
+    folder.mkdir(parents=True)
+    (folder.parent / "source.yaml").write_text(LEGACY_SOURCE, "utf-8")
+    (folder / "legacy_credits.yaml").write_text(LEGACY_SPEC, "utf-8")
+    with pytest.raises(ConfigValidationError) as caught:
+        generate(bundle)
+    assert any("is not in the MVP" in error for error in caught.value.errors)
+
+
 def test_cloud_files_source_keeps_its_raw_table_and_adds_a_batch_load_step(bundle: Path) -> None:
     folder = bundle / "sources" / "legacy" / "legacy"
     folder.mkdir(parents=True)
     (folder.parent / "source.yaml").write_text(LEGACY_SOURCE, "utf-8")
     (folder / "legacy_credits.yaml").write_text(LEGACY_SPEC, "utf-8")
-    generate(bundle)
+    generate(bundle, allow_frozen=True)
     tasks = _tasks(bundle, "legacy_daily")
     assert list(tasks["batch_load"]["spark_python_task"]["parameters"]) == [
         "--catalog",
@@ -262,7 +271,7 @@ def test_cloud_files_file_arrival_can_watch_a_volume(bundle: Path) -> None:
         ),
         "utf-8",
     )
-    generate(bundle)
+    generate(bundle, allow_frozen=True)
     assert _job(bundle, "legacy_daily")["trigger"]["file_arrival"]["url"] == volume
 
 
@@ -482,7 +491,7 @@ def test_spec_shape_must_match_the_source_kind(bundle: Path) -> None:
     project.mkdir()
     (project / "legacy_credits.yaml").write_text(LEGACY_SPEC, "utf-8")
     with pytest.raises(ConfigValidationError) as caught:
-        load_sources(bundle)
+        load_sources(bundle, allow_frozen=True)
     assert any("a sftp_files source loads with volume_files" in e for e in caught.value.errors)
 
 

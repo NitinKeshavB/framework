@@ -16,7 +16,7 @@ CONFIGS = Path(__file__).resolve().parents[1] / "configs" / "bronze"
 
 
 def _load(name: str):
-    return validate_configs([CONFIGS / name])[0]
+    return validate_configs([CONFIGS / name], allow_frozen=True)[0]
 
 
 def test_billing_publishes_raw_to_bronze():

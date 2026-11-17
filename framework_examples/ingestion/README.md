@@ -17,11 +17,9 @@ ingestion/sources/
     source.yaml
     claims_db_codes.yaml        no project, snapshot
     actuarial/claims_db_claims.yaml
-  drops/                        cloud_files. Files land in a raw table first.
-    source.yaml
-    drops_history.yaml          copy_into, no project
-    pricing/drops_rates.yaml    autoloader
 ```
+
+There is no `cloud_files` example: its methods (`autoloader`, `copy_into`, `ctas`) are not in the MVP, and validation rejects them.
 
 `./run.sh generate` reads `framework_ingestion` only. To check these specs:
 
