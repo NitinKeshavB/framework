@@ -775,7 +775,7 @@ SELECT
 FROM ${catalog}.framework_meta.pipeline_updates pu
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;
 
--- Latest append for each load. Retries of record_load_metrics may insert again; this view
+-- Latest append for each load. Retries of record_load_metrics may insert again. This view
 -- keeps one row per job, update, and dataflow.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_loads AS
 SELECT
