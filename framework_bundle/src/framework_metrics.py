@@ -217,7 +217,9 @@ def register(dp, spark, catalog: str) -> None:
 
 
 def _append(dp, spark, log: str, job: str) -> None:
-    @dp.append_flow(target=EVENTS, name=f"{job}{EVENT_LOG_SUFFIX}")
+    # The flow must not be named <job>_event_log: that is already a table in this schema, and
+    # Lakeflow treats a flow with the same name as a cycle on that table.
+    @dp.append_flow(target=EVENTS, name=f"{job}_to_flow_events")
     def _events():
         return (
             spark.readStream.table(log)

@@ -181,8 +181,8 @@ def test_metrics_pipeline_adds_one_append_flow_per_event_log():
     metrics.register(dp, spark, "framework_dev")
     assert dp.tables == ["flow_events"]
     assert dp.flows == [
-        ("flow_events", "abs_daily_event_log"),
-        ("flow_events", "erp_hourly_event_log"),
+        ("flow_events", "abs_daily_to_flow_events"),
+        ("flow_events", "erp_hourly_to_flow_events"),
     ]
     assert "FROM flow_events" in dp.views["table_load_metrics"]()
 
