@@ -21,7 +21,7 @@ from lakeflow_framework.ingestion import (
     new_table,
     registry_rows,
 )
-from lakeflow_framework.metadata import object_rows, workflow_rows
+from lakeflow_framework.metadata import current_objects_sql, object_rows, workflow_rows
 from lakeflow_framework.pipeline import build_pipeline
 
 SAMPLE = Path(__file__).resolve().parents[1] / "framework_examples" / "ingestion"
@@ -685,6 +685,15 @@ def test_registry_rows_use_the_deployed_catalog() -> None:
     assert all(name.startswith("aal_dev_fdh.") for name in tables)
     with pytest.raises(ConfigValidationError):
         registry_rows(SAMPLE, "not a catalog")
+
+
+def test_every_registry_row_name_can_be_looked_up() -> None:
+    rows = registry_rows(SAMPLE, "aal_dev_fdh")
+    assert any("->" in row["full_name"] for row in rows if row["object_kind"] == "link")
+    statement = current_objects_sql("aal_dev_fdh", rows)
+    assert "'billing_invoices->" in statement
+    with pytest.raises(ValueError, match="object name"):
+        current_objects_sql("aal_dev_fdh", [{**rows[0], "full_name": "x' OR '1'='1"}])
 
 
 def test_registry_rows_carry_each_source_its_schemas_and_its_job_triggers() -> None:

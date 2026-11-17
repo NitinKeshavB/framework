@@ -385,7 +385,8 @@ OWNED_KINDS = (
 SCD_COLUMNS = ("valid_from", "valid_to", "is_current", "is_deleted")
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
-_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+# ">" is for link names, pipeline->table. Nothing here can close a quoted SQL string.
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.>-]+$")
 _SAFE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
