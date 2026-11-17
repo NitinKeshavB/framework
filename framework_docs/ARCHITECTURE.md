@@ -116,17 +116,17 @@ flowchart LR
 | bronze, `<schema>.<table>` | `<source>_bronze` | ingestion pipeline | One passing row, or one row per key with Auto CDC | Streaming table or materialized view |
 | quarantine, `<table>_qrntn` | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |
 
-The framework creates nothing outside `framework_meta` except the tables its pipelines publish. Schemas, volumes, and foreign catalogs exist before a deploy.
+The registry tables change once per deploy, `table_health` once a day, and the metrics tables once an hour. A delivery run writes only its own data tables and event log. The framework creates nothing outside `framework_meta` except the tables its pipelines publish. Schemas, volumes, and foreign catalogs exist before a deploy. The `framework_events` volume that older versions created is no longer used; drop it by hand once nothing reads it.
 
 ### Registry, physical
 
-History is insert-only. A version is `(object_kind, full_name, recorded_at)`. A run step is `(run_id, step_no, status)`. The tables do not declare those as primary keys. A run matches the definition that was active when `owner`, `object_kind`, and `full_name` are equal and `started_at` is inside `[valid_from, valid_to)`.
+History is insert-only. A version is `(object_kind, full_name, recorded_at)`. A ledger step is `(run_id, step_no, status)`; an ownership refusal has `run_id = ownership-<first 16 characters of the hash>` and `step_name = ownership_check`. The tables do not declare those as primary keys. The definition active at time `t` is the version with `valid_from <= t` and `valid_to` null or later, in `v_object_history`.
 
 ```mermaid
 erDiagram
   object_registry ||--|| object_current : "latest version"
   run_ledger ||--|| run_current : "latest step"
-  object_current ||--o{ run_ledger : "owner, object_kind, full_name"
+  object_current ||--o{ run_ledger : "refused object_kind, full_name"
   object_current ||--o{ table_health : "bronze table_name"
   object_registry {
     string object_kind
@@ -205,11 +205,61 @@ erDiagram
 | `run_current` | `(owner, object_kind, full_name)` |
 | `table_health` | `(owner, event_date, table_name)` |
 
-`config` is `config_json` parsed to `VARIANT`; `content_hash` is computed over `config_json`, so both are kept. `recon_json` is no longer written; it stays so older rows still read.
+Every registry table sets `delta.autoOptimize.optimizeWrite` and `delta.autoOptimize.autoCompact`; `table_health` sets `optimizeWrite`. `framework_ddl` turns `autoCompact` on for tables created while it was off.
+
+`config` is `config_json` parsed to `VARIANT`; `content_hash` is computed over `config_json`, so both are kept. In `run_ledger` and `run_current`, `parent_run_id`, `step_no`, `started_at`, and `ended_at` are only set on job steps from before runs moved to the system tables, and `recon_json` is no longer written. The columns stay so those rows still read.
+
+### Runs, from the system tables
+
+Run outcomes, durations, and cost are not copied into the registry. The views in `system_views.sql` join the current workflow definitions to the system tables:
+
+```mermaid
+erDiagram
+  v_workflows ||--o{ jobs : "job_name = tags lakeflow_framework_workflow"
+  jobs ||--o{ job_run_timeline : "workspace_id, job_id"
+  job_run_timeline ||--o{ job_task_run_timeline : "job_id, run_id"
+  job_run_timeline ||--o{ job_usage : "usage_metadata job_id, job_run_id"
+  v_workflows ||--o{ pipelines : "job_name = name without deploy prefix"
+  pipelines ||--o{ pipeline_update_timeline : "workspace_id, pipeline_id"
+  pipeline_update_timeline ||--o{ pipeline_usage : "usage_metadata dlt_pipeline_id, dlt_update_id"
+  job_usage }o--|| list_prices : "sku_name, cloud, usage_unit, time"
+  pipeline_usage }o--|| list_prices : "sku_name, cloud, usage_unit, time"
+  v_workflows {
+    string job_name
+    string owner_kind
+    string owner
+    array pipeline_ids
+  }
+  jobs {
+    string workspace_id
+    string job_id
+    string name
+    map tags
+  }
+  job_run_timeline {
+    string job_id
+    string run_id
+    timestamp period_start_time
+    string result_state
+    string termination_code
+  }
+  pipelines {
+    string workspace_id
+    string pipeline_id
+    string name
+  }
+  pipeline_update_timeline {
+    string pipeline_id
+    string update_id
+    string result_state
+  }
+```
+
+`jobs`, `job_run_timeline`, `job_task_run_timeline`, `pipelines`, and `pipeline_update_timeline` are in `system.lakeflow`. `job_usage` and `pipeline_usage` are rows of `system.billing.usage`, and `list_prices` is `system.billing.list_prices`. `v_job_status` takes the latest `v_job_runs` row per `job_name`. `table_load_metrics.pipeline_id` joins `v_pipeline_updates.pipeline_id`, and `update_id` joins too, so a load's row counts sit next to its cost.
 
 ### Registry, logical
 
-Every box is a row in `object_registry`, except `RUN_STEP`, which is a row in `run_ledger`. `parent_full_name` and `relation` are the edges.
+Every box is a row in `object_registry`, except `RUN_STEP`, which is an ownership refusal in `run_ledger`. `parent_full_name` and `relation` are the edges.
 
 ```mermaid
 erDiagram
@@ -314,6 +364,7 @@ flowchart TD
   v_object_current --> v_columns
   v_object_history --> v_column_history
   run_ledger --> v_process
+  run_ledger --> v_ownership_refusals
   run_current --> v_run_current
   v_workflows --> v_job_status
   v_job_runs --> v_job_status
@@ -327,7 +378,7 @@ flowchart TD
   system_tables --> v_observed_lineage
 ```
 
-`framework_meta.sql` creates every view on the left of the system tables; `system_views.sql` creates `v_job_runs`, `v_job_task_runs`, `v_job_status`, `v_pipeline_updates`, and `v_observed_lineage`, in their own job because they need system table grants. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_run_current` holds the latest ownership refusal per object.
+`framework_meta.sql` creates every view on the left of the system tables; `system_views.sql` creates `v_job_runs`, `v_job_task_runs`, `v_job_status`, `v_pipeline_updates`, and `v_observed_lineage`, in their own job because they need system table grants. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_ownership_refusals` lists every definition `registry_sync` refused, and `v_run_current` the latest ledger step per object.
 
 `v_object_history` windows by `owner_kind`, `owner`, `object_kind`, and `full_name`. Filter those columns, and `owner` in particular, or the window reads every version in the table. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row.
 

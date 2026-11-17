@@ -123,6 +123,7 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_run_current` | Latest ownership refusal per object, and the last step of jobs from before steps moved to the system tables. |
 | `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. Created by `framework_system_views`. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
+| `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
 | `v_bronze_tables` | Every bronze table and its owner. The table health step reads it. |
 | `v_metadata_drift` | Each declared tag or column comment that Unity Catalog (`<catalog>.information_schema`) lacks or holds differently. Empty once `registry_sync` has run after the tables exist. |
 
@@ -177,7 +178,7 @@ The tables use liquid clustering:
 
 Each table clusters on at most three keys. `framework_ddl` moves tables created with four keys to these with `ALTER TABLE ... CLUSTER BY`; new writes and the next `OPTIMIZE` use them.
 
-All set `delta.autoOptimize.optimizeWrite`. `autoCompact` is off on the registry tables; they are written once per deploy, so compaction after each commit gains little. Predictive optimization, once the catalog owner enables it, compacts these tables in the background instead. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
+All set `delta.autoOptimize.optimizeWrite`, and the registry tables also set `autoCompact`: they are written once per deploy, so compacting after that commit is cheap. `framework_ddl` turns it on for tables created while it was off. Predictive optimization, once the catalog owner enables it, also compacts these tables in the background. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
 `v_object_history` partitions by `owner_kind`, `owner`, `object_kind`, and `full_name`. A query that filters `owner` is applied before that window. Filtering only `valid_from` cannot be, because that would change which row comes next. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
 

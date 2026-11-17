@@ -1,9 +1,10 @@
--- Registry for Lakeflow workflows, pipelines, flows, securables, runs, and table health.
--- ${catalog} is replaced by the DDL task. History tables are insert-only.
--- object_current and run_current hold one row per key so a lookup does not window the
--- history. registry_sync writes definitions at deploy and merges those rows. The backfill
--- below runs only while the current table is empty. Job run outcomes are not stored here.
--- v_job_runs and v_job_status in system_views.sql read them from the system tables.
+-- Registry for Lakeflow workflows, pipelines, flows, securables, ownership refusals, and
+-- table health. ${catalog} is replaced by the DDL task. History tables are insert-only.
+-- registry_sync is the only writer of definitions. It runs at deploy, so these tables change
+-- once per deploy, not once per job run. object_current and run_current hold one row per key
+-- so a lookup does not window the history. The backfill below runs only while the current
+-- table is empty. Job run outcomes are not stored here. v_job_runs and v_job_status in
+-- system_views.sql read them from the system tables. Row counts are in table_load_metrics.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
@@ -34,10 +35,12 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'false'
+  'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- recon_json is no longer written. It stays so older rows still read.
+-- Ownership refusals: a FAILED ownership_check step per refused pipeline or table.
+-- Delivery jobs no longer write steps here. The step columns and recon_json stay so rows
+-- from before that change still read.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
   run_id STRING,
   parent_run_id STRING,
@@ -58,7 +61,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
 CLUSTER BY (owner, event_date, run_id)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'false'
+  'delta.autoOptimize.autoCompact' = 'true'
 );
 
 -- One row per object. Lookups and dashboards read this, not the history window.
@@ -80,10 +83,10 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_current (
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'false'
+  'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- One row per job or pipeline: the latest step. run_ledger keeps every step.
+-- One row per object: its latest run_ledger step. run_ledger keeps every step.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_current (
   run_id STRING,
   parent_run_id STRING,
@@ -104,7 +107,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_current (
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'false'
+  'delta.autoOptimize.autoCompact' = 'true'
 );
 
 -- One row per bronze table per framework_optimize run.
@@ -137,6 +140,20 @@ ALTER TABLE ${catalog}.framework_meta.object_current ADD COLUMNS (config VARIANT
 ALTER TABLE ${catalog}.framework_meta.object_registry CLUSTER BY (owner, object_kind, full_name);
 
 ALTER TABLE ${catalog}.framework_meta.run_ledger CLUSTER BY (owner, event_date, run_id);
+
+-- Writes are once per deploy now, so compaction after each commit is cheap. Tables created
+-- while it was off are switched here.
+ALTER TABLE ${catalog}.framework_meta.object_registry
+SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
+
+ALTER TABLE ${catalog}.framework_meta.object_current
+SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
+
+ALTER TABLE ${catalog}.framework_meta.run_ledger
+SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
+
+ALTER TABLE ${catalog}.framework_meta.run_current
+SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true');
 
 -- object_current is not history, so its older rows are parsed once here.
 UPDATE ${catalog}.framework_meta.object_current
@@ -223,7 +240,8 @@ SELECT
   recorded_at
 FROM ${catalog}.framework_meta.object_current;
 
--- Every job's latest step, however long ago it ran: a weekly or monthly job still shows.
+-- The latest step per object: an ownership refusal, or a job's last step from before run
+-- outcomes moved to the system tables. v_job_status is the current run status.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_run_current AS
 SELECT
   run_id,
@@ -259,6 +277,19 @@ SELECT
   recorded_at,
   event_date
 FROM ${catalog}.framework_meta.run_ledger;
+
+-- Each definition registry_sync refused because another owner holds the name.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_refusals AS
+SELECT
+  object_kind,
+  full_name,
+  owner_kind AS refused_owner_kind,
+  owner AS refused_owner,
+  failure_reason,
+  recorded_at,
+  event_date
+FROM ${catalog}.framework_meta.run_ledger
+WHERE step_name = 'ownership_check' AND status = 'FAILED';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_lineage AS
 SELECT
@@ -449,8 +480,8 @@ WHERE object_kind = 'flow'
   AND config:layer::STRING = 'bronze';
 
 -- Declared tags and column comments that Unity Catalog does not hold, or holds differently.
--- Empty when every apply_metadata task has run since the last spec change. Only tables that
--- exist are compared, and only the tags this framework sets.
+-- Empty once registry_sync has run after the tables exist. Only tables that exist are
+-- compared, and only the tags this framework sets.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_metadata_drift AS
 WITH existing AS (
   SELECT lower(concat_ws('.', table_catalog, table_schema, table_name)) AS table_name

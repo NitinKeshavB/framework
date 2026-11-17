@@ -93,6 +93,7 @@ Query `<catalog>.framework_meta`:
 | `v_job_status` | Each job with its latest run from the system tables: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` |
 | `v_run_current`, `v_process` | Ownership refusals, and job steps from before runs moved to the system tables |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
+| `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
 | `table_load_metrics` | Rows written, upserted, deleted, and dropped, expectation counts, backlog, and duration per pipeline update, flow, and table |
 | `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run state, termination code, durations, and list cost from the system tables |
 | `table_health` | Daily file count, size, and last load commit of each bronze table |

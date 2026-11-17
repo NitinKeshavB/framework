@@ -500,7 +500,14 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
         line.split("(", 1)[1].rstrip(")") for line in text.splitlines() if "CLUSTER BY (" in line
     ]
     assert keys and all(len(key.split(",")) <= 3 for key in keys)
-    assert "'delta.autoOptimize.autoCompact' = 'false'" in text
+    assert "'delta.autoOptimize.autoCompact' = 'false'" not in text
+    for table in ("object_registry", "object_current", "run_ledger", "run_current"):
+        assert (
+            f"ALTER TABLE framework_dev.framework_meta.{table}\n"
+            "SET TBLPROPERTIES ('delta.autoOptimize.autoCompact' = 'true')"
+        ) in text
+    assert "VIEW framework_dev.framework_meta.v_ownership_refusals" in text
+    assert "step_name = 'ownership_check' AND status = 'FAILED'" in text
     assert "v_ownership_conflicts" in text
     assert "project" not in text.replace("project for silver", "")
     assert "${catalog}" not in text

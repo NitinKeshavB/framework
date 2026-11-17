@@ -11,6 +11,7 @@ The registry DDL in `framework_bundle/sql/framework_meta.sql` runs on every `fra
 - A new column is `ALTER TABLE ... ADD COLUMNS`. The DDL task skips that statement when the column is already there.
 - A new clustering key is `ALTER TABLE ... CLUSTER BY`, at most three keys.
 - A backfill is an `UPDATE` whose `WHERE` matches only rows still missing the value, as `config` is filled on `object_current`. Never `UPDATE` the history tables.
+- A table property change is `ALTER TABLE ... SET TBLPROPERTIES`, as `autoCompact` is turned on.
 - A retired view is `DROP VIEW IF EXISTS`.
 
 The DDL task splits the file on `;`, so a SQL comment in it, or in `system_views.sql`, must not contain a semicolon. A test enforces this. The system-table views are in `system_views.sql` and their own `framework_system_views` job, because they need `SELECT` on `system.lakeflow`, `system.billing`, and `system.access`. Deploy only warns if that job fails.
