@@ -381,7 +381,7 @@ OWNED_KINDS = (
     "streaming_table",
     "materialized_view",
 )
-# Validity columns object_registry stores for each version. registry_sync sets them.
+# Validity columns asset_registry stores for each version. registry_sync sets them.
 SCD_COLUMNS = ("valid_from", "valid_to", "is_current", "is_deleted")
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -465,7 +465,7 @@ def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
         "started_at": payload.get("started_at"),
         "ended_at": payload.get("ended_at"),
         "failure_reason": payload.get("failure_reason"),
-        # Rows recorded before load counts moved to table_load_metrics can carry this.
+        # Rows recorded before load counts moved to load_ledger can carry this.
         "recon_json": payload.get("recon_json"),
         "recorded_at": recorded,
         "event_date": recorded[:10],
@@ -492,7 +492,7 @@ def ingest_steps(
 
 
 def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
-    """Current hash for each object. object_current has one row, so this is a point lookup."""
+    """Current hash for each object. asset_registry_current has one row, so this is a point lookup."""
 
     _require_catalog(catalog)
     names, kinds, owners = _object_keys(rows)
@@ -501,7 +501,7 @@ def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
         raise ValueError("owner is required")
     return (
         "SELECT object_kind, full_name, content_hash "
-        f"FROM {catalog}.framework_meta.object_current "
+        f"FROM {catalog}.framework_meta.asset_registry_current "
         f"WHERE owner_kind IN ({_sql_in(owner_kinds)}) AND owner IN ({_sql_in(owners)}) "
         f"AND object_kind IN ({_sql_in(kinds)}) "
         f"AND full_name IN ({_sql_in(names)})"
@@ -517,7 +517,7 @@ def owners_sql(catalog: str, full_names: list[str]) -> str:
         raise ValueError("full name is required")
     return (
         f"SELECT object_kind, full_name, owner_kind, owner "
-        f"FROM {catalog}.framework_meta.v_object_current "
+        f"FROM {catalog}.framework_meta.v_asset_registry_current "
         f"WHERE object_kind IN ({_sql_in(OWNED_KINDS)}) "
         f"AND full_name IN ({_sql_in(names)})"
     )

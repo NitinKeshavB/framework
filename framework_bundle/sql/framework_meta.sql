@@ -3,16 +3,16 @@
 -- registry_sync is the only writer of definitions. It runs at deploy, so these tables change
 -- once per deploy, not once per job run.
 --
--- object_registry is SCD Type 2. Each version has valid_from, valid_to, and is_current. A
+-- asset_registry is SCD Type 2. Each version has valid_from, valid_to, and is_current. A
 -- changed definition closes its current version and adds a new one. A definition removed
 -- from the bundle closes its current version and adds a deletion version (is_deleted true)
 -- that stays current until the definition comes back. Nothing in it is updated except
 -- valid_to and is_current, and nothing is deleted. run_ledger and table_health are events
--- and stay insert-only. object_current and run_current hold one row per key
--- so a lookup does not window the history. job_runs, job_task_runs, and pipeline_updates are written hourly by
--- framework_runs from the Jobs API and the pipeline event logs, merged on their run or update
--- key, so a run that was still going is updated when it ends. They need no system table
--- grants. Per-load row counts for every layer are in load_ledger (appended by each job). Cost is in system_views.sql.
+-- and stay insert-only. asset_registry_current and run_current hold one row per key
+-- so a lookup does not window the history. Delivery jobs append load_ledger (record_load_metrics)
+-- and merge job_runs NRT (record_this_run). Hourly framework_runs is catch-up for job_runs /
+-- job_task_runs / pipeline_updates from the Jobs API and event logs (no system table grants).
+-- Cost views live in system_views.sql.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
@@ -28,7 +28,7 @@
 
 CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_meta;
 
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_registry (
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry (
   object_kind STRING,
   full_name STRING,
   owner_kind STRING,
@@ -80,7 +80,7 @@ TBLPROPERTIES (
 );
 
 -- One row per object. Lookups and dashboards read this, not the history window.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.object_current (
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry_current (
   object_kind STRING,
   full_name STRING,
   owner_kind STRING,
@@ -371,27 +371,6 @@ TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true'
 );
 
--- Daily rollup for 90-day dashboards (day x job x layer x dataflow x target_table).
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_daily_rollup (
-  load_date DATE,
-  job_name STRING,
-  layer STRING,
-  dataflow STRING,
-  target_table STRING,
-  loads BIGINT,
-  rows_read BIGINT,
-  rows_written BIGINT,
-  rows_quarantine BIGINT,
-  rows_processed BIGINT,
-  failed_loads BIGINT,
-  recorded_at TIMESTAMP
-)
-CLUSTER BY (load_date, job_name, layer)
-TBLPROPERTIES (
-  'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'true'
-);
-
 -- One row per SQL file version apply_ddl has applied, by the hash of its statements. A deploy
 -- whose SQL is already here skips the DDL. Delete the rows to make the next run apply it all.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
@@ -399,7 +378,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
   applied_at TIMESTAMP
 );
 
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_current AS
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_asset_registry_current AS
 SELECT
   object_kind,
   full_name,
@@ -414,46 +393,7 @@ SELECT
   content_hash,
   source,
   recorded_at
-FROM ${catalog}.framework_meta.object_current;
-
--- Deprecated passthrough of run_current. Prefer v_ownership_refusals for refusals and
--- v_job_status for delivery outcomes. Kept for one release.
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_run_current AS
-SELECT
-  run_id,
-  parent_run_id,
-  object_kind,
-  full_name,
-  owner_kind,
-  owner,
-  step_no,
-  step_name,
-  status,
-  started_at,
-  ended_at,
-  failure_reason,
-  recorded_at,
-  event_date
-FROM ${catalog}.framework_meta.run_current;
-
--- Deprecated passthrough of run_ledger. Prefer run_ledger or v_ownership_refusals.
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_process AS
-SELECT
-  run_id,
-  parent_run_id,
-  object_kind,
-  full_name,
-  owner_kind,
-  owner,
-  step_no,
-  step_name,
-  status,
-  started_at,
-  ended_at,
-  failure_reason,
-  recorded_at,
-  event_date
-FROM ${catalog}.framework_meta.run_ledger;
+FROM ${catalog}.framework_meta.asset_registry_current;
 
 -- Each definition registry_sync refused because another owner holds the name.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_refusals AS
@@ -480,7 +420,7 @@ SELECT
   content_hash,
   source,
   recorded_at
-FROM ${catalog}.framework_meta.object_current
+FROM ${catalog}.framework_meta.asset_registry_current
 WHERE object_kind = 'link';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_workflows AS
@@ -498,7 +438,7 @@ SELECT
   config:delivery_detail.trigger::STRING AS delivery_trigger,
   content_hash,
   recorded_at
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'workflow';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_pipelines AS
@@ -515,7 +455,7 @@ SELECT
   config:config.technical_owner::STRING AS technical_owner,
   config:config.notify.on_failure AS failure_mail,
   config:config.notify.on_success AS success_mail
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'pipeline';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_dataflows AS
@@ -530,7 +470,7 @@ SELECT
   config:bronze AS bronze,
   config:quarantine AS quarantine,
   recorded_at
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'dataflow';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_flows AS
@@ -546,7 +486,7 @@ SELECT
   config:path::STRING AS path,
   config:table::STRING AS table_name,
   recorded_at
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'flow';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_tables AS
@@ -567,11 +507,11 @@ SELECT
   config:pipeline_id::STRING AS pipeline_id,
   config:job_name::STRING AS job_name,
   config:load_method::STRING AS load_method
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
 
 -- A table has one current owner. This view is empty when that holds. A row here means
--- object_current was written by hand with two rows for the same name.
+-- asset_registry_current was written by hand with two rows for the same name.
 -- The owners are made distinct first. Photon fails to compile a distinct count in HAVING
 -- next to collect_set over the same expression.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_conflicts AS
@@ -580,7 +520,7 @@ WITH holders AS (
     object_kind,
     full_name,
     concat(owner_kind, ':', owner) AS holder
-  FROM ${catalog}.framework_meta.object_current
+  FROM ${catalog}.framework_meta.asset_registry_current
   WHERE object_kind IN ('pipeline', 'table', 'streaming_table', 'materialized_view')
 )
 SELECT
@@ -594,7 +534,7 @@ HAVING count(*) > 1;
 -- Every version of every object. A version was active during [valid_from, valid_to). A
 -- null valid_to is still active. A deletion version (is_deleted) says the definition was
 -- removed from its bundle at valid_from.
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_object_history AS
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_asset_registry_history AS
 SELECT
   object_kind,
   full_name,
@@ -612,7 +552,7 @@ SELECT
   valid_to,
   is_current,
   is_deleted
-FROM ${catalog}.framework_meta.object_registry;
+FROM ${catalog}.framework_meta.asset_registry;
 
 -- Each source system as its source.yaml declares it.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_source_systems AS
@@ -628,7 +568,7 @@ SELECT
   config:requested_by::ARRAY<STRING> AS requesters,
   content_hash,
   recorded_at
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'source_system';
 
 -- Each schema a source system reads or writes, with the tags registry_sync sets on it.
@@ -641,7 +581,7 @@ SELECT
   config:tags AS tags,
   content_hash,
   recorded_at
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'schema';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_columns AS
@@ -656,7 +596,7 @@ SELECT
   config:classification::STRING AS classification,
   config:pii::STRING AS pii,
   recorded_at
-FROM ${catalog}.framework_meta.v_object_current
+FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'column';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_column_history AS
@@ -674,7 +614,7 @@ SELECT
   valid_from,
   valid_to,
   is_current
-FROM ${catalog}.framework_meta.v_object_history
+FROM ${catalog}.framework_meta.v_asset_registry_history
 WHERE object_kind = 'column';
 
 -- Bronze tables, for the daily table health step.
@@ -683,7 +623,7 @@ SELECT DISTINCT
   config:table::STRING AS table_name,
   owner_kind,
   owner
-FROM ${catalog}.framework_meta.object_current
+FROM ${catalog}.framework_meta.asset_registry_current
 WHERE object_kind = 'flow'
   AND config:layer::STRING = 'bronze';
 
@@ -702,7 +642,7 @@ existing_schemas AS (
 ),
 declared_schemas AS (
   SELECT lower(full_name) AS schema_name, owner_kind, owner, item, nullif(declared, '') AS declared
-  FROM ${catalog}.framework_meta.object_current
+  FROM ${catalog}.framework_meta.asset_registry_current
   LATERAL VIEW explode(map(
     'domain', config:tags.domain::STRING,
     'owner', config:tags.owner::STRING,
@@ -726,7 +666,7 @@ applied_schemas AS (
 ),
 declared_tables AS (
   SELECT lower(full_name) AS table_name, owner_kind, owner, item, nullif(declared, '') AS declared
-  FROM ${catalog}.framework_meta.object_current
+  FROM ${catalog}.framework_meta.asset_registry_current
   LATERAL VIEW explode(map(
     'classification', config:classification::STRING,
     'domain', config:domain::STRING,
@@ -763,7 +703,7 @@ declared_columns AS (
     owner,
     item,
     nullif(declared, '') AS declared
-  FROM ${catalog}.framework_meta.object_current
+  FROM ${catalog}.framework_meta.asset_registry_current
   LATERAL VIEW explode(map(
     'classification', config:classification::STRING,
     'pii', config:pii::STRING,
@@ -957,34 +897,6 @@ QUALIFY row_number() OVER (
   PARTITION BY job_name, layer, update_id, dataflow
   ORDER BY recorded_at DESC
 ) = 1;
-
--- Deprecated: use v_loads WHERE layer = 'bronze'. Kept for one release.
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_loads AS
-SELECT
-  job_name,
-  layer,
-  pipeline_id,
-  pipeline_name,
-  update_id,
-  dataflow,
-  owner_kind,
-  owner,
-  target_table AS bronze_table,
-  quarantine_table,
-  started_at,
-  ended_at,
-  duration_seconds,
-  rows_read,
-  rows_written AS rows_bronze,
-  rows_quarantine,
-  rows_processed,
-  target_status AS bronze_status,
-  quarantine_status,
-  expectations,
-  failure_reason,
-  recorded_at
-FROM ${catalog}.framework_meta.v_loads
-WHERE layer = 'bronze';
 
 -- Hot ∪ archive loads for the last 90 days (dashboard window). Archive is forever.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads_90d AS

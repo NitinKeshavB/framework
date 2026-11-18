@@ -4,7 +4,7 @@
 
 The version in [framework_lff_lib/pyproject.toml](../framework_lff_lib/pyproject.toml) is the wheel version. A minor version may add an optional field to a spec. A major version may rename or remove a required one. Deploy the bundles again after a version change. Each bundle uploads the wheel it just built.
 
-The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `object_registry` row.
+The registry `content_hash` is the config version. It is independent of the wheel version. An unchanged spec does not append a new `asset_registry` row.
 
 The registry DDL in `framework_bundle/sql/framework_meta.sql` runs on a `framework_bundle` deploy whenever the file has changed, so each statement must be safe to run again. Tables are `CREATE ... IF NOT EXISTS` and views `CREATE OR REPLACE VIEW`.
 
@@ -42,14 +42,15 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 
 ## What not to change
 
-- `registry_sync`, which deploy runs, is the only writer of definitions. It calls `append_definitions` in `registry.py`, which inserts `object_registry`, merges `object_current`, and records ownership refusals in `run_ledger` and `run_current`. Delivery jobs do not write the registry and must not wait on it: the pipeline reads its specs from `lff.specs`. Do not `UPDATE` or `DELETE` the history tables. Do not add another writer.
+- `registry_sync`, which deploy runs, is the only writer of definitions. It calls `append_definitions` in `registry.py`, which inserts `asset_registry`, merges `asset_registry_current`, and records ownership refusals in `run_ledger` and `run_current`. Delivery jobs do not write the registry and must not wait on it: the pipeline reads its specs from `lff.specs`. Do not `UPDATE` or `DELETE` the history tables. Do not add another writer.
 - Do not weaken the ownership check. `registry_sync` must keep refusing a pipeline or table another owner holds.
 - Do not put `checkpoint` or `cloudFiles.schemaLocation` back into the Auto Loader options. Lakeflow owns that state for pipelines.
 - Do not schedule a `VACUUM` that shortens retention.
 - Do not create a table or schema in a spec's name from a pipeline. Schemas and volumes are prepared outside the framework.
 - Add a Unity Catalog tag key only by listing it in `SCHEMA_TAGS` or `TABLE_RECORD_TAGS` in `unity.py` and in `v_metadata_drift`. `unity.py` unsets only listed keys, so tags set by others stay.
-- Do not write `object_registry` except through `append_definitions` and `retire_definitions`. They keep exactly one current version per `(object_kind, full_name)`; a plain `INSERT` breaks that.
-- Do not drop the `event_log` block, the `lff.specs` and `lff.catalog` settings, or the `lakeflow_framework_workflow` tag from generated pipelines and jobs. The pipeline, `table_load_metrics`, and the run views depend on them.
+- Do not write `asset_registry` except through `append_definitions` and `retire_definitions`. They keep exactly one current version per `(object_kind, full_name)`; a plain `INSERT` breaks that.
+- Do not drop the `event_log` block, the `lff.specs` and `lff.catalog` settings, or the `lakeflow_framework_workflow` tag from generated pipelines and jobs. The pipeline, `record_load_metrics` / `v_loads`, and the run views depend on them.
+- Do not reintroduce retired meta objects (`v_process`, `v_run_current`, `v_bronze_loads`, `load_daily_rollup`, ops `flow_events` / `table_load_metrics`). See [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).
 
 ## Adding a source kind
 

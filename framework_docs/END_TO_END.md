@@ -28,7 +28,7 @@ Definitions change only when specs change, and specs change only at deploy, so t
 
 1. `bundle:deploy framework_bundle` runs `framework_ddl`, which creates or migrates `framework_meta` and the run tables and views, then `framework_system_views`, which creates the cost and observed lineage views only when the target sets `system_views` to `true`.
 2. `bundle:deploy framework_ingestion` regenerates, uploads the bundle, and runs `registry_sync`. Its one task validates every spec under the target catalog and:
-   - writes each source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column into `object_registry` and `object_current`, and retires what the bundle no longer defines. An unchanged definition is not a new history row. A table or pipeline another owner holds is refused and recorded as a `FAILED` `ownership_check` row in `run_ledger`;
+   - writes each source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column into `asset_registry` and `asset_registry_current`, and retires what the bundle no longer defines. An unchanged definition is not a new history row. A table or pipeline another owner holds is refused and recorded as a `FAILED` `ownership_check` row in `run_ledger`;
    - would set the schema, table, and column tags and column comments in Unity Catalog (see [Unity Catalog tags](#unity-catalog-tags)), but phase 1 parks that step: tag policies on the same keys refuse the deploy identity. Declared tags stay in the registry and in `v_metadata_drift`. Set `APPLY_TAGS` in `unity.py` once the account grants assignment (or drops the policies).
 
 If `registry_sync` fails, the deploy command fails.
@@ -39,7 +39,7 @@ Every framework job task writes timestamped log lines to its run's output: the a
 
 A delivery job runs **refresh_pipeline**, then **record_load_metrics** with `run_if: ALL_DONE` (runs even when the pipeline failed), then **record_this_run** (NRT job status into `job_runs`). Metrics append `rows_read` / `rows_written` / `rows_quarantine` into the central `load_ledger` (`layer = bronze`), or a **FAILED stub** when the event log has no `flow_progress`. Insert only, no MERGE. Use `v_loads` for recon and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint. Hourly `framework_runs` is catch-up. The job does not write definitions to the registry.
 
-The pipeline reads its specs from the deployed bundle. The generated pipeline sets `lff.specs` to the workspace paths of its spec files and `lff.catalog` to the target catalog, and `build_pipelines` validates those files with `validate_configs`. A pipeline id missing from `lff.specs` is an error. A pipeline without `lff.specs` falls back to reading `framework_meta.v_object_current`.
+The pipeline reads its specs from the deployed bundle. The generated pipeline sets `lff.specs` to the workspace paths of its spec files and `lff.catalog` to the target catalog, and `build_pipelines` validates those files with `validate_configs`. A pipeline id missing from `lff.specs` is an error. A pipeline without `lff.specs` falls back to reading `framework_meta.v_asset_registry_current`.
 
 Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log. Each delivery job writes NRT status via `record_this_run`; hourly `framework_runs` is catch-up into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row counts for recon are in `v_loads`. Cost needs the optional system views.
 
@@ -84,11 +84,11 @@ A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine
 
 ## The registry
 
-Four registry tables in `<catalog>.framework_meta`. `object_registry` is SCD Type 2: every version of every definition, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. `run_ledger` holds events and stays insert-only. `object_current` and `run_current` hold one row per key for lookups. `registry_sync` writes them all at deploy, and the deploy fails if it fails, so the deployed configuration is always in the tables. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). The file creates a fresh `framework_meta` and has no `ALTER` statements: until go-live, a table change means dropping the schema and deploying again. See [MAINTAINERS.md](MAINTAINERS.md).
+Four registry tables in `<catalog>.framework_meta`. `asset_registry` is SCD Type 2: every version of every definition, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. `run_ledger` holds events and stays insert-only. `asset_registry_current` and `run_current` hold one row per key for lookups. `registry_sync` writes them all at deploy, and the deploy fails if it fails, so the deployed configuration is always in the tables. The DDL lives in [framework_bundle/sql/framework_meta.sql](../framework_bundle/sql/framework_meta.sql). The file creates a fresh `framework_meta` and has no `ALTER` statements: until go-live, a table change means dropping the schema and deploying again. See [MAINTAINERS.md](MAINTAINERS.md).
 
 `framework_ddl` records the hash of the SQL it applied in `framework_meta.ddl_applied`. A deploy that brings the same SQL finds the hash and stops after that one lookup. A deploy that changes the SQL file runs every statement again; they are all idempotent. To reapply unchanged SQL, for example after a view was dropped by hand, delete the rows from `ddl_applied` or run `apply_ddl.py` with `force` as its third argument. `framework_system_views` uses the same table for its own file.
 
-`object_registry` catalogs every definition the job syncs. Each row keeps the definition as `config_json`, the text its `content_hash` covers, and as `config`, the same document parsed to `VARIANT`; the views read `config:path`.
+`asset_registry` catalogs every definition the job syncs. Each row keeps the definition as `config_json`, the text its `content_hash` covers, and as `config`, the same document parsed to `VARIANT`; the views read `config:path`.
 
 | Kind | What it is |
 | --- | --- |
@@ -110,14 +110,14 @@ Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `o
 
 ### Ownership
 
-A pipeline or table has one owner. Before inserting, `registry_sync` looks up the current owner of each pipeline and table it deploys. If another owner holds it, the row is not inserted and a `FAILED` `ownership_check` step goes to the ledger, with the holder named in `failure_reason`. The other definitions are still written. Flows, links, workflows, dataflows, and columns follow their pipeline or table. `v_ownership_conflicts` lists a name that has two rows in `object_current`; it should be empty. Moving a table to another owner is a deliberate manual change, not something `registry_sync` allows.
+A pipeline or table has one owner. Before inserting, `registry_sync` looks up the current owner of each pipeline and table it deploys. If another owner holds it, the row is not inserted and a `FAILED` `ownership_check` step goes to the ledger, with the holder named in `failure_reason`. The other definitions are still written. Flows, links, workflows, dataflows, and columns follow their pipeline or table. `v_ownership_conflicts` lists a name that has two rows in `asset_registry_current`; it should be empty. Moving a table to another owner is a deliberate manual change, not something `registry_sync` allows.
 
 ### Views
 
 | View | What it answers |
 | --- | --- |
-| `v_object_current` | The current definition for every object, read from `object_current`. This is what the pipeline loads. |
-| `v_object_history` | Every version, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. A point in time is `valid_from <= t AND (valid_to IS NULL OR valid_to > t) AND NOT is_deleted`. |
+| `v_asset_registry_current` | The current definition for every object, read from `asset_registry_current`. This is what the pipeline loads. |
+| `v_asset_registry_history` | Every version, with `valid_from`, `valid_to`, `is_current`, and `is_deleted`. A point in time is `valid_from <= t AND (valid_to IS NULL OR valid_to > t) AND NOT is_deleted`. |
 | `v_source_systems` | Each current source system as its `source.yaml` declares it, with its deliveries. |
 | `v_schemas` | Each schema a source uses, its layers, and the tags set on it. |
 | `v_workflows` | Each delivery job, its pipeline ids, every requester, its source, and its schedule or trigger. |
@@ -127,11 +127,10 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_tables` | Each securable's domain, team, technical owner, classification, PII, layer, pipeline, job, and load method. |
 | `v_columns`, `v_column_history` | Current and past columns of raw, bronze, and quarantine. |
 | `v_lineage` | Latest link per parent, child, and relation. |
-| `v_process` | Every step of every run. |
-| `v_run_current` | Latest ownership refusal per object, and the last step of jobs from before steps moved to the system tables. |
-| `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. Current to within an hour, the `framework_runs` schedule. |
-| `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
 | `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
+| `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. NRT via `record_this_run`; hourly `framework_runs` is catch-up only. |
+| `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
+| `v_loads`, `v_load_failures` | Per-load recon (NRT via `record_load_metrics`) and failure reasons for repair. |
 | `v_bronze_tables` | Every bronze table and its owner. The table health step reads it. |
 | `v_metadata_drift` | Each declared schema, table, or column tag, or column comment, that Unity Catalog (`<catalog>.information_schema`) lacks or holds differently. `securable` says which. Empty once `registry_sync` has run after the schemas and tables exist. |
 
@@ -155,15 +154,14 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
 | `load_ledger`, `v_loads`, `v_loads_90d` | Each job, `record_load_metrics` (`ALL_DONE`) | Central recon SoR: counts and FAILED stubs. `v_loads_90d` unions 7-day hot with forever archive for dashboards |
 | `v_load_failures` | Views over loads + job/task runs | What failed and why (`failure_reason`, task, run page) for repair |
-| `job_runs` (+ `record_this_run`) | Delivery job NRT + hourly `framework_runs` | Status and `failure_reason`; repair resumes failed tasks |
-| `job_runs`, `v_job_runs` | `framework_runs`, hourly, from the Jobs API | Each run of a framework job: status, result state, termination code, trigger, setup, queue, execution, and run seconds, and the run page URL |
-| `job_task_runs`, `v_job_task_runs` | The same | Each task run: task key, status, result state, and termination code |
-| `pipeline_updates`, `v_pipeline_updates` | `framework_runs`, from the `update_progress` events in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
+| `job_runs`, `v_job_runs`, `v_job_status` | Delivery job `record_this_run` (NRT) + hourly `framework_runs` catch-up | Each run: status, result state, termination code, `failure_reason`, durations, run page URL |
+| `job_task_runs`, `v_job_task_runs` | NRT when available + hourly catch-up | Each task run: task key, status, result state, `failure_reason` |
+| `pipeline_updates`, `v_pipeline_updates` | Hourly `framework_runs` from `update_progress` in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
 | `v_job_costs`, `v_pipeline_costs` | `framework_system_views`, only when `system_views` is `true` | DBUs and list cost per job run and per pipeline update, from `system.billing.usage` and `list_prices` |
 | `v_observed_lineage` | `framework_system_views`, only when `system_views` is `true` | What `system.access.table_lineage` saw each bronze and quarantine table read, next to the declared raw source: `declared`, `undeclared`, or `not_observed`. The registry's link and flow rows stay the declared intent. |
 | `table_health` | `framework_optimize`, daily | Each bronze table's file count and size (`DESCRIBE DETAIL`), and its last load commit with its operation metrics (`DESCRIBE HISTORY`, skipping `OPTIMIZE` and `VACUUM`) |
 
-Quality rules are checked on the private staging table; expectation counts on the ledger come from that update's `flow_progress` when present. Legacy `flow_events` / `table_load_metrics` are not written by the ops bundle.
+Quality rules are checked on the private staging table; expectation counts on the ledger come from that update's `flow_progress` when present. Recon SoR is `load_ledger` / `v_loads` (NRT on each delivery job).
 
 Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). `framework_runs` matches a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline update on the name of the event log it is in. It needs no system table grants: the identity that runs it needs `CAN_VIEW` on the delivery jobs, which the deploying identity has. The Jobs API keeps 60 days of runs, and `job_runs` keeps them after that.
 
@@ -195,8 +193,8 @@ targets:
 
 The tables use liquid clustering:
 
-- `object_registry`: `CLUSTER BY (owner, object_kind, full_name)`
-- `object_current`: `CLUSTER BY (owner, object_kind, full_name)`
+- `asset_registry`: `CLUSTER BY (owner, object_kind, full_name)`
+- `asset_registry_current`: `CLUSTER BY (owner, object_kind, full_name)`
 - `run_ledger`: `CLUSTER BY (owner, event_date, run_id)`
 - `run_current`: `CLUSTER BY (owner, object_kind, full_name)`
 - `table_health`: `CLUSTER BY (owner, event_date, table_name)`
@@ -205,15 +203,15 @@ Each table clusters on at most three keys.
 
 All set `delta.autoOptimize.optimizeWrite`, and the registry tables also set `autoCompact`: they are written once per deploy, so compacting after that commit is cheap. Predictive optimization, once the catalog owner enables it, also compacts these tables in the background. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
-`v_object_history` reads `valid_from` and `valid_to` from `object_registry`, so a filter on `owner` or on the dates prunes files directly. `object_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
+`v_asset_registry_history` reads `valid_from` and `valid_to` from `asset_registry`, so a filter on `owner` or on the dates prunes files directly. `asset_registry_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
 
-`registry_sync` writes a version when `object_current` has no row or a different hash. One `MERGE` closes the current version (`valid_to`, `is_current = false`) and inserts the new one; then the object's row in `object_current` is replaced. A retried deploy finds the same hash current and writes nothing to the history. A definition the bundle no longer deploys is retired: its version is closed, a deletion version (`is_deleted = true`) becomes current, and it leaves `object_current`. Retirement covers every `source_system`-owned object in the catalog, so only `framework_ingestion` may register source systems there; a deploy with no definitions retires nothing. Deploys of one bundle run one at a time, so the last deploy wins. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
+`registry_sync` writes a version when `asset_registry_current` has no row or a different hash. One `MERGE` closes the current version (`valid_to`, `is_current = false`) and inserts the new one; then the object's row in `asset_registry_current` is replaced. A retried deploy finds the same hash current and writes nothing to the history. A definition the bundle no longer deploys is retired: its version is closed, a deletion version (`is_deleted = true`) becomes current, and it leaves `asset_registry_current`. Retirement covers every `source_system`-owned object in the catalog, so only `framework_ingestion` may register source systems there; a deploy with no definitions retires nothing. Deploys of one bundle run one at a time, so the last deploy wins. A run joins the definition that was active on `owner`, `object_kind`, and `full_name`, with `started_at` inside `[valid_from, valid_to)`. `event_date` bounds `run_ledger`.
 
 To see the registry as it was at a moment:
 
 ```sql
 SELECT object_kind, full_name, config, valid_from, valid_to
-FROM framework_meta.v_object_history
+FROM framework_meta.v_asset_registry_history
 WHERE owner = 'billing'
   AND valid_from <= TIMESTAMP '2026-11-08 00:00:00'
   AND (valid_to IS NULL OR valid_to > TIMESTAMP '2026-11-08 00:00:00')
@@ -249,14 +247,14 @@ None of the following has run on Databricks. The code assumes them:
 - `DESCRIBE DETAIL` `numRecords` on streaming tables and materialized views.
 - Reading `${workspace.file_path}` spec files from a serverless pipeline, and `spark.conf.get` of `lff.specs` inside it.
 - Workspace concurrency if many pipelines run together.
-- `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names `table_load_metrics` reads.
+- `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names `record_load_metrics` / `v_loads` read.
 - `databricks-sdk` on serverless environment version 4 without listing it as a dependency, `WorkspaceClient()` with the job's own credentials, and `jobs.list` returning `settings.tags` without `expand_tasks`.
 - The Jobs API run fields `framework_runs` reads: `state.life_cycle_state` and `result_state`, `status.termination_details.code`, `setup_duration`, `queue_duration`, `execution_duration`, and `run_duration`.
 - `details:update_progress.state` on the published event log, and `dlt_update_id` in `usage_metadata` for the optional cost view.
 - A condition task with a bundle variable as its left operand, and a job whose only other task is excluded finishing as succeeded.
 - `ALTER STREAMING TABLE` and `ALTER MATERIALIZED VIEW` with `SET TAGS`, `UNSET TAGS`, and `ALTER COLUMN ... COMMENT` on pipeline-owned tables, and whether a later pipeline update keeps column comments it does not define.
 - `ALTER SCHEMA ... SET TAGS` and `UNSET TAGS`, and `information_schema.schemata` and `schema_tags`, run as the deploy identity.
-- The SCD Type 2 `MERGE` with a `UNION ALL` source and a null merge key, `LEFT ANTI JOIN` against a temporary view inside `MERGE`, and `DELETE ... WHERE NOT EXISTS` on `object_current`. The statements parse and behave as intended on DuckDB, not yet on Databricks.
+- The SCD Type 2 `MERGE` with a `UNION ALL` source and a null merge key, `LEFT ANTI JOIN` against a temporary view inside `MERGE`, and `DELETE ... WHERE NOT EXISTS` on `asset_registry_current`. The statements parse and behave as intended on DuckDB, not yet on Databricks.
 
 If one fails, record the observed syntax here and change the single strategy or DDL statement. Do not spread a workaround across the bundles.
 

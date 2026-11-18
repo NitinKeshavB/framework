@@ -140,8 +140,8 @@ SELECT
   CAST(NULL AS STRING) AS quarantine_status,
   CAST(NULL AS STRING) AS expectations,
   CAST('{_FAILED_REASON}' AS STRING) AS failure_reason
-FROM {meta}.object_current d
-JOIN {meta}.object_current p
+FROM {meta}.asset_registry_current d
+JOIN {meta}.asset_registry_current p
   ON p.object_kind = 'pipeline' AND p.full_name = d.parent_full_name
 WHERE d.object_kind = 'dataflow'
   AND p.parent_full_name = '{job_name}'
@@ -205,7 +205,7 @@ flows AS (
     max(parent_full_name) AS dataflow,
     max(owner_kind) AS owner_kind,
     max(owner) AS owner
-  FROM {meta}.object_current
+  FROM {meta}.asset_registry_current
   WHERE object_kind = 'flow' AND config:table IS NOT NULL
   GROUP BY lower(config:table::STRING)
 ),

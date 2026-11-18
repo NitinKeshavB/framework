@@ -127,7 +127,7 @@ flows AS (
     lower(config:table::STRING) AS table_name,
     max(config:layer::STRING) AS layer,
     max(parent_full_name) AS dataflow
-  FROM {meta}.object_current
+  FROM {meta}.asset_registry_current
   WHERE object_kind = 'flow' AND config:table IS NOT NULL
   GROUP BY lower(config:table::STRING)
 ),
@@ -175,7 +175,7 @@ LEFT JOIN expectations e
  AND e.pipeline_id = r.pipeline_id
  AND e.update_id = r.update_id
  AND e.flow_name = r.flow_name
-LEFT JOIN {meta}.object_current d
+LEFT JOIN {meta}.asset_registry_current d
   ON d.object_kind = 'dataflow' AND d.full_name = r.dataflow
 """
 

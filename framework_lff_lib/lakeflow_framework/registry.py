@@ -156,11 +156,13 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
     for row in fresh:
         change = "changed" if (row["object_kind"], row["full_name"]) in current else "new"
         log.info("definition %s %s: %s", row["object_kind"], row["full_name"], change)
-    written = _scd2_merge(spark, _table(catalog, "object_registry"), fresh)
-    log.info("definitions: wrote %d version(s) to object_registry and object_current", written)
+    written = _scd2_merge(spark, _table(catalog, "asset_registry"), fresh)
+    log.info(
+        "definitions: wrote %d version(s) to asset_registry and asset_registry_current", written
+    )
     _merge_current(
         spark,
-        _table(catalog, "object_current"),
+        _table(catalog, "asset_registry_current"),
         fresh,
         OBJECT_COLUMNS,
         OBJECT_KEYS,
@@ -181,7 +183,7 @@ def retire_definitions(
     """Close every current version of ``owner_kind`` that this deploy no longer defines.
 
     Each retired object gets a deletion version (``is_deleted = true``) and leaves
-    object_current, so its name is free and v_object_current no longer lists it. A deploy with
+    asset_registry_current, so its name is free and v_asset_registry_current no longer lists it. A deploy with
     no definitions retires nothing: an empty bundle is a mistake, not a removal.
     """
 
@@ -199,7 +201,7 @@ def retire_definitions(
     spark.createDataFrame(rows, schema).createOrReplaceTempView("_framework_deployed")
     gone = _rows(
         spark.sql(
-            f"SELECT c.object_kind, c.full_name FROM {_table(catalog, 'object_current')} c "
+            f"SELECT c.object_kind, c.full_name FROM {_table(catalog, 'asset_registry_current')} c "
             "LEFT ANTI JOIN _framework_deployed d "
             "ON d.object_kind = c.object_kind AND d.full_name = c.full_name "
             f"WHERE c.owner_kind = '{owner_kind}' ORDER BY c.object_kind, c.full_name"
@@ -254,8 +256,8 @@ def retire_statements(catalog: str, deployed: str, owner_kind: str) -> list[str]
 
     if not re.fullmatch(r"[A-Za-z0-9_-]+", catalog or ""):
         raise ValueError("catalog is required")
-    registry = _table(catalog, "object_registry")
-    current = _table(catalog, "object_current")
+    registry = _table(catalog, "asset_registry")
+    current = _table(catalog, "asset_registry_current")
     gone = (
         f"SELECT r.* FROM {registry} r "
         f"LEFT ANTI JOIN {deployed} d ON d.object_kind = r.object_kind AND d.full_name = r.full_name "

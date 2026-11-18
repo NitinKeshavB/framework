@@ -105,7 +105,7 @@ WITH dataflows AS (
     lower(regexp_replace(config:raw::STRING, '/+$', '')) AS declared_source,
     lower(config:bronze::STRING) AS bronze,
     lower(config:quarantine::STRING) AS quarantine
-  FROM ${catalog}.framework_meta.object_current
+  FROM ${catalog}.framework_meta.asset_registry_current
   WHERE object_kind = 'dataflow'
 ),
 targets AS (

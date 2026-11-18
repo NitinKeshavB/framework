@@ -482,13 +482,13 @@ def test_current_lookup_prunes_by_owner_kind_and_name():
             }
         ],
     )
-    assert "FROM framework_dev.framework_meta.object_current" in statement
+    assert "FROM framework_dev.framework_meta.asset_registry_current" in statement
     assert "owner_kind IN ('source_system')" in statement
     assert "owner IN ('billing')" in statement
     assert "object_kind IN ('column')" in statement
     assert "full_name IN ('framework_dev.billing_bronze.invoices.amount')" in statement
     assert "QUALIFY" not in statement
-    assert "v_object_current" not in statement
+    assert "v_asset_registry_current" not in statement
 
 
 def test_ddl_clusters_both_tables_and_names_the_catalog():
@@ -515,23 +515,23 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "system.lakeflow" not in text
     assert "framework_events" not in text
     assert "v_tables" in text
-    assert "v_object_history" in text
-    assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.object_current" in text
+    assert "v_asset_registry_history" in text
+    assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.asset_registry_current" in text
     assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.run_current" in text
-    current_view = next(statement for statement in statements if "v_object_current" in statement)
-    assert "object_current" in current_view
+    current_view = next(
+        statement for statement in statements if "v_asset_registry_current" in statement
+    )
+    assert "asset_registry_current" in current_view
     assert "QUALIFY" not in current_view
     assert "v_recon" not in text
-    run_current = next(
-        statement
-        for statement in statements
-        if "VIEW" in statement and "v_run_current AS" in statement
-    )
-    assert "date_sub" not in run_current
+    assert "v_run_current" not in text
+    assert "v_process" not in text
+    assert "v_bronze_loads" not in text
+    assert "load_daily_rollup" not in text
     assert "get_json_object" not in text
     assert "config:pipeline_ids::ARRAY<STRING>" in text
     assert "framework_meta.table_health" in text
-    history = text.split("v_object_history", 1)[1]
+    history = text.split("v_asset_registry_history", 1)[1]
     assert "is_deleted" in history.split(";")[0] and "LEAD(" not in history.split(";")[0]
     assert "CREATE BLOOMFILTER INDEX" not in text
     assert "v_columns" in text
@@ -541,7 +541,7 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "is_current" in text
     # A fresh schema only: tables and views, and no statement that changes rows.
     assert {statement.split()[0].upper() for statement in statements} == {"CREATE"}
-    assert _column_list(text, "object_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
+    assert _column_list(text, "asset_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
     assert _column_list(text, "run_ledger") == list(LEDGER_COLUMNS)
 
 
@@ -836,7 +836,7 @@ def test_a_name_held_by_another_owner_is_refused_and_the_same_owner_may_update()
 
 def test_owner_lookup_is_limited_to_owned_kinds_and_safe_names():
     sql = owners_sql("framework_dev", ["framework_dev.billing_bronze.invoices", "x' OR '1'='1"])
-    assert "framework_dev.framework_meta.v_object_current" in sql
+    assert "framework_dev.framework_meta.v_asset_registry_current" in sql
     assert "x' OR" not in sql
     assert "'column'" not in sql
     with pytest.raises(ValueError):
@@ -861,7 +861,10 @@ def test_collector_records_a_failed_check_instead_of_writing_another_owners_tabl
 
     class Spark:
         def sql(self, statement):
-            if "v_object_current" in statement and "owner_kind" in statement.split("FROM")[0]:
+            if (
+                "v_asset_registry_current" in statement
+                and "owner_kind" in statement.split("FROM")[0]
+            ):
                 return Frame(
                     [
                         {
@@ -884,7 +887,7 @@ def test_collector_records_a_failed_check_instead_of_writing_another_owners_tabl
         full_name="framework_dev.erp_bronze.orders", owner="erp", content_hash="e" * 64
     )
     assert append_definitions(Spark(), [taken, fine], set(), "framework_dev") == 1
-    registry = written["framework_dev.framework_meta.object_registry"]
+    registry = written["framework_dev.framework_meta.asset_registry"]
     assert [row["full_name"] for row in registry] == ["framework_dev.erp_bronze.orders"]
     (step,) = written["framework_dev.framework_meta.run_ledger"]
     assert step["step_name"] == "ownership_check" and step["status"] == "FAILED"
@@ -983,9 +986,9 @@ def test_step_lookup_prunes_by_owner_and_event_date():
 def test_one_merge_closes_the_changed_version_and_inserts_the_new_one():
     from lakeflow_framework.registry import scd2_merge_sql
 
-    sql = scd2_merge_sql("c.framework_meta.object_registry", "SELECT * FROM staged")
-    assert sql.startswith("MERGE INTO c.framework_meta.object_registry t")
-    # A retry after object_current failed finds the same hash current: nothing is closed and
+    sql = scd2_merge_sql("c.framework_meta.asset_registry", "SELECT * FROM staged")
+    assert sql.startswith("MERGE INTO c.framework_meta.asset_registry t")
+    # A retry after asset_registry_current failed finds the same hash current: nothing is closed and
     # nothing is inserted, so history gets no second row.
     assert "WHERE r.content_hash <> s.content_hash OR coalesce(r.is_deleted, false)" in sql
     assert "WHEN MATCHED AND (t.content_hash <> u.content_hash" in sql
@@ -995,7 +998,7 @@ def test_one_merge_closes_the_changed_version_and_inserts_the_new_one():
     assert "QUALIFY row_number()" in sql
 
 
-def test_a_removed_definition_gets_a_deletion_version_and_leaves_object_current():
+def test_a_removed_definition_gets_a_deletion_version_and_leaves_asset_registry_current():
     from lakeflow_framework.registry import retire_definitions, retire_statements
 
     close, delete = retire_statements("c", "_deployed", "source_system")
@@ -1003,7 +1006,7 @@ def test_a_removed_definition_gets_a_deletion_version_and_leaves_object_current(
     assert "r.owner_kind = 'source_system'" in close
     assert "NOT coalesce(r.is_deleted, false)" in close
     assert "u.recorded_at, NULL, true, true)" in close
-    assert delete.startswith("DELETE FROM c.framework_meta.object_current c")
+    assert delete.startswith("DELETE FROM c.framework_meta.asset_registry_current c")
     assert "c.owner_kind = 'source_system'" in delete
     with pytest.raises(ValueError, match="no definitions"):
         retire_definitions(object(), [], "c")

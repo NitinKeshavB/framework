@@ -8,7 +8,7 @@ The repository overview is [../README.md](../README.md). This page is every file
 | `<source_system>_<table>.yaml` | The project bringing it in, or the source itself | `sources/<source_system>/<project>/`, or next to `source.yaml` when there is no project |
 | `project.yaml` | The project | `framework_curation/<domain>/<project>/` |
 
-Check them without a cluster: `./run.sh generate` for ingestion, `./run.sh projects:generate` for curation. Both print every error in one pass. Job runs, statuses, and definition metadata live in `framework_meta`; the views are listed in the [root README](../README.md#see-what-is-running).
+Check them without a cluster: `./run.sh generate` for ingestion, `./run.sh projects:generate` for curation. Both print every error in one pass. Job runs, statuses, and definition metadata live in frozen `framework_meta` (see [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md)); the views are listed in the [root README](../README.md#see-what-is-running).
 
 ## source.yaml
 
@@ -190,4 +190,4 @@ Quarantine carries `failed_rules`, the names of the rules that failed. Rows that
 
 ## Operations
 
-The views are listed in the [root README](../README.md#see-what-is-running). The full run path is in [END_TO_END.md](END_TO_END.md).
+The views are listed in the [root README](../README.md#see-what-is-running). The full run path is in [END_TO_END.md](END_TO_END.md). The frozen metadata schema (NRT vs hourly catch-up, removed objects) is in [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).

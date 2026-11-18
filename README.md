@@ -13,7 +13,7 @@ source system ──delivery──▶ bronze ──▶ silver / gold / product
 | Folder | Role | Owner |
 | --- | --- | --- |
 | `framework_lff_lib` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
-| `framework_bundle` | The deployed framework: the wheel, the `framework_meta` registry DDL, the `framework_metrics` pipeline, and daily `OPTIMIZE` and table health | Platform team |
+| `framework_bundle` | The deployed framework: the wheel, frozen `framework_meta` DDL, hourly `framework_runs` catch-up, and daily `OPTIMIZE` / archive / table health | Platform team |
 | `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
 | `framework_curation` | One bundle per project for silver, gold, and data products, with ownership checks and maps | One project each |
 | `framework_examples/ingestion` | Specs for each ingestion kind: a raw volume, SharePoint, a database, and cloud files | None |
@@ -81,22 +81,21 @@ Query `<catalog>.framework_meta`:
 
 | View | What it answers |
 | --- | --- |
-| `v_object_current` | Current definitions for every object kind, with owner |
+| `v_asset_registry_current` | Current definitions for every object kind, with owner |
 | `v_workflows` | Each delivery job, its pipeline ids, and every requester |
 | `v_pipelines` | Source system, requesting team, delivery, domain, data domain, team, owner, and who is mailed |
 | `v_dataflows` | Raw path or table, bronze, and quarantine for each table load |
 | `v_flows` | Raw, bronze, and quarantine flows, with relation and path or table |
 | `v_tables` | Owner, requester, classification, and PII on each table |
-| `v_object_history` | Every version of a source system, schema, workflow, pipeline, flow, table, link, or column, with `valid_from`, `valid_to`, `is_current`, and `is_deleted` (SCD Type 2). Filter it to see the system at a moment. |
+| `v_asset_registry_history` | Every version of a source system, schema, workflow, pipeline, flow, table, link, or column, with `valid_from`, `valid_to`, `is_current`, and `is_deleted` (SCD Type 2). Filter it to see the system at a moment. |
 | `v_source_systems`, `v_schemas` | Each source system as `source.yaml` declares it, and the schemas it uses with their tags. |
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
-| `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, current to within an hour |
-| `v_run_current`, `v_process` | Ownership refusals, and job steps from before delivery jobs stopped writing them |
+| `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` (NRT via `record_this_run`; hourly `framework_runs` is catch-up only) |
+| `v_loads`, `v_load_failures` | Per-load recon and failures (NRT via `record_load_metrics` on every delivery job) |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 | `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
-| `table_load_metrics` | Rows written, upserted, deleted, and dropped, expectation counts, backlog, and duration per pipeline update, flow, and table |
-| `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations, from the Jobs API and the event logs |
+| `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations (NRT + hourly catch-up) |
 | `v_job_costs`, `v_pipeline_costs` | DBUs and list cost per run and update. Only when `system_views` is `true` |
 | `table_health` | Daily file count, size, and last load commit of each bronze table |
 | `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
@@ -134,5 +133,6 @@ source venv/bin/activate        # or set PYTHON to a venv's python
 - [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, `project.yaml`
 - [framework_docs/END_TO_END.md](framework_docs/END_TO_END.md) for the run path, quality rules, and the registry
 - [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the flows, the data model of every table the framework writes, the module boundaries, and the design choices
+- [framework_docs/META_MODEL_REVIEW.md](framework_docs/META_MODEL_REVIEW.md) for the frozen `framework_meta` schema, NRT vs hourly `framework_runs`, and removed objects
 - [framework_docs/MAINTAINERS.md](framework_docs/MAINTAINERS.md) for versioning, deploy, and what not to change
 - [framework_docs/ROADMAP.md](framework_docs/ROADMAP.md) for what is built, phase 1, and what is not verified

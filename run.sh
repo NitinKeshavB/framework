@@ -8,7 +8,16 @@ set -euo pipefail
 
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 PKG_DIR="$THIS_DIR/framework_lff_lib"
-PYTHON="${PYTHON:-python3}"
+# Prefer the repo venv when PYTHON is unset, so ./run.sh generate works without activate.
+if [ -z "${PYTHON:-}" ]; then
+    if [ -x "$THIS_DIR/venv/bin/python" ]; then
+        PYTHON="$THIS_DIR/venv/bin/python"
+    elif [ -x "$THIS_DIR/.venv/bin/python" ]; then
+        PYTHON="$THIS_DIR/.venv/bin/python"
+    else
+        PYTHON="python3"
+    fi
+fi
 
 
 ##########################
@@ -19,6 +28,16 @@ PYTHON="${PYTHON:-python3}"
 function install {
     "$PYTHON" -m pip install --upgrade pip
     "$PYTHON" -m pip install --editable "$PKG_DIR[dev]"
+}
+
+# fail fast with a clear fix when the editable package is missing from PYTHON
+function _require-package {
+    if ! "$PYTHON" -c "import lakeflow_framework" >/dev/null 2>&1; then
+        echo "No module named 'lakeflow_framework' for: $PYTHON" >&2
+        echo "Fix: source venv/bin/activate && ./run.sh install" >&2
+        echo "Or:  PYTHON=$THIS_DIR/venv/bin/python ./run.sh install" >&2
+        exit 1
+    fi
 }
 
 # run all pre-commit hooks (ruff, ruff-format, file hygiene) on every file; hooks may fix files
@@ -51,12 +70,14 @@ function build {
 # validate the source systems and table specs, then regenerate from them:
 # SOURCE_MAP.md, and one pipeline file, pipeline resource, and job per source delivery
 function generate {
+    _require-package
     "$PYTHON" -m lakeflow_framework.cli generate "$THIS_DIR/framework_ingestion"
 }
 
 # create source.yaml for a new source system:
 # ./run.sh new-source <domain> <source_system> <owner-email> [kind] [delivery]
 function new-source {
+    _require-package
     "$PYTHON" -m lakeflow_framework.cli new-source "$THIS_DIR/framework_ingestion" \
         "${1:?usage: ./run.sh new-source <domain> <source_system> <owner-email> [kind] [delivery]}" \
         "${2:?source_system is required}" --owner "${3:?owner email is required}" \
@@ -66,6 +87,7 @@ function new-source {
 # create a table spec in the right folder, from a template:
 # ./run.sh new-table <domain> <source_system> <table> [requested-by] [delivery]
 function new-table {
+    _require-package
     local requested_args=()
     local delivery_args=()
     [ -n "${4:-}" ] && requested_args=(--requested-by "$4")
@@ -79,18 +101,21 @@ function new-table {
 # validate every project against the example bronze sources and the other projects, then rewrite
 # framework_curation/PROJECTS_INDEX.md and each project's PROJECT_MAP.md
 function projects:generate {
+    _require-package
     "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
         --sources "$THIS_DIR/framework_examples/ingestion"
 }
 
 # fail if a project map is out of date (for CI); changes nothing
 function projects:check {
+    _require-package
     "$PYTHON" -m lakeflow_framework.cli projects generate "$THIS_DIR/framework_curation" \
         --sources "$THIS_DIR/framework_examples/ingestion" --check
 }
 
 # create a project folder with its bundle file: ./run.sh new-project <domain> <project> <owner-email>
 function new-project {
+    _require-package
     "$PYTHON" -m lakeflow_framework.cli projects new "$THIS_DIR/framework_curation" \
         --domain "${1:?usage: ./run.sh new-project <domain> <project> <owner-email>}" \
         --project "${2:?project is required}" --owner "${3:?owner email is required}"
@@ -98,6 +123,7 @@ function new-project {
 
 # fail if the generated files are out of date (for CI); changes nothing
 function generate:check {
+    _require-package
     "$PYTHON" -m lakeflow_framework.cli generate "$THIS_DIR/framework_ingestion" --check
 }
 

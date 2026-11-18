@@ -443,7 +443,7 @@ class UnityMetadata:
         # so it holds only letters, digits, and underscores.
         quoted = ", ".join(f"'{pipeline_id}'" for pipeline_id in ids)
         frame = self.spark.sql(
-            "SELECT full_name, config_json FROM framework_meta.v_object_current "
+            "SELECT full_name, config_json FROM framework_meta.v_asset_registry_current "
             f"WHERE object_kind = 'pipeline' AND full_name IN ({quoted})"
         )
         rows = frame.collect() if hasattr(frame, "collect") else list(frame)

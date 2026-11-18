@@ -10,9 +10,9 @@ from pyspark.sql import SparkSession
 from lakeflow_framework.logs import job_logging, step
 
 TABLES = (
-    "object_registry",
+    "asset_registry",
     "run_ledger",
-    "object_current",
+    "asset_registry_current",
     "run_current",
     "table_health",
     "load_ledger",

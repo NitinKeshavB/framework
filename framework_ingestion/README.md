@@ -63,7 +63,7 @@ The spec's `raw_to_bronze` section holds the bronze table, keys, columns, and qu
 
 ## One delivery, one pipeline, one job
 
-A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline, and the pipeline reads the delivery's deployed spec files, listed in its `lff.specs` setting. Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `table_load_metrics`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
+A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline, and the pipeline reads the delivery's deployed spec files, listed in its `lff.specs` setting. Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `record_load_metrics` → `load_ledger` / `v_loads`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
 
 ## Add a table to a source system
 

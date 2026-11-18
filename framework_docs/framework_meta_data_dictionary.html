@@ -106,7 +106,7 @@
   <main>
     <section class="intro">
       <p><strong>How to use:</strong> filter tables and views below, open a card for purpose and grain, then download this page as a standalone HTML file for offline sharing. Physical relationships are in the <a href="https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit" target="_blank" rel="noopener">Lucidchart ER diagram</a>.</p>
-      <p>Schema: <code>&lt;catalog&gt;.framework_meta</code>. Pipeline-owned metrics objects (<code>flow_events</code>, <code>table_load_metrics</code>, <code>&lt;job&gt;_event_log</code>) live in the same schema but are created by pipelines, not by <code>framework_meta.sql</code>.</p>
+      <p>Schema: <code>&lt;catalog&gt;.framework_meta</code> (frozen — see <code>META_MODEL_REVIEW.md</code>). Per-delivery event logs (<code>&lt;job&gt;_event_log</code>) are created by pipelines. Recon is NRT via <code>record_load_metrics</code>; hourly <code>framework_runs</code> is catch-up only.</p>
     </section>
 
     <div class="filters" id="filters">
@@ -127,15 +127,15 @@
     const LUCID = "https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit";
     const objects = [
       {
-        kind: "table", name: "object_registry",
+        kind: "table", name: "asset_registry",
         writtenBy: "registry_sync", grain: "One SCD Type 2 version of one definition",
         purpose: "History of every source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column the bundle deploys. Changed specs close the current version and insert a new one; removed specs get a deletion version.",
         columns: ["object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "config", "valid_from", "valid_to", "is_current", "is_deleted", "recorded_at"]
       },
       {
-        kind: "table", name: "object_current",
+        kind: "table", name: "asset_registry_current",
         writtenBy: "registry_sync", grain: "One row per (object_kind, full_name)",
-        purpose: "Current non-deleted definition for lookups and dashboards. Avoids windowing object_registry for every query.",
+        purpose: "Current non-deleted definition for lookups and dashboards. Avoids windowing asset_registry for every query.",
         columns: ["object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "config", "recorded_at"]
       },
       {
@@ -193,12 +193,6 @@
         columns: ["job_name", "job_id", "run_id", "status", "failure_reason", "recorded_at", "archived_at"]
       },
       {
-        kind: "table", name: "load_daily_rollup",
-        writtenBy: "reserved (daily rollup refresh)", grain: "One job / layer / day",
-        purpose: "Pre-aggregated daily counts for long-range dashboards; DDL present, refresh may be filled later.",
-        columns: ["job_name", "layer", "event_date", "rows_read", "rows_written", "rows_quarantine", "failed_loads"]
-      },
-      {
         kind: "table", name: "ddl_applied",
         writtenBy: "framework_ddl / apply_ddl", grain: "One SQL file hash per successful apply",
         purpose: "Skip unchanged framework_meta.sql on later deploys. Delete rows or pass force to reapply.",
@@ -211,26 +205,14 @@
         columns: ["id", "timestamp", "event_type", "details", "origin.pipeline_id", "origin.update_id", "origin.flow_name"]
       },
       {
-        kind: "mv", name: "flow_events",
-        writtenBy: "deprecated (DDL only; not written by ops)", grain: "One flow_definition or flow_progress event",
-        purpose: "Legacy dual-path metrics. Prefer load_ledger / v_loads. framework_metrics pipeline retired from the ops bundle.",
-        columns: ["job_name", "pipeline_id", "update_id", "flow_name", "event_id", "event_type", "event_at", "details"]
-      },
-      {
-        kind: "mv", name: "table_load_metrics",
-        writtenBy: "deprecated (DDL only; not written by ops)", grain: "One job, update, flow, and table",
-        purpose: "Legacy per-flow breakdown. Prefer v_loads / load_ledger for recon across layers.",
-        columns: ["job_name", "pipeline_id", "update_id", "flow_name", "table_name", "layer", "dataflow", "rows_written", "status", "expectations"]
-      },
-      {
-        kind: "view", name: "v_object_current",
-        writtenBy: "framework_meta.sql", grain: "Same as object_current",
-        purpose: "Stable read API over object_current for dashboards and other views.",
+        kind: "view", name: "v_asset_registry_current",
+        writtenBy: "framework_meta.sql", grain: "Same as asset_registry_current",
+        purpose: "Stable read API over asset_registry_current for dashboards and other views.",
         columns: ["object_kind", "full_name", "owner", "config", "content_hash", "recorded_at"]
       },
       {
-        kind: "view", name: "v_object_history",
-        writtenBy: "framework_meta.sql", grain: "Every version in object_registry",
+        kind: "view", name: "v_asset_registry_history",
+        writtenBy: "framework_meta.sql", grain: "Every version in asset_registry",
         purpose: "Point-in-time history of definitions using SCD columns (valid_from / valid_to / is_current / is_deleted).",
         columns: ["object_kind", "full_name", "config", "valid_from", "valid_to", "is_current", "is_deleted"]
       },
@@ -291,7 +273,7 @@
       {
         kind: "view", name: "v_lineage",
         writtenBy: "framework_meta.sql", grain: "One link row",
-        purpose: "Declared pipeline→table write/reject edges from object_current link rows.",
+        purpose: "Declared pipeline→table write/reject edges from asset_registry_current link rows.",
         columns: ["full_name", "parent_full_name", "relation", "config"]
       },
       {
@@ -309,7 +291,7 @@
       {
         kind: "view", name: "v_ownership_conflicts",
         writtenBy: "framework_meta.sql", grain: "Names with more than one current holder",
-        purpose: "Integrity check: should be empty when object_current has one owner per name.",
+        purpose: "Integrity check: should be empty when asset_registry_current has one owner per name.",
         columns: ["object_kind", "full_name", "owners"]
       },
       {
@@ -317,18 +299,6 @@
         writtenBy: "framework_meta.sql", grain: "One drifted tag or comment",
         purpose: "Declared vs Unity Catalog schema/table/column tags and comments. Empty when APPLY_TAGS is on and in sync; phase 1 parks tag assignment.",
         columns: ["securable", "table_name", "column_name", "item", "declared", "applied"]
-      },
-      {
-        kind: "view", name: "v_run_current",
-        writtenBy: "framework_meta.sql", grain: "Latest ledger step per object",
-        purpose: "Readable projection of run_current for refusals and legacy steps.",
-        columns: ["run_id", "object_kind", "full_name", "owner", "step_name", "status"]
-      },
-      {
-        kind: "view", name: "v_process",
-        writtenBy: "framework_meta.sql", grain: "Every run_ledger row",
-        purpose: "Full process/refusal history from run_ledger.",
-        columns: ["run_id", "object_kind", "full_name", "step_name", "status", "event_date"]
       },
       {
         kind: "view", name: "v_job_runs",
@@ -339,7 +309,7 @@
       {
         kind: "view", name: "v_job_status",
         writtenBy: "framework_meta.sql", grain: "One workflow + latest run",
-        purpose: "Current status of each registered workflow (null status if never run).",
+        purpose: "Current status of each registered workflow (NRT via record_this_run; null if never run). Hourly framework_runs is catch-up only.",
         columns: ["job_name", "owner", "run_id", "status", "started_at", "run_page_url"]
       },
       {
@@ -371,12 +341,6 @@
         writtenBy: "framework_meta.sql", grain: "One failed load and/or job/task with reasons",
         purpose: "What failed and why for repair: load failure_reason plus job/task failure_reason and run page.",
         columns: ["job_name", "layer", "target_table", "target_status", "load_failure_reason", "job_status", "job_failure_reason", "task_key", "task_failure_reason", "run_page_url"]
-      },
-      {
-        kind: "view", name: "v_bronze_loads",
-        writtenBy: "framework_meta.sql", grain: "Latest bronze row per job, update, dataflow",
-        purpose: "Bronze-only slice of v_loads with legacy column aliases (bronze_table, rows_bronze, bronze_status).",
-        columns: ["job_name", "bronze_table", "quarantine_table", "rows_read", "rows_bronze", "rows_quarantine", "rows_processed", "started_at"]
       },
       {
         kind: "view", name: "v_job_costs",

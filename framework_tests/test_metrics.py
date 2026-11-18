@@ -112,7 +112,12 @@ def test_a_table_that_cannot_be_described_is_recorded_with_its_error():
 def test_metrics_pipeline_finds_each_event_log_and_names_its_job():
     metrics = _metrics_module()
     found = metrics.event_logs(
-        ["abs_daily_event_log", "object_current", "erp_hourly_event_log", "bad-name_event_log"]
+        [
+            "abs_daily_event_log",
+            "asset_registry_current",
+            "erp_hourly_event_log",
+            "bad-name_event_log",
+        ]
     )
     assert found == {"abs_daily_event_log": "abs_daily", "erp_hourly_event_log": "erp_hourly"}
     assert "'abs_daily' AS job_name" in metrics.event_columns("abs_daily")
@@ -136,7 +141,7 @@ def test_table_load_metrics_groups_by_pipeline_update_flow_and_table():
         assert field in sql
     assert "duration_seconds" in sql
     assert "_staged" in sql  # quality counts are on the staging table, mapped to its dataflow
-    assert "framework_dev.framework_meta.object_current" in sql
+    assert "framework_dev.framework_meta.asset_registry_current" in sql
 
 
 class _Pipelines:
@@ -191,7 +196,7 @@ def test_metrics_pipeline_adds_one_append_flow_per_event_log():
 
 def test_metrics_pipeline_with_no_event_log_yet_keeps_an_empty_table():
     metrics = _metrics_module()
-    dp, spark = _Pipelines(), _MetricsSpark(["object_current"])
+    dp, spark = _Pipelines(), _MetricsSpark(["asset_registry_current"])
     metrics.register(dp, spark, "framework_dev")
     assert dp.tables == [] and dp.flows == []
     assert "WHERE false) no_events" in dp.views["table_load_metrics"]()

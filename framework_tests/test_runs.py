@@ -238,7 +238,7 @@ def test_the_first_pass_reads_thirty_days_and_nothing_registered_reads_nothing()
 
 
 def test_pipeline_updates_come_from_update_progress_events_in_each_event_log():
-    assert event_log_jobs(["abs_daily_event_log", "object_current", "x-y_event_log"]) == {
+    assert event_log_jobs(["abs_daily_event_log", "asset_registry_current", "x-y_event_log"]) == {
         "abs_daily_event_log": "abs_daily"
     }
     sql = pipeline_updates_sql("c.framework_meta", {"abs_daily_event_log": "abs_daily"}, NOW)
