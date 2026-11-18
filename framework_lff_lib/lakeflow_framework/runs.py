@@ -35,6 +35,7 @@ JOB_RUN_COLUMNS = (
     "life_cycle_state",
     "result_state",
     "termination_code",
+    "failure_reason",
     "trigger_type",
     "setup_seconds",
     "queue_seconds",
@@ -56,6 +57,7 @@ TASK_RUN_COLUMNS = (
     "life_cycle_state",
     "result_state",
     "termination_code",
+    "failure_reason",
     "recorded_at",
 )
 PIPELINE_UPDATE_COLUMNS = (
@@ -113,6 +115,7 @@ def job_run_rows(
         "life_cycle_state": life,
         "result_state": result,
         "termination_code": code,
+        "failure_reason": _failure_reason(run),
         "trigger_type": _text(run.get("trigger")),
         "setup_seconds": _seconds(run.get("setup_duration")),
         "queue_seconds": _seconds(run.get("queue_duration")),
@@ -138,10 +141,51 @@ def job_run_rows(
                 "life_cycle_state": task_life,
                 "result_state": task_result,
                 "termination_code": task_code,
+                "failure_reason": _failure_reason(task),
                 "recorded_at": recorded_at,
             }
         )
     return row, tasks
+
+
+def record_this_run(
+    spark,
+    client,
+    catalog: str,
+    job_name: str,
+    run_id: str,
+    now: datetime | None = None,
+) -> int:
+    """Merge one Jobs API run (this delivery job) into job_runs and job_task_runs for NRT status."""
+
+    if not _IDENTIFIER.fullmatch(job_name or ""):
+        raise ValueError("job name is required")
+    if not str(run_id or "").isdigit():
+        raise ValueError("run_id is required")
+    meta = _meta(catalog)
+    recorded = (now or datetime.now(timezone.utc)).replace(microsecond=0)
+    run = client.jobs.get_run(int(run_id)).as_dict()
+    settings = (client.jobs.get(int(run.get("job_id"))).as_dict().get("settings")) or {}
+    deployed = _text(settings.get("name")) or job_name
+    workspace_id = _text(client.get_workspace_id())
+    row, tasks = job_run_rows(run, job_name, deployed, workspace_id, recorded)
+    _merge(spark, f"{meta}.job_runs", [row], JOB_RUN_COLUMNS, ("job_id", "run_id"))
+    _merge(
+        spark,
+        f"{meta}.job_task_runs",
+        tasks,
+        TASK_RUN_COLUMNS,
+        ("job_run_id", "task_run_id"),
+    )
+    log.info(
+        "this run: merged run %s of %s status=%s reason=%s (%d task(s))",
+        run_id,
+        job_name,
+        row.get("status"),
+        row.get("failure_reason"),
+        len(tasks),
+    )
+    return 1
 
 
 def framework_jobs(jobs: Iterable[Mapping[str, Any]], workflows: set[str]) -> dict[str, tuple]:
@@ -354,6 +398,23 @@ def _state(run: Mapping[str, Any]) -> tuple[str | None, str | None, str | None]:
     if result is None and code is not None and life == "TERMINATED":
         result = "SUCCESS" if code == "SUCCESS" else code
     return life, result, code
+
+
+def _failure_reason(run: Mapping[str, Any]) -> str | None:
+    """Human-readable why from Jobs API state / termination details."""
+
+    state = run.get("state") or {}
+    status = run.get("status") or {}
+    details = status.get("termination_details") or {}
+    for value in (
+        state.get("state_message"),
+        details.get("message"),
+        details.get("type"),
+    ):
+        text = _text(value)
+        if text:
+            return text[:4000]
+    return None
 
 
 def _meta(catalog: str) -> str:

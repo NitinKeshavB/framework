@@ -194,17 +194,30 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     generate(bundle)
     source = (bundle / "pipelines" / "billing_daily.py").read_text("utf-8")
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
-    # The job refreshes the pipeline, then appends load counts (no MERGE).
+    # Refresh, then metrics even on failure, then NRT job status.
     assert [task["task_key"] for task in _job(bundle)["tasks"]] == [
         "refresh_pipeline",
         "record_load_metrics",
+        "record_this_run",
     ]
     job = _job(bundle)
     assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
     assert job["environments"]
     metrics = _tasks(bundle)["record_load_metrics"]
     assert metrics["depends_on"] == [{"task_key": "refresh_pipeline"}]
-    assert metrics["spark_python_task"]["parameters"] == ["${var.catalog}", "billing_daily"]
+    assert metrics["run_if"] == "ALL_DONE"
+    assert metrics["spark_python_task"]["parameters"] == [
+        "${var.catalog}",
+        "billing_daily",
+        "bronze",
+    ]
+    this_run = _tasks(bundle)["record_this_run"]
+    assert this_run["run_if"] == "ALL_DONE"
+    assert this_run["spark_python_task"]["parameters"] == [
+        "${var.catalog}",
+        "billing_daily",
+        "{{job.run_id}}",
+    ]
     specs = _settings(bundle)["lff.specs"].split(",")
     assert len(specs) == 2
     assert all(spec.startswith("${workspace.file_path}/sources/billing/") for spec in specs)

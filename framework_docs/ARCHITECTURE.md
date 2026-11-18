@@ -7,7 +7,7 @@ How the framework is put together: the folders, the code, every table it writes,
 Folders at the repository root start with `framework_`.
 
 - `framework_lff_lib` is the wheel. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`.
-- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, the `framework_metrics` pipeline, the hourly `framework_runs` job (job runs and pipeline updates), and the daily `framework_optimize` job (compaction and table health).
+- `framework_bundle` deploys that wheel and the metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, the hourly `framework_runs` job (job runs and pipeline updates), and the daily `framework_optimize` job (compaction, archive of hot metrics older than 7 days, and table health).
 - `framework_ingestion` is source to bronze: source systems, table specs, and the pipelines and jobs generated from them.
 - `framework_curation/<domain>/<project>` is one bundle per project for silver, gold, and data products.
 - `framework_examples/ingestion` is the set of specs to copy for each source kind. `framework_examples/consumer` is the original single-bundle example and is reference only.
@@ -72,10 +72,15 @@ flowchart TD
   specs["deployed spec files (lff.specs)"] --> refresh
   refresh --> tables[(staged, bronze, and quarantine tables)]
   refresh --> eventLog[("&lt;job&gt;_event_log")]
+  refresh --> recordMetrics["record_load_metrics (run_if ALL_DONE)"]
+  eventLog --> recordMetrics
+  recordMetrics --> ledger[(load_ledger)]
+  recordMetrics --> recordThisRun[record_this_run]
+  recordThisRun --> jobRuns[(job_runs NRT)]
   trigger --> jobsApi[(Jobs API run history)]
 ```
 
-The job is one task, plus `batch_load` for frozen `cloud_files` methods. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry. Its outcome is in the Jobs API and its update states and row counts in its event log; `framework_runs` copies both into `framework_meta` every hour.
+The job runs **refresh_pipeline**, then **record_load_metrics** with `run_if: ALL_DONE` (even when the pipeline failed), which appends that update's counts into the central `load_ledger` with the job's medallion `layer`, or a **FAILED stub** when the event log has no `flow_progress`. Then **record_this_run** writes NRT status and `failure_reason` into `job_runs`. Insert only; no MERGE; no scan of target tables. Frozen `cloud_files` methods add **batch_load** before the refresh. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry. Hourly `framework_runs` is catch-up from the Jobs API and event logs.
 
 ### Inside one pipeline: source to bronze and quarantine
 
@@ -94,23 +99,33 @@ The staging table computes `_dq_failed_rules` once per row and carries one warn 
 ```mermaid
 flowchart LR
   ingestionPipelines[ingestion pipelines] --> eventLogs[("&lt;job&gt;_event_log")]
-  eventLogs --> metricsPipeline[framework_metrics, hourly]
-  metricsPipeline --> flowEvents[(flow_events)]
-  flowEvents --> loadMetrics[(table_load_metrics)]
-  registry[(object_current)] --> loadMetrics
-  jobsApi[(Jobs API)] --> runsJob[framework_runs, hourly]
+  anyJob[any layer job record_load_metrics ALL_DONE] --> eventLogs
+  anyJob --> ledger[(load_ledger)]
+  ledger --> loads[v_loads]
+  loads --> failures[v_load_failures]
+  anyJob --> recordThisRun[record_this_run]
+  recordThisRun --> runTables[(job_runs, job_task_runs)]
+  jobsApi[(Jobs API)] --> runsJob[framework_runs, hourly catch-up]
   eventLogs --> runsJob
-  runsJob --> runTables[(job_runs, job_task_runs, pipeline_updates)]
-  runTables --> runViews[v_job_runs, v_job_task_runs, v_job_status, v_pipeline_updates]
-  registry --> runViews
+  runsJob --> runTables
+  runsJob --> updates[(pipeline_updates)]
+  runTables --> runViews[v_job_runs, v_job_task_runs, v_job_status]
+  updates --> runViews
+  registry[(object_current)] --> runViews
   systemTables[("system.billing, system.access (optional)")] --> costViews[v_job_costs, v_pipeline_costs, v_observed_lineage]
   runTables --> costViews
   optimize[framework_optimize, daily] --> health[(table_health)]
+  optimize --> archive[archive_hot to *_archive]
+  ledger --> archive
+  runTables --> archive
+  archive --> loads90[v_loads_90d]
   registry --> metadataDrift[v_metadata_drift]
   infoSchema[(catalog information_schema)] --> metadataDrift
 ```
 
 ## Data model
+
+Editable Lucidchart (tabs: ERD, **framework_meta catalog**, **Team process: patterns → jobs**): [Lakeflow framework_meta](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit). Purpose and usage of every table and view: [framework_meta_data_dictionary.html](framework_meta_data_dictionary.html) (open in a browser; use **Download HTML** for an offline copy).
 
 ### Every table, by owner
 
@@ -121,18 +136,20 @@ flowchart LR
 | `run_ledger` | `framework_meta` | `registry_sync` | One ownership refusal, or a job step from before steps moved to the system tables | Delta, insert-only |
 | `run_current` | `framework_meta` | `registry_sync` | One row per `(owner_kind, owner, object_kind, full_name)` | Delta, merged |
 | `table_health` | `framework_meta` | `framework_optimize` | One bronze table per day | Delta, append |
-| `job_runs` | `framework_meta` | `framework_runs` | One run of a framework job | Delta, merged on `(job_id, run_id)` |
-| `job_task_runs` | `framework_meta` | `framework_runs` | One task run of a job run | Delta, merged on `(job_run_id, task_run_id)` |
+| `job_runs` | `framework_meta` | each job (`record_this_run`) + hourly `framework_runs` | One run of a framework job | Delta, merged on `(job_id, run_id)` |
+| `job_task_runs` | `framework_meta` | `framework_runs` (+ NRT when available) | One task run of a job run | Delta, merged on `(job_run_id, task_run_id)` |
 | `pipeline_updates` | `framework_meta` | `framework_runs` | One update of an ingestion pipeline | Delta, merged on `(pipeline_id, update_id)` |
+| `load_ledger` | `framework_meta` | each job (`record_load_metrics`) | One job, layer, update, and dataflow (incl. FAILED stubs) | Delta, insert-only, ~7-day hot |
+| `load_ledger_archive` / `job_runs_archive` / `job_task_runs_archive` / `pipeline_updates_archive` | `framework_meta` | `framework_optimize` `archive_hot` | Rows moved off hot after 7 days | Delta, forever |
+| `load_daily_rollup` | `framework_meta` | reserved for daily rollup refresh | One job/layer/day aggregate | Delta |
+| `ddl_applied` | `framework_meta` | `framework_ddl` / `apply_ddl` | One SQL file hash per successful apply | Delta, insert-only |
 | `<job>_event_log` | `framework_meta` | each ingestion pipeline | One pipeline event | Event log table |
-| `flow_events` | `framework_meta` | `framework_metrics` | One `flow_definition` or `flow_progress` event | Streaming table |
-| `table_load_metrics` | `framework_meta` | `framework_metrics` | One job, pipeline, update, and flow | Materialized view |
-| `bronze_load_ledger` | `framework_meta` | each delivery job (`record_load_metrics`) | One job, update, and dataflow (append-only) | Table |
+| `flow_events` / `table_load_metrics` | `framework_meta` | deprecated (DDL kept; not written by ops) | Legacy dual-path metrics | Streaming table / MV |
 | `<pipeline_id>_staged` | none (private) | ingestion pipeline | One source row | Private streaming table or materialized view |
 | bronze, `<schema>.<table>` | `<source>_bronze` | ingestion pipeline | One passing row, or one row per key with Auto CDC | Streaming table or materialized view |
 | quarantine, `<table>_qrntn` | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |
 
-The registry tables change once per deploy, `table_health` once a day, and the metrics and run tables once an hour. A delivery run writes only its own data tables and event log. The framework creates nothing outside `framework_meta` except the tables its pipelines publish. Schemas, volumes, and foreign catalogs exist before a deploy. The `framework_events` volume that older versions created is no longer used; drop it by hand once nothing reads it.
+The registry tables change once per deploy, `table_health` and hot→archive once a day, and hourly `framework_runs` is catch-up. A delivery or curation run writes its own data tables, event log, one append into `load_ledger` for its layer, and NRT `job_runs` via `record_this_run`. The framework creates nothing outside `framework_meta` except the tables its pipelines publish. Schemas, volumes, and foreign catalogs exist before a deploy. The `framework_events` volume that older versions created is no longer used; drop it by hand once nothing reads it. Until go-live, drop `framework_meta` to pick up new columns (`failure_reason`, archives); `CREATE IF NOT EXISTS` will not ALTER existing tables.
 
 ### Registry, physical
 
@@ -238,7 +255,8 @@ erDiagram
   v_workflows ||--o{ job_runs : "job_name = tags lakeflow_framework_workflow"
   job_runs ||--o{ job_task_runs : "job_run_id = run_id"
   v_workflows ||--o{ pipeline_updates : "job_name = event log name without _event_log"
-  pipeline_updates ||--o{ table_load_metrics : "pipeline_id, update_id"
+  job_runs ||--o{ load_ledger : "job_name / run context"
+  load_ledger ||--o| v_load_failures : "FAILED or failure_reason"
   job_runs ||--o| job_costs : "job_id, run_id (optional)"
   pipeline_updates ||--o| pipeline_costs : "pipeline_id, update_id (optional)"
   job_runs {
@@ -250,6 +268,7 @@ erDiagram
     string status
     string result_state
     string termination_code
+    string failure_reason
     double run_seconds
   }
   job_task_runs {
@@ -257,6 +276,7 @@ erDiagram
     string task_run_id
     string task_key
     string status
+    string failure_reason
   }
   pipeline_updates {
     string job_name
@@ -334,46 +354,32 @@ A tag with no value is not set, and one the spec no longer gives is unset. Tags 
 
 ```mermaid
 erDiagram
-  event_log ||--o{ flow_events : "flow_definition and flow_progress"
-  flow_events ||--o{ table_load_metrics : "grouped per update and flow"
-  table_load_metrics }o--o| dataflow_row : "dataflow = pipeline_id"
-  flow_events {
+  event_log ||--o{ load_ledger : "record_load_metrics per update and layer"
+  load_ledger ||--o| v_loads : "latest per job, layer, update, dataflow"
+  load_ledger ||--o| load_ledger_archive : "archive_hot after 7 days"
+  load_ledger_archive ||--o| v_loads_90d : "hot union archive"
+  pipeline_updates ||--o{ load_ledger : "pipeline_id, update_id"
+  load_ledger {
     string job_name
-    string pipeline_id
-    string pipeline_name
-    string update_id
-    string flow_name
-    string event_id
-    string event_type
-    timestamp event_at
-    string details
-  }
-  table_load_metrics {
-    string job_name
-    string pipeline_id
-    string pipeline_name
-    string update_id
-    string flow_name
-    string table_name
     string layer
+    string pipeline_id
+    string update_id
     string dataflow
-    string owner_kind
-    string owner
-    string status
-    timestamp started_at
-    timestamp ended_at
-    double duration_seconds
+    string target_table
+    string quarantine_table
+    bigint rows_read
     bigint rows_written
-    bigint rows_upserted
-    bigint rows_deleted
-    bigint rows_dropped
-    bigint backlog_bytes
-    bigint backlog_files
-    array expectations
+    bigint rows_quarantine
+    bigint rows_processed
+    string target_status
+    string failure_reason
+    timestamp recorded_at
   }
 ```
 
-`job_name` comes from the event log's table name, `<job>_event_log`. `pipeline_id` is the Databricks pipeline id, which joins to `v_pipeline_updates` with `update_id`. `dataflow` is the spec's `pipeline_id`, which joins to the registry. Rule counts are on the `staged` row, because the rules are checked there.
+`job_name` comes from the event log's table name, `<job>_event_log`. `pipeline_id` is the Databricks pipeline id, which joins to `v_pipeline_updates` with `update_id`. `dataflow` is the spec's `pipeline_id`, which joins to the registry. Rule counts land on the ledger from staged `flow_progress` when present.
+
+**Per-load counts.** `v_loads` (or `load_ledger`) is the sole recon SoR for bronze, silver, gold, and product. Counts come from that update's event log in the job itself (`ALL_DONE`), with FAILED stubs when there is no progress; never MERGE. Filter on `layer` for one medallion layer. `v_bronze_loads` is the bronze slice with legacy column aliases. `v_loads_90d` unions 7-day hot with forever archive for dashboards. `v_load_failures` joins loads to job/task `failure_reason` for repair. Legacy `flow_events` / `table_load_metrics` DDL may remain but are not written by the ops bundle.
 
 ## Views
 
@@ -405,6 +411,13 @@ flowchart TD
   job_task_runs --> v_job_task_runs
   pipeline_updates --> v_pipeline_updates
   v_workflows --> v_pipeline_updates
+  load_ledger --> v_loads
+  v_loads --> v_bronze_loads
+  load_ledger --> v_loads_90d
+  load_ledger_archive --> v_loads_90d
+  v_loads --> v_load_failures
+  v_job_runs --> v_load_failures
+  v_job_task_runs --> v_load_failures
   v_job_runs --> v_job_costs
   v_pipeline_updates --> v_pipeline_costs
   object_current --> v_observed_lineage
@@ -413,7 +426,7 @@ flowchart TD
   system_tables --> v_observed_lineage
 ```
 
-`framework_meta.sql` creates every view except three; `system_views.sql` creates `v_job_costs`, `v_pipeline_costs`, and `v_observed_lineage`, in their own job because they need system table grants. That job runs them only when the target sets `system_views` to `true`. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_ownership_refusals` lists every definition `registry_sync` refused, and `v_run_current` the latest ledger step per object.
+`framework_meta.sql` creates every view except three; `system_views.sql` creates `v_job_costs`, `v_pipeline_costs`, and `v_observed_lineage`, in their own job because they need system table grants. That job runs them only when the target sets `system_views` to `true`. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs`. `v_ownership_refusals` lists every definition `registry_sync` refused, and `v_run_current` the latest ledger step per object. `v_loads` keeps the latest `load_ledger` row per job, layer, update, and dataflow (retries of `record_load_metrics` may append again). `v_loads_90d` unions hot and archive; `v_load_failures` surfaces what failed and why.
 
 `v_object_history` reads the SCD columns from `object_registry`; it does not window. Filter `owner`, the first clustering key, to read less. `object_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row. `v_source_systems` and `v_schemas` list the current source systems and the schemas they use, with their tags. `v_metadata_drift` covers schema, table, and column tags, with `securable` saying which.
 
@@ -423,6 +436,10 @@ How the views join their sources:
 | --- | --- |
 | `v_job_runs`, `v_job_task_runs` | `job_runs.job_name` (the job's `lakeflow_framework_workflow` tag) = `v_workflows.job_name` |
 | `v_pipeline_updates` | `pipeline_updates.job_name` (the event log's name) = `v_workflows.job_name` |
+| `v_loads` | `load_ledger` partitioned by `job_name`, `layer`, `update_id`, `dataflow`; latest `recorded_at` |
+| `v_loads_90d` | hot `load_ledger` union `load_ledger_archive` (QUALIFY latest) |
+| `v_load_failures` | loads + job/task runs where status FAILED or `failure_reason` set |
+| `v_bronze_loads` | `v_loads` where `layer = 'bronze'` (legacy column aliases) |
 | `v_job_costs` | `system.billing.usage` `usage_metadata.job_id` and `job_run_id` = `job_runs.job_id` and `run_id` |
 | `v_pipeline_costs` | `usage_metadata.dlt_pipeline_id` and `dlt_update_id` = `pipeline_updates.pipeline_id` and `update_id` |
 | `v_observed_lineage` | `table_lineage.target_table_full_name` = the dataflow's bronze or quarantine table |
@@ -452,7 +469,7 @@ How the views join their sources:
 
 **Unity Catalog holds the governance metadata.** The spec and `source.yaml` are the source; `registry_sync` writes them to Unity Catalog at every deploy and changes only what differs. `v_metadata_drift` shows anything that disagrees.
 
-**Definitions are SCD Type 2; events are not.** A definition has a life: it is created, changed, and removed, and `object_registry` keeps every state with when it held. A refusal or a health reading happens once, so `run_ledger` and `table_health` only append.
+**Definitions are SCD Type 2; events are not.** A definition has a life: it is created, changed, and removed, and `object_registry` keeps every state with when it held. A refusal, a health reading, or a load-metrics append happens once, so `run_ledger`, `table_health`, and `load_ledger` only append.
 
 **One bundle retires one owner kind.** `registry_sync` retires every `source_system`-owned object in the catalog that `framework_ingestion` no longer defines. That is right while `framework_ingestion` is the only bundle that registers source systems in a catalog. A second bundle that registers source systems into the same catalog, or two developers deploying different branches into one dev catalog, would retire each other's definitions.
 

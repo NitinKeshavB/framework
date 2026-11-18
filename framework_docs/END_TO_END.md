@@ -37,11 +37,11 @@ Every framework job task writes timestamped log lines to its run's output: the a
 
 ## What a delivery job does
 
-A delivery job runs **refresh_pipeline**, then **record_load_metrics**, which appends `rows_read` / `rows_bronze` / `rows_quarantine` for that update into `bronze_load_ledger` (insert only, no MERGE, no scan of bronze). A `cloud_files` table that uses `copy_into` or `ctas` adds **batch_load** before the refresh; those methods are frozen, so no generated job has that task yet. The job does not write definitions to the registry.
+A delivery job runs **refresh_pipeline**, then **record_load_metrics** with `run_if: ALL_DONE` (runs even when the pipeline failed), then **record_this_run** (NRT job status into `job_runs`). Metrics append `rows_read` / `rows_written` / `rows_quarantine` into the central `load_ledger` (`layer = bronze`), or a **FAILED stub** when the event log has no `flow_progress`. Insert only, no MERGE. Use `v_loads` for recon and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint. Hourly `framework_runs` is catch-up. The job does not write definitions to the registry.
 
 The pipeline reads its specs from the deployed bundle. The generated pipeline sets `lff.specs` to the workspace paths of its spec files and `lff.catalog` to the target catalog, and `build_pipelines` validates those files with `validate_configs`. A pipeline id missing from `lff.specs` is an error. A pipeline without `lff.specs` falls back to reading `framework_meta.v_object_current`.
 
-Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log, which the hourly `framework_runs` job copies into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row and rule counts come from the event log, in `table_load_metrics`. Cost needs the optional system views.
+Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log. Each delivery job writes NRT status via `record_this_run`; hourly `framework_runs` is catch-up into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row counts for recon are in `v_loads`. Cost needs the optional system views.
 
 ## How each kind loads
 
@@ -153,8 +153,9 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | Table or view | Built by | What it holds |
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
-| `table_load_metrics` | The `framework_metrics` pipeline, hourly | One row per job, pipeline, update, flow, and table: detail from every event log |
-| `bronze_load_ledger`, `v_bronze_loads` | Each delivery job, task `record_load_metrics` after the pipeline refresh | Append-only per-load counts: `rows_read`, `rows_bronze`, `rows_quarantine`, `rows_processed`. No MERGE; the view keeps the latest row per job, update, and dataflow |
+| `load_ledger`, `v_loads`, `v_loads_90d` | Each job, `record_load_metrics` (`ALL_DONE`) | Central recon SoR: counts and FAILED stubs. `v_loads_90d` unions 7-day hot with forever archive for dashboards |
+| `v_load_failures` | Views over loads + job/task runs | What failed and why (`failure_reason`, task, run page) for repair |
+| `job_runs` (+ `record_this_run`) | Delivery job NRT + hourly `framework_runs` | Status and `failure_reason`; repair resumes failed tasks |
 | `job_runs`, `v_job_runs` | `framework_runs`, hourly, from the Jobs API | Each run of a framework job: status, result state, termination code, trigger, setup, queue, execution, and run seconds, and the run page URL |
 | `job_task_runs`, `v_job_task_runs` | The same | Each task run: task key, status, result state, and termination code |
 | `pipeline_updates`, `v_pipeline_updates` | `framework_runs`, from the `update_progress` events in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
@@ -162,16 +163,16 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | `v_observed_lineage` | `framework_system_views`, only when `system_views` is `true` | What `system.access.table_lineage` saw each bronze and quarantine table read, next to the declared raw source: `declared`, `undeclared`, or `not_observed`. The registry's link and flow rows stay the declared intent. |
 | `table_health` | `framework_optimize`, daily | Each bronze table's file count and size (`DESCRIBE DETAIL`), and its last load commit with its operation metrics (`DESCRIBE HISTORY`, skipping `OPTIMIZE` and `VACUUM`) |
 
-`framework_metrics` lists the `*_event_log` tables on every update and streams their `flow_definition` and `flow_progress` events into `flow_events`, one append flow per log, so a new delivery is picked up on the next hourly run. Quality rules are checked on the private staging table, so the expectation counts are on the row whose `layer` is `staged`; its `dataflow` is the spec's `pipeline_id`, as on the bronze row.
+Quality rules are checked on the private staging table; expectation counts on the ledger come from that update's `flow_progress` when present. Legacy `flow_events` / `table_load_metrics` are not written by the ops bundle.
 
 Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). `framework_runs` matches a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline update on the name of the event log it is in. It needs no system table grants: the identity that runs it needs `CAN_VIEW` on the delivery jobs, which the deploying identity has. The Jobs API keeps 60 days of runs, and `job_runs` keeps them after that.
 
 ```sql
--- rows read and loaded for each bronze table load (append-only ledger, not a table scan)
-SELECT job_name, bronze_table, quarantine_table, started_at,
-       rows_read, rows_bronze, rows_quarantine, rows_processed, expectations
-FROM framework_meta.v_bronze_loads
-WHERE bronze_table ILIKE '%finance_abs'
+-- rows read and loaded for any layer (append-only ledger, not a table scan)
+SELECT job_name, layer, target_table, quarantine_table, started_at,
+       rows_read, rows_written, rows_quarantine, rows_processed, expectations
+FROM framework_meta.v_loads
+WHERE target_table ILIKE '%finance_abs'
 ORDER BY started_at DESC;
 ```
 

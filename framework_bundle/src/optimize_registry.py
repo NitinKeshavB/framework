@@ -9,7 +9,19 @@ from pyspark.sql import SparkSession
 
 from lakeflow_framework.logs import job_logging, step
 
-TABLES = ("object_registry", "run_ledger", "object_current", "run_current", "table_health")
+TABLES = (
+    "object_registry",
+    "run_ledger",
+    "object_current",
+    "run_current",
+    "table_health",
+    "load_ledger",
+    "job_runs",
+    "job_task_runs",
+    "pipeline_updates",
+    "load_ledger_archive",
+    "job_runs_archive",
+)
 
 
 def main() -> None:

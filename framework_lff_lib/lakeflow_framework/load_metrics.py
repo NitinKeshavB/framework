@@ -1,8 +1,9 @@
-"""Append-only bronze load counts, written by each delivery job after its pipeline refresh.
+"""Append-only load counts for any medallion layer, written after each pipeline refresh.
 
-No MERGE: each run inserts a few rows for the update that just finished. Retries may append a
-second row for the same update_id; v_bronze_loads keeps the latest recorded_at. Counts come from
-that update's event-log flow_progress only, never from scanning bronze or quarantine tables.
+Central recon for bronze, silver, gold (and product). Runs even when refresh_pipeline failed
+(``run_if: ALL_DONE``): if the event log has no flow_progress, inserts FAILED stub rows so
+``v_loads`` always shows the attempt. No MERGE. Retries may append again; ``v_loads`` keeps
+the latest ``recorded_at``.
 """
 
 from __future__ import annotations
@@ -14,66 +15,144 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 EVENT_LOG_SUFFIX = "_event_log"
-LEDGER = "bronze_load_ledger"
+LEDGER = "load_ledger"
+LAYERS = frozenset({"bronze", "silver", "gold", "product"})
+LEDGER_COLUMNS = (
+    "job_name",
+    "layer",
+    "pipeline_id",
+    "pipeline_name",
+    "update_id",
+    "dataflow",
+    "owner_kind",
+    "owner",
+    "target_table",
+    "quarantine_table",
+    "started_at",
+    "ended_at",
+    "duration_seconds",
+    "rows_read",
+    "rows_written",
+    "rows_quarantine",
+    "rows_processed",
+    "target_status",
+    "quarantine_status",
+    "expectations",
+    "failure_reason",
+    "recorded_at",
+)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+$")
 _EXPECTATIONS = (
     "ARRAY<STRUCT<name: STRING, dataset: STRING, passed_records: BIGINT, failed_records: BIGINT>>"
 )
+_FAILED_REASON = (
+    "no flow_progress for the latest update; pipeline likely failed before metrics — "
+    "repair the failed task and rerun from the point of failure"
+)
 
 
-def record_bronze_loads(spark, catalog: str, job_name: str) -> int:
-    """Append rows_read / bronze / quarantine counts for the latest pipeline update of ``job_name``.
-
-    Uses ``INSERT INTO ... SELECT`` so column types come from the SQL (with explicit CASTs), not
-    from inferring a Python row. That avoids "types cannot be determined after inferring" when
-    some metrics are null, and keeps the rows off the driver.
-    """
+def record_loads(spark, catalog: str, job_name: str, layer: str = "bronze") -> int:
+    """Append load rows for the latest update, or FAILED stubs when there is no progress."""
 
     if not _IDENTIFIER.fullmatch(catalog or ""):
         raise ValueError("catalog is required")
     if not _IDENTIFIER.fullmatch(job_name or ""):
         raise ValueError("job name is required")
+    if layer not in LAYERS:
+        raise ValueError(f"layer must be one of {sorted(LAYERS)}")
     meta = f"{catalog}.framework_meta"
     event_log = f"{meta}.{job_name}{EVENT_LOG_SUFFIX}"
-    log.info("load metrics: recording latest update of %s from %s", job_name, event_log)
-    loads = latest_bronze_loads_sql(event_log, meta, job_name)
-    spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW _framework_bronze_loads AS {loads}")
-    counted = _rows(spark.sql("SELECT count(*) AS n FROM _framework_bronze_loads"))
+    log.info("load metrics: recording latest %s update of %s from %s", layer, job_name, event_log)
+    loads = latest_loads_sql(event_log, meta, job_name, layer)
+    spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW _framework_loads AS {loads}")
+    counted = _rows(spark.sql("SELECT count(*) AS n FROM _framework_loads"))
     written = int(counted[0]["n"]) if counted else 0
     if not written:
-        log.info("load metrics: no flow_progress for the latest update yet")
-        return 0
+        log.info("load metrics: no flow_progress; inserting FAILED stub row(s)")
+        stub = failed_loads_stub_sql(meta, job_name, layer)
+        spark.sql(f"CREATE OR REPLACE TEMPORARY VIEW _framework_loads AS {stub}")
+        counted = _rows(spark.sql("SELECT count(*) AS n FROM _framework_loads"))
+        written = int(counted[0]["n"]) if counted else 0
+        if not written:
+            log.info("load metrics: no dataflows registered for %s; nothing to append", job_name)
+            return 0
+    cols = ", ".join(LEDGER_COLUMNS[:-1])
     spark.sql(
-        f"INSERT INTO {meta}.{LEDGER} SELECT "
-        f"job_name, pipeline_id, pipeline_name, update_id, dataflow, owner_kind, owner, "
-        f"bronze_table, quarantine_table, started_at, ended_at, duration_seconds, "
-        f"rows_read, rows_bronze, rows_quarantine, rows_processed, "
-        f"bronze_status, quarantine_status, expectations, current_timestamp() AS recorded_at "
-        f"FROM _framework_bronze_loads"
+        f"INSERT INTO {meta}.{LEDGER} SELECT {cols}, "
+        f"current_timestamp() AS recorded_at FROM _framework_loads"
     )
     for row in _rows(
         spark.sql(
-            "SELECT dataflow, update_id, rows_read, rows_bronze, rows_quarantine, rows_processed "
-            "FROM _framework_bronze_loads"
+            "SELECT dataflow, update_id, rows_read, rows_written, rows_quarantine, "
+            "rows_processed, target_status, failure_reason FROM _framework_loads"
         )
     ):
         log.info(
-            "load metrics: %s update %s dataflow %s: read=%s bronze=%s quarantine=%s processed=%s",
+            "load metrics: %s %s update %s dataflow %s: read=%s written=%s quarantine=%s "
+            "processed=%s status=%s reason=%s",
+            layer,
             job_name,
             row.get("update_id"),
             row.get("dataflow"),
             row.get("rows_read"),
-            row.get("rows_bronze"),
+            row.get("rows_written"),
             row.get("rows_quarantine"),
             row.get("rows_processed"),
+            row.get("target_status"),
+            row.get("failure_reason"),
         )
     log.info("load metrics: appended %d row(s) to %s.%s", written, meta, LEDGER)
     return written
 
 
-def latest_bronze_loads_sql(event_log: str, meta: str, job_name: str) -> str:
+def record_bronze_loads(spark, catalog: str, job_name: str) -> int:
+    """Compatibility wrapper: append bronze-layer rows into the central load ledger."""
+
+    return record_loads(spark, catalog, job_name, layer="bronze")
+
+
+def failed_loads_stub_sql(meta: str, job_name: str, layer: str = "bronze") -> str:
+    """One FAILED ledger row per registered dataflow when the event log has no progress."""
+
+    if layer not in LAYERS:
+        raise ValueError(f"layer must be one of {sorted(LAYERS)}")
+    target = "bronze" if layer == "bronze" else layer
+    return f"""
+SELECT
+  CAST('{job_name}' AS STRING) AS job_name,
+  CAST('{layer}' AS STRING) AS layer,
+  CAST(p.full_name AS STRING) AS pipeline_id,
+  CAST(NULL AS STRING) AS pipeline_name,
+  CAST(CONCAT('failed-', date_format(current_timestamp(), 'yyyyMMddHHmmss')) AS STRING) AS update_id,
+  CAST(d.full_name AS STRING) AS dataflow,
+  CAST(d.owner_kind AS STRING) AS owner_kind,
+  CAST(d.owner AS STRING) AS owner,
+  CAST(d.config:{target}::STRING AS STRING) AS target_table,
+  CAST(d.config:quarantine::STRING AS STRING) AS quarantine_table,
+  CAST(current_timestamp() AS TIMESTAMP) AS started_at,
+  CAST(current_timestamp() AS TIMESTAMP) AS ended_at,
+  CAST(NULL AS DOUBLE) AS duration_seconds,
+  CAST(NULL AS BIGINT) AS rows_read,
+  CAST(NULL AS BIGINT) AS rows_written,
+  CAST(NULL AS BIGINT) AS rows_quarantine,
+  CAST(NULL AS BIGINT) AS rows_processed,
+  CAST('FAILED' AS STRING) AS target_status,
+  CAST(NULL AS STRING) AS quarantine_status,
+  CAST(NULL AS STRING) AS expectations,
+  CAST('{_FAILED_REASON}' AS STRING) AS failure_reason
+FROM {meta}.object_current d
+JOIN {meta}.object_current p
+  ON p.object_kind = 'pipeline' AND p.full_name = d.parent_full_name
+WHERE d.object_kind = 'dataflow'
+  AND p.parent_full_name = '{job_name}'
+"""
+
+
+def latest_loads_sql(event_log: str, meta: str, job_name: str, layer: str = "bronze") -> str:
     """SQL that builds one ledger row per dataflow for the newest update in ``event_log``."""
 
+    if layer not in LAYERS:
+        raise ValueError(f"layer must be one of {sorted(LAYERS)}")
     return f"""
 WITH latest AS (
   SELECT origin.update_id AS update_id
@@ -170,13 +249,14 @@ staged_expectations AS (
 )
 SELECT
   CAST('{job_name}' AS STRING) AS job_name,
+  CAST('{layer}' AS STRING) AS layer,
   CAST(r.pipeline_id AS STRING) AS pipeline_id,
   CAST(max(r.pipeline_name) AS STRING) AS pipeline_name,
   CAST(r.update_id AS STRING) AS update_id,
   CAST(r.dataflow AS STRING) AS dataflow,
   CAST(max(r.owner_kind) AS STRING) AS owner_kind,
   CAST(max(r.owner) AS STRING) AS owner,
-  CAST(max(CASE WHEN r.layer = 'bronze' THEN r.table_name END) AS STRING) AS bronze_table,
+  CAST(max(CASE WHEN r.layer = '{layer}' THEN r.table_name END) AS STRING) AS target_table,
   CAST(max(CASE WHEN r.layer = 'quarantine' THEN r.table_name END) AS STRING) AS quarantine_table,
   CAST(min(r.started_at) AS TIMESTAMP) AS started_at,
   CAST(max(r.ended_at) AS TIMESTAMP) AS ended_at,
@@ -184,22 +264,36 @@ SELECT
     (unix_millis(max(r.ended_at)) - unix_millis(min(r.started_at))) / 1000.0 AS DOUBLE
   ) AS duration_seconds,
   CAST(max(CASE WHEN r.layer = 'staged' THEN r.rows_written END) AS BIGINT) AS rows_read,
-  CAST(max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END) AS BIGINT) AS rows_bronze,
+  CAST(max(CASE WHEN r.layer = '{layer}' THEN r.rows_written END) AS BIGINT) AS rows_written,
   CAST(max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END) AS BIGINT) AS rows_quarantine,
   CAST(
-    coalesce(max(CASE WHEN r.layer = 'bronze' THEN r.rows_written END), 0)
+    coalesce(max(CASE WHEN r.layer = '{layer}' THEN r.rows_written END), 0)
       + coalesce(max(CASE WHEN r.layer = 'quarantine' THEN r.rows_written END), 0)
     AS BIGINT
   ) AS rows_processed,
-  CAST(max(CASE WHEN r.layer = 'bronze' THEN r.status END) AS STRING) AS bronze_status,
+  CAST(max(CASE WHEN r.layer = '{layer}' THEN r.status END) AS STRING) AS target_status,
   CAST(max(CASE WHEN r.layer = 'quarantine' THEN r.status END) AS STRING) AS quarantine_status,
-  CAST(max(e.expectations) AS STRING) AS expectations
+  CAST(max(e.expectations) AS STRING) AS expectations,
+  CAST(
+    CASE
+      WHEN max(CASE WHEN r.layer = '{layer}' THEN r.status END) IN ('FAILED', 'CANCELED')
+      THEN CONCAT('flow status ', max(CASE WHEN r.layer = '{layer}' THEN r.status END))
+      ELSE NULL
+    END AS STRING
+  ) AS failure_reason
 FROM resolved r
 LEFT JOIN staged_expectations e ON e.dataflow = r.dataflow
 WHERE r.dataflow IS NOT NULL
-  AND r.layer IN ('staged', 'bronze', 'quarantine')
+  AND r.layer IN ('staged', '{layer}', 'quarantine')
 GROUP BY r.pipeline_id, r.update_id, r.dataflow
+HAVING max(CASE WHEN r.layer = '{layer}' THEN r.table_name END) IS NOT NULL
 """
+
+
+def latest_bronze_loads_sql(event_log: str, meta: str, job_name: str) -> str:
+    """Compatibility wrapper for bronze-layer SQL."""
+
+    return latest_loads_sql(event_log, meta, job_name, layer="bronze")
 
 
 def _rows(frame: Any) -> list[dict]:

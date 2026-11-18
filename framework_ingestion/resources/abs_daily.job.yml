@@ -33,9 +33,22 @@ resources:
       - task_key: record_load_metrics
         depends_on:
         - task_key: refresh_pipeline
+        run_if: ALL_DONE
         environment_key: framework_env
         spark_python_task:
           python_file: ../src/record_load_metrics.py
           parameters:
           - ${var.catalog}
           - abs_daily
+          - bronze
+      - task_key: record_this_run
+        depends_on:
+        - task_key: record_load_metrics
+        run_if: ALL_DONE
+        environment_key: framework_env
+        spark_python_task:
+          python_file: ../src/record_this_run.py
+          parameters:
+          - ${var.catalog}
+          - abs_daily
+          - '{{job.run_id}}'

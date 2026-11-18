@@ -231,9 +231,10 @@ def test_job_status_is_the_latest_recorded_run_per_workflow():
     assert workflows < runs < statements.index(status)
 
 
-def test_ops_bundle_wires_metrics_system_views_and_table_health():
+def test_ops_bundle_wires_system_views_archive_and_table_health():
     resources = yaml.safe_load((BUNDLE / "resources" / "framework_ops.job.yml").read_text("utf-8"))
-    jobs, pipelines = resources["resources"]["jobs"], resources["resources"]["pipelines"]
+    jobs = resources["resources"]["jobs"]
+    pipelines = resources["resources"].get("pipelines") or {}
     # Missing system table grants must not stop the registry DDL, so the views are their own job.
     assert [task["task_key"] for task in jobs["framework_ddl"]["tasks"]] == ["apply_ddl"]
     # The system views are off unless the target sets system_views: the condition skips them.
@@ -253,11 +254,9 @@ def test_ops_bundle_wires_metrics_system_views_and_table_health():
         assert task["spark_python_task"]["parameters"] == ["${var.catalog}", part]
     assert "schedule" in jobs["framework_runs"]
     health = {task["task_key"] for task in jobs["framework_optimize"]["tasks"]}
-    assert health == {"optimize", "table_health"}
-    pipeline = pipelines["framework_metrics_pipeline"]
-    assert pipeline["serverless"] is True
-    assert pipeline["configuration"] == {"lakeflow_framework.catalog": "${var.catalog}"}
-    assert "event_log" not in pipeline  # its own log would be read back as an ingestion log
-    refresh = jobs["framework_metrics"]["tasks"][0]["pipeline_task"]["pipeline_id"]
-    assert refresh == "${resources.pipelines.framework_metrics_pipeline.id}"
-    assert jobs["framework_metrics"]["performance_target"] == "PERFORMANCE_OPTIMIZED"
+    assert health == {"optimize", "archive_hot", "table_health"}
+    assert "framework_metrics" not in jobs
+    assert "framework_metrics_pipeline" not in pipelines
+    assert "v_loads" in "\n".join(ddl_statements("framework_dev"))
+    assert "v_load_failures" in "\n".join(ddl_statements("framework_dev"))
+    assert "load_ledger_archive" in "\n".join(ddl_statements("framework_dev"))

@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>framework_meta data dictionary</title>
+  <style>
+    :root {
+      --bg: #f4f0e8;
+      --ink: #1c1917;
+      --muted: #57534e;
+      --card: #fffcf7;
+      --line: #d6d3d1;
+      --accent: #0f766e;
+      --accent-soft: #ccfbf1;
+      --table: #1d4ed8;
+      --view: #7c3aed;
+      --chip: #e7e5e4;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.5 "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #d1fae5 0%, transparent 55%),
+        radial-gradient(900px 400px at 100% 0%, #e0e7ff 0%, transparent 50%),
+        var(--bg);
+    }
+    header {
+      position: sticky; top: 0; z-index: 5;
+      backdrop-filter: blur(10px);
+      background: color-mix(in srgb, var(--bg) 82%, white);
+      border-bottom: 1px solid var(--line);
+      padding: 1rem 1.25rem;
+    }
+    .bar { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; justify-content: space-between; max-width: 1100px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 1.25rem; letter-spacing: -.02em; }
+    .sub { color: var(--muted); font-size: .9rem; margin-top: .2rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+    input[type="search"] {
+      min-width: 220px; flex: 1; max-width: 360px;
+      padding: .55rem .75rem; border: 1px solid var(--line); border-radius: 8px;
+      background: white; font: inherit;
+    }
+    button, a.btn {
+      appearance: none; border: 1px solid var(--ink); background: var(--ink); color: white;
+      padding: .55rem .9rem; border-radius: 8px; font: inherit; cursor: pointer; text-decoration: none;
+    }
+    a.btn.secondary { background: transparent; color: var(--ink); }
+    main { max-width: 1100px; margin: 0 auto; padding: 1.25rem; }
+    .intro {
+      background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+      padding: 1rem 1.1rem; margin-bottom: 1rem;
+    }
+    .intro a { color: var(--accent); }
+    .filters { display: flex; flex-wrap: wrap; gap: .4rem; margin: .75rem 0 1rem; }
+    .filters button {
+      background: var(--chip); color: var(--ink); border-color: transparent; padding: .35rem .7rem; font-size: .85rem;
+    }
+    .filters button.active { background: var(--accent-soft); border-color: var(--accent); }
+    .grid { display: grid; gap: .85rem; }
+    article {
+      background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+      padding: 1rem 1.1rem; scroll-margin-top: 5.5rem;
+    }
+    article.hidden { display: none; }
+    .top { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline; justify-content: space-between; }
+    .name { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 1.05rem; font-weight: 600; }
+    .kind {
+      font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+      padding: .2rem .45rem; border-radius: 999px;
+    }
+    .kind.table { background: #dbeafe; color: var(--table); }
+    .kind.view { background: #ede9fe; color: var(--view); }
+    .kind.mv { background: #ffedd5; color: #c2410c; }
+    .meta { display: grid; gap: .35rem; margin: .7rem 0; color: var(--muted); font-size: .92rem; }
+    .meta strong { color: var(--ink); font-weight: 600; }
+    .purpose { margin: .4rem 0 0; }
+    details { margin-top: .65rem; }
+    summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+    ul.cols { margin: .4rem 0 0; padding-left: 1.1rem; font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: .82rem; }
+    footer { max-width: 1100px; margin: 0 auto 2rem; padding: 0 1.25rem; color: var(--muted); font-size: .85rem; }
+    @media print {
+      header { position: static; }
+      .actions, .filters, input[type="search"] { display: none !important; }
+      article { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <div>
+        <h1>framework_meta data dictionary</h1>
+        <div class="sub">Lakeflow framework bundle · catalog schema for definitions, runs, and load metrics</div>
+      </div>
+      <div class="actions">
+        <input id="q" type="search" placeholder="Filter by name or purpose…" />
+        <button type="button" id="download">Download HTML</button>
+        <a class="btn secondary" href="https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit" target="_blank" rel="noopener">Open Lucid ERD</a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <p><strong>How to use:</strong> filter tables and views below, open a card for purpose and grain, then download this page as a standalone HTML file for offline sharing. Physical relationships are in the <a href="https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit" target="_blank" rel="noopener">Lucidchart ER diagram</a>.</p>
+      <p>Schema: <code>&lt;catalog&gt;.framework_meta</code>. Pipeline-owned metrics objects (<code>flow_events</code>, <code>table_load_metrics</code>, <code>&lt;job&gt;_event_log</code>) live in the same schema but are created by pipelines, not by <code>framework_meta.sql</code>.</p>
+    </section>
+
+    <div class="filters" id="filters">
+      <button type="button" data-filter="all" class="active">All</button>
+      <button type="button" data-filter="table">Tables</button>
+      <button type="button" data-filter="view">Views</button>
+      <button type="button" data-filter="mv">Pipeline objects</button>
+    </div>
+
+    <div class="grid" id="cards"></div>
+  </main>
+
+  <footer>
+    Generated for the Lakeflow framework bundle. Relationships in Lucid are logical join keys (Delta tables do not declare primary keys).
+  </footer>
+
+  <script>
+    const LUCID = "https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit";
+    const objects = [
+      {
+        kind: "table", name: "object_registry",
+        writtenBy: "registry_sync", grain: "One SCD Type 2 version of one definition",
+        purpose: "History of every source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column the bundle deploys. Changed specs close the current version and insert a new one; removed specs get a deletion version.",
+        columns: ["object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "config", "valid_from", "valid_to", "is_current", "is_deleted", "recorded_at"]
+      },
+      {
+        kind: "table", name: "object_current",
+        writtenBy: "registry_sync", grain: "One row per (object_kind, full_name)",
+        purpose: "Current non-deleted definition for lookups and dashboards. Avoids windowing object_registry for every query.",
+        columns: ["object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "config", "recorded_at"]
+      },
+      {
+        kind: "table", name: "run_ledger",
+        writtenBy: "registry_sync", grain: "One ownership refusal (or legacy job step)",
+        purpose: "Insert-only event log of definitions refused because another owner already holds the name. Delivery jobs no longer write load steps here.",
+        columns: ["run_id", "object_kind", "full_name", "owner_kind", "owner", "step_no", "step_name", "status", "failure_reason", "recorded_at", "event_date"]
+      },
+      {
+        kind: "table", name: "run_current",
+        writtenBy: "registry_sync", grain: "One latest ledger step per owned object",
+        purpose: "Current refusal/step pointer for each object key, for quick status without scanning run_ledger.",
+        columns: ["run_id", "object_kind", "full_name", "owner_kind", "owner", "step_name", "status", "recorded_at", "event_date"]
+      },
+      {
+        kind: "table", name: "table_health",
+        writtenBy: "framework_optimize (daily)", grain: "One bronze table per optimize run",
+        purpose: "File count, size, and last load commit metrics from DESCRIBE DETAIL / HISTORY for bronze tables listed in v_bronze_tables.",
+        columns: ["table_name", "owner_kind", "owner", "num_files", "size_in_bytes", "last_version", "last_operation", "last_commit_at", "last_operation_metrics", "error", "recorded_at", "event_date"]
+      },
+      {
+        kind: "table", name: "job_runs",
+        writtenBy: "record_this_run (NRT) + framework_runs (hourly catch-up)", grain: "One Jobs API run of a framework job",
+        purpose: "Run outcomes for delivery and framework jobs tagged lakeflow_framework_workflow. Includes failure_reason. Merged on (job_id, run_id); no system.lakeflow grant required. Hot ~7 days; older rows move to job_runs_archive.",
+        columns: ["job_name", "deployed_name", "job_id", "run_id", "started_at", "ended_at", "status", "result_state", "termination_code", "failure_reason", "run_seconds", "run_page_url", "recorded_at"]
+      },
+      {
+        kind: "table", name: "job_task_runs",
+        writtenBy: "framework_runs (hourly) + NRT when available", grain: "One task within a job run",
+        purpose: "Per-task status for framework job runs (refresh_pipeline, record_load_metrics, record_this_run). Includes failure_reason for repair.",
+        columns: ["job_name", "job_id", "job_run_id", "task_run_id", "task_key", "started_at", "ended_at", "status", "result_state", "failure_reason", "recorded_at"]
+      },
+      {
+        kind: "table", name: "pipeline_updates",
+        writtenBy: "framework_runs (hourly)", grain: "One Lakeflow pipeline update",
+        purpose: "Update start/end/state from each delivery pipeline's published event log (update_progress events).",
+        columns: ["job_name", "pipeline_id", "pipeline_name", "update_id", "started_at", "ended_at", "state", "status", "recorded_at"]
+      },
+      {
+        kind: "table", name: "load_ledger",
+        writtenBy: "each layer job · record_load_metrics (run_if ALL_DONE)", grain: "One append per job, layer, update, and dataflow",
+        purpose: "Sole recon SoR: append-only counts for bronze, silver, gold, and product, plus FAILED stubs when the event log has no flow_progress. No MERGE, no table scan. Hot ~7 days; older rows move to load_ledger_archive.",
+        columns: ["job_name", "layer", "pipeline_id", "update_id", "dataflow", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_quarantine", "rows_processed", "target_status", "expectations", "failure_reason", "recorded_at"]
+      },
+      {
+        kind: "table", name: "load_ledger_archive",
+        writtenBy: "framework_optimize · archive_hot", grain: "Same as load_ledger after move",
+        purpose: "Forever archive of load_ledger rows older than 7 days. Queried via v_loads_90d with hot.",
+        columns: ["job_name", "layer", "pipeline_id", "update_id", "dataflow", "rows_read", "rows_written", "failure_reason", "recorded_at", "archived_at"]
+      },
+      {
+        kind: "table", name: "job_runs_archive",
+        writtenBy: "framework_optimize · archive_hot", grain: "Same as job_runs after move",
+        purpose: "Forever archive of job_runs older than 7 days.",
+        columns: ["job_name", "job_id", "run_id", "status", "failure_reason", "recorded_at", "archived_at"]
+      },
+      {
+        kind: "table", name: "load_daily_rollup",
+        writtenBy: "reserved (daily rollup refresh)", grain: "One job / layer / day",
+        purpose: "Pre-aggregated daily counts for long-range dashboards; DDL present, refresh may be filled later.",
+        columns: ["job_name", "layer", "event_date", "rows_read", "rows_written", "rows_quarantine", "failed_loads"]
+      },
+      {
+        kind: "table", name: "ddl_applied",
+        writtenBy: "framework_ddl / apply_ddl", grain: "One SQL file hash per successful apply",
+        purpose: "Skip unchanged framework_meta.sql on later deploys. Delete rows or pass force to reapply.",
+        columns: ["sql_hash", "applied_at"]
+      },
+      {
+        kind: "mv", name: "<job>_event_log",
+        writtenBy: "each ingestion pipeline", grain: "One pipeline event",
+        purpose: "Published Lakeflow event log for a delivery (for example abs_daily_event_log). Source for pipeline_updates and record_load_metrics.",
+        columns: ["id", "timestamp", "event_type", "details", "origin.pipeline_id", "origin.update_id", "origin.flow_name"]
+      },
+      {
+        kind: "mv", name: "flow_events",
+        writtenBy: "deprecated (DDL only; not written by ops)", grain: "One flow_definition or flow_progress event",
+        purpose: "Legacy dual-path metrics. Prefer load_ledger / v_loads. framework_metrics pipeline retired from the ops bundle.",
+        columns: ["job_name", "pipeline_id", "update_id", "flow_name", "event_id", "event_type", "event_at", "details"]
+      },
+      {
+        kind: "mv", name: "table_load_metrics",
+        writtenBy: "deprecated (DDL only; not written by ops)", grain: "One job, update, flow, and table",
+        purpose: "Legacy per-flow breakdown. Prefer v_loads / load_ledger for recon across layers.",
+        columns: ["job_name", "pipeline_id", "update_id", "flow_name", "table_name", "layer", "dataflow", "rows_written", "status", "expectations"]
+      },
+      {
+        kind: "view", name: "v_object_current",
+        writtenBy: "framework_meta.sql", grain: "Same as object_current",
+        purpose: "Stable read API over object_current for dashboards and other views.",
+        columns: ["object_kind", "full_name", "owner", "config", "content_hash", "recorded_at"]
+      },
+      {
+        kind: "view", name: "v_object_history",
+        writtenBy: "framework_meta.sql", grain: "Every version in object_registry",
+        purpose: "Point-in-time history of definitions using SCD columns (valid_from / valid_to / is_current / is_deleted).",
+        columns: ["object_kind", "full_name", "config", "valid_from", "valid_to", "is_current", "is_deleted"]
+      },
+      {
+        kind: "view", name: "v_source_systems",
+        writtenBy: "framework_meta.sql", grain: "One current source_system",
+        purpose: "Source.yaml details: domain, owner email, kind, engine, foreign catalog, deliveries.",
+        columns: ["source_system", "domain", "owner_email", "source_kind", "engine", "foreign_catalog"]
+      },
+      {
+        kind: "view", name: "v_schemas",
+        writtenBy: "framework_meta.sql", grain: "One current schema definition",
+        purpose: "Schemas a source reads or writes, with layers and declared Unity Catalog tags.",
+        columns: ["schema_name", "owner", "layers", "tags"]
+      },
+      {
+        kind: "view", name: "v_workflows",
+        writtenBy: "framework_meta.sql", grain: "One delivery job",
+        purpose: "Registered workflows with pipeline ids, schedule/trigger, and ownership used by run collectors.",
+        columns: ["job_name", "owner", "pipeline_ids", "schedule", "delivery_trigger"]
+      },
+      {
+        kind: "view", name: "v_pipelines",
+        writtenBy: "framework_meta.sql", grain: "One pipeline_id",
+        purpose: "Pipeline specs with domain, team, technical owner, and notify lists.",
+        columns: ["pipeline", "owner", "job_name", "domain", "team", "technical_owner"]
+      },
+      {
+        kind: "view", name: "v_dataflows",
+        writtenBy: "framework_meta.sql", grain: "One dataflow per pipeline",
+        purpose: "Raw / bronze / quarantine targets for each table load.",
+        columns: ["dataflow", "pipeline", "raw", "bronze", "quarantine"]
+      },
+      {
+        kind: "view", name: "v_flows",
+        writtenBy: "framework_meta.sql", grain: "One layer flow",
+        purpose: "Individual raw, bronze, or quarantine flows with path or table name.",
+        columns: ["flow", "dataflow", "layer", "path", "table_name"]
+      },
+      {
+        kind: "view", name: "v_tables",
+        writtenBy: "framework_meta.sql", grain: "One securable table",
+        purpose: "Bronze/quarantine/raw tables with classification, PII, pipeline, job, and load method tags.",
+        columns: ["table_name", "owner", "layer", "pipeline_id", "job_name", "load_method", "classification", "pii"]
+      },
+      {
+        kind: "view", name: "v_columns",
+        writtenBy: "framework_meta.sql", grain: "One current column",
+        purpose: "Declared columns with type, description, classification, and PII.",
+        columns: ["table_name", "column_name", "ordinal", "data_type", "description", "classification", "pii"]
+      },
+      {
+        kind: "view", name: "v_column_history",
+        writtenBy: "framework_meta.sql", grain: "One column version",
+        purpose: "SCD history of column definitions.",
+        columns: ["table_name", "column_name", "data_type", "valid_from", "valid_to", "is_current"]
+      },
+      {
+        kind: "view", name: "v_lineage",
+        writtenBy: "framework_meta.sql", grain: "One link row",
+        purpose: "Declared pipeline→table write/reject edges from object_current link rows.",
+        columns: ["full_name", "parent_full_name", "relation", "config"]
+      },
+      {
+        kind: "view", name: "v_bronze_tables",
+        writtenBy: "framework_meta.sql", grain: "Distinct bronze table names",
+        purpose: "Input list for the daily table_health step.",
+        columns: ["table_name", "owner_kind", "owner"]
+      },
+      {
+        kind: "view", name: "v_ownership_refusals",
+        writtenBy: "framework_meta.sql", grain: "One FAILED ownership_check",
+        purpose: "Definitions registry_sync refused because another owner holds the name.",
+        columns: ["object_kind", "full_name", "refused_owner", "failure_reason", "recorded_at"]
+      },
+      {
+        kind: "view", name: "v_ownership_conflicts",
+        writtenBy: "framework_meta.sql", grain: "Names with more than one current holder",
+        purpose: "Integrity check: should be empty when object_current has one owner per name.",
+        columns: ["object_kind", "full_name", "owners"]
+      },
+      {
+        kind: "view", name: "v_metadata_drift",
+        writtenBy: "framework_meta.sql", grain: "One drifted tag or comment",
+        purpose: "Declared vs Unity Catalog schema/table/column tags and comments. Empty when APPLY_TAGS is on and in sync; phase 1 parks tag assignment.",
+        columns: ["securable", "table_name", "column_name", "item", "declared", "applied"]
+      },
+      {
+        kind: "view", name: "v_run_current",
+        writtenBy: "framework_meta.sql", grain: "Latest ledger step per object",
+        purpose: "Readable projection of run_current for refusals and legacy steps.",
+        columns: ["run_id", "object_kind", "full_name", "owner", "step_name", "status"]
+      },
+      {
+        kind: "view", name: "v_process",
+        writtenBy: "framework_meta.sql", grain: "Every run_ledger row",
+        purpose: "Full process/refusal history from run_ledger.",
+        columns: ["run_id", "object_kind", "full_name", "step_name", "status", "event_date"]
+      },
+      {
+        kind: "view", name: "v_job_runs",
+        writtenBy: "framework_meta.sql", grain: "One job run with workflow owner",
+        purpose: "job_runs joined to v_workflows for ownership and delivery context.",
+        columns: ["job_name", "owner", "run_id", "status", "started_at", "run_seconds", "run_page_url"]
+      },
+      {
+        kind: "view", name: "v_job_status",
+        writtenBy: "framework_meta.sql", grain: "One workflow + latest run",
+        purpose: "Current status of each registered workflow (null status if never run).",
+        columns: ["job_name", "owner", "run_id", "status", "started_at", "run_page_url"]
+      },
+      {
+        kind: "view", name: "v_job_task_runs",
+        writtenBy: "framework_meta.sql", grain: "One task run with workflow owner",
+        purpose: "Task-level outcomes joined to workflows.",
+        columns: ["job_name", "owner", "job_run_id", "task_key", "status"]
+      },
+      {
+        kind: "view", name: "v_pipeline_updates",
+        writtenBy: "framework_meta.sql", grain: "One pipeline update with workflow owner",
+        purpose: "Pipeline update timing/state joined to workflows.",
+        columns: ["job_name", "owner", "pipeline_id", "update_id", "status", "duration_seconds"]
+      },
+      {
+        kind: "view", name: "v_loads",
+        writtenBy: "framework_meta.sql", grain: "Latest ledger row per job, layer, update, dataflow",
+        purpose: "Sole recon SoR read API for per-load row counts across bronze, silver, gold, and product (including FAILED stubs). Deduplicates retries of record_load_metrics.",
+        columns: ["job_name", "layer", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_quarantine", "rows_processed", "target_status", "failure_reason", "started_at"]
+      },
+      {
+        kind: "view", name: "v_loads_90d",
+        writtenBy: "framework_meta.sql", grain: "Latest load across hot + archive",
+        purpose: "Dashboard window: unions 7-day hot load_ledger with forever load_ledger_archive, then latest per key.",
+        columns: ["job_name", "layer", "target_table", "rows_read", "rows_written", "failure_reason", "recorded_at"]
+      },
+      {
+        kind: "view", name: "v_load_failures",
+        writtenBy: "framework_meta.sql", grain: "One failed load and/or job/task with reasons",
+        purpose: "What failed and why for repair: load failure_reason plus job/task failure_reason and run page.",
+        columns: ["job_name", "layer", "target_table", "target_status", "load_failure_reason", "job_status", "job_failure_reason", "task_key", "task_failure_reason", "run_page_url"]
+      },
+      {
+        kind: "view", name: "v_bronze_loads",
+        writtenBy: "framework_meta.sql", grain: "Latest bronze row per job, update, dataflow",
+        purpose: "Bronze-only slice of v_loads with legacy column aliases (bronze_table, rows_bronze, bronze_status).",
+        columns: ["job_name", "bronze_table", "quarantine_table", "rows_read", "rows_bronze", "rows_quarantine", "rows_processed", "started_at"]
+      },
+      {
+        kind: "view", name: "v_job_costs",
+        writtenBy: "system_views.sql (optional)", grain: "One job run with DBUs/cost",
+        purpose: "Optional cost from system.billing. Created only when system_views=true.",
+        columns: ["job_name", "run_id", "dbus", "list_cost"]
+      },
+      {
+        kind: "view", name: "v_pipeline_costs",
+        writtenBy: "system_views.sql (optional)", grain: "One pipeline update with DBUs/cost",
+        purpose: "Optional pipeline update cost from system.billing when system_views=true.",
+        columns: ["job_name", "update_id", "dbus", "list_cost"]
+      },
+      {
+        kind: "view", name: "v_observed_lineage",
+        writtenBy: "system_views.sql (optional)", grain: "One observed vs declared lineage row",
+        purpose: "Compares system.access.table_lineage to declared raw sources when system_views=true.",
+        columns: ["table_name", "declared_source", "observed_source", "status"]
+      }
+    ];
+
+    const cards = document.getElementById("cards");
+    const q = document.getElementById("q");
+    let activeFilter = "all";
+
+    function render() {
+      const term = q.value.trim().toLowerCase();
+      cards.innerHTML = "";
+      for (const obj of objects) {
+        const hay = [obj.name, obj.purpose, obj.writtenBy, obj.grain, ...(obj.columns || [])].join(" ").toLowerCase();
+        const matchFilter = activeFilter === "all" || obj.kind === activeFilter;
+        const matchText = !term || hay.includes(term);
+        if (!(matchFilter && matchText)) continue;
+        const art = document.createElement("article");
+        art.dataset.kind = obj.kind;
+        art.innerHTML = `
+          <div class="top">
+            <div class="name">${obj.name}</div>
+            <span class="kind ${obj.kind}">${obj.kind === "mv" ? "pipeline object" : obj.kind}</span>
+          </div>
+          <p class="purpose">${obj.purpose}</p>
+          <div class="meta">
+            <div><strong>Written by:</strong> ${obj.writtenBy}</div>
+            <div><strong>Grain:</strong> ${obj.grain}</div>
+          </div>
+          <details>
+            <summary>Key columns</summary>
+            <ul class="cols">${(obj.columns || []).map(c => `<li>${c}</li>`).join("")}</ul>
+          </details>`;
+        cards.appendChild(art);
+      }
+      if (!cards.children.length) {
+        cards.innerHTML = `<article><p class="purpose">No objects match this filter.</p></article>`;
+      }
+    }
+
+    q.addEventListener("input", render);
+    document.getElementById("filters").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-filter]");
+      if (!btn) return;
+      activeFilter = btn.dataset.filter;
+      for (const b of document.querySelectorAll("#filters button")) b.classList.toggle("active", b === btn);
+      render();
+    });
+
+    document.getElementById("download").addEventListener("click", () => {
+      const blob = new Blob([document.documentElement.outerHTML], { type: "text/html;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "framework_meta_data_dictionary.html";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    render();
+  </script>
+</body>
+</html>

@@ -96,7 +96,18 @@ resources:
             python_file: ../src/optimize_registry.py
             parameters:
               - ${var.catalog}
+        - task_key: archive_hot
+          depends_on:
+            - task_key: optimize
+          environment_key: framework_env
+          spark_python_task:
+            python_file: ../src/archive_hot.py
+            parameters:
+              - ${var.catalog}
+              - "7"
         - task_key: table_health
+          depends_on:
+            - task_key: archive_hot
           environment_key: framework_env
           spark_python_task:
             python_file: ../src/record_table_health.py
@@ -109,29 +120,4 @@ resources:
             dependencies:
               - ../../framework_lff_lib/dist/*.whl
 
-    framework_metrics:
-      name: framework_metrics
-      performance_target: PERFORMANCE_OPTIMIZED
-      schedule:
-        quartz_cron_expression: "0 30 * * * ?"
-        timezone_id: UTC
-      tasks:
-        - task_key: refresh_metrics
-          pipeline_task:
-            pipeline_id: ${resources.pipelines.framework_metrics_pipeline.id}
-      queue:
-        enabled: true
-
-  pipelines:
-    framework_metrics_pipeline:
-      name: framework_metrics
-      catalog: ${var.catalog}
-      schema: framework_meta
-      serverless: true
-      channel: current
-      continuous: false
-      configuration:
-        lakeflow_framework.catalog: ${var.catalog}
-      libraries:
-        - file:
-            path: ../src/framework_metrics.py
+    # framework_metrics (flow_events / table_load_metrics) retired: recon is load_ledger / v_loads.

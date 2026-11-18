@@ -1,14 +1,7 @@
-"""framework_metrics pipeline: one row per pipeline update, flow, and table in table_load_metrics.
+"""Deprecated: recon is load_ledger / v_loads via record_load_metrics on each delivery job.
 
-Every ingestion pipeline publishes its event log to framework_meta as <job name>_event_log.
-Each update of this pipeline lists those tables and streams their flow_definition and
-flow_progress events into flow_events, one append flow per log. table_load_metrics groups
-those events by pipeline, update, and flow. Per-load rows_read / bronze / quarantine counts are
-appended by each delivery job into bronze_load_ledger (see load_metrics), not by this pipeline.
-A log added since the last update gets its flow on the next one.
-
-Quality rules are checked on the private <pipeline_id>_staged table, so expectation counts
-are on the staged row; its dataflow column names the spec, as on the bronze row.
+This module remains for reference and unit tests. The framework_metrics job/pipeline was
+removed from framework_ops.job.yml. Do not redeploy it for production recon.
 """
 
 from __future__ import annotations

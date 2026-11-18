@@ -73,6 +73,7 @@ def test_a_run_becomes_one_row_and_a_row_per_task():
     row, tasks = job_run_rows(_run(), "abs_daily", "[dev me] abs_daily", "123", NOW)
     assert (row["job_id"], row["run_id"], row["status"]) == ("7", "11", "SUCCEEDED")
     assert row["termination_code"] == "SUCCESS"
+    assert row["failure_reason"] is None
     assert row["run_seconds"] == 90.0 and row["setup_seconds"] == 1.0
     assert row["started_at"] == datetime(2026, 11, 17, 5, 0, tzinfo=timezone.utc)
     assert row["trigger_type"] == "PERIODIC"
@@ -83,6 +84,21 @@ def test_a_run_becomes_one_row_and_a_row_per_task():
         "refresh_pipeline",
     )
     assert task["status"] == "SUCCEEDED"
+    assert task["failure_reason"] is None
+
+
+def test_failure_reason_comes_from_state_message():
+    run = _run(result="FAILED")
+    run["state"]["state_message"] = "Pipeline update failed: SCHEMA_MISMATCH"
+    run["tasks"][0]["state"] = {
+        "life_cycle_state": "TERMINATED",
+        "result_state": "FAILED",
+        "state_message": "boom",
+    }
+    row, tasks = job_run_rows(run, "abs_daily", "abs_daily", "123", NOW)
+    assert row["status"] == "FAILED"
+    assert row["failure_reason"] == "Pipeline update failed: SCHEMA_MISMATCH"
+    assert tasks[0]["failure_reason"] == "boom"
 
 
 def test_a_running_run_has_no_end_and_the_newer_status_shape_is_read():

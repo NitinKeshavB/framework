@@ -457,15 +457,29 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         refresh["depends_on"] = [{"task_key": "batch_load"}]
     refresh["pipeline_task"] = {"pipeline_id": f"${{resources.pipelines.{name}_pipeline.id}}"}
     tasks.append(refresh)
-    # Append-only insert of rows_read / bronze / quarantine for this update. No MERGE.
+    # Append load_ledger even when refresh_pipeline failed (ALL_DONE). No MERGE.
     tasks.append(
         {
             "task_key": "record_load_metrics",
             "depends_on": [{"task_key": "refresh_pipeline"}],
+            "run_if": "ALL_DONE",
             "environment_key": "framework_env",
             "spark_python_task": {
                 "python_file": "../src/record_load_metrics.py",
-                "parameters": ["${var.catalog}", name],
+                "parameters": ["${var.catalog}", name, "bronze"],
+            },
+        }
+    )
+    # NRT job status into job_runs (success or failure). Hourly framework_runs is catch-up.
+    tasks.append(
+        {
+            "task_key": "record_this_run",
+            "depends_on": [{"task_key": "record_load_metrics"}],
+            "run_if": "ALL_DONE",
+            "environment_key": "framework_env",
+            "spark_python_task": {
+                "python_file": "../src/record_this_run.py",
+                "parameters": ["${var.catalog}", name, "{{job.run_id}}"],
             },
         }
     )

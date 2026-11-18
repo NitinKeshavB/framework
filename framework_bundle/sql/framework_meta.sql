@@ -12,7 +12,7 @@
 -- so a lookup does not window the history. job_runs, job_task_runs, and pipeline_updates are written hourly by
 -- framework_runs from the Jobs API and the pipeline event logs, merged on their run or update
 -- key, so a run that was still going is updated when it ends. They need no system table
--- grants. Per-load row counts are in bronze_load_ledger (appended by each delivery job). Cost is in system_views.sql.
+-- grants. Per-load row counts for every layer are in load_ledger (appended by each job). Cost is in system_views.sql.
 --
 -- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
 -- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs (
   life_cycle_state STRING,
   result_state STRING,
   termination_code STRING,
+  failure_reason STRING,
   trigger_type STRING,
   setup_seconds DOUBLE,
   queue_seconds DOUBLE,
@@ -187,6 +188,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs (
   life_cycle_state STRING,
   result_state STRING,
   termination_code STRING,
+  failure_reason STRING,
   recorded_at TIMESTAMP
 )
 CLUSTER BY (job_name, started_at)
@@ -214,32 +216,177 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- Append-only counts for each bronze table load. Each delivery job inserts a few rows after its
--- pipeline refresh, from that update's event log only. No MERGE. A retry may append again. The
--- view below keeps the latest recorded_at per job, update, and dataflow.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.bronze_load_ledger (
+-- Append-only counts for every medallion layer (bronze, silver, gold, product). Each delivery
+-- or curation job inserts a few rows after its pipeline refresh, from that update's event log
+-- only. No MERGE. A retry may append again. v_loads keeps the latest recorded_at per job,
+-- layer, update, and dataflow. Until go-live, drop framework_meta to replace bronze_load_ledger.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
   job_name STRING,
+  layer STRING,
   pipeline_id STRING,
   pipeline_name STRING,
   update_id STRING,
   dataflow STRING,
   owner_kind STRING,
   owner STRING,
-  bronze_table STRING,
+  target_table STRING,
   quarantine_table STRING,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
   duration_seconds DOUBLE,
   rows_read BIGINT,
-  rows_bronze BIGINT,
+  rows_written BIGINT,
   rows_quarantine BIGINT,
   rows_processed BIGINT,
-  bronze_status STRING,
+  target_status STRING,
   quarantine_status STRING,
   expectations STRING,
+  failure_reason STRING,
   recorded_at TIMESTAMP
 )
+CLUSTER BY (layer, job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+-- Forever archives: rows moved out of the 7-day hot tables by archive_hot. Never purged.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
+  job_name STRING,
+  layer STRING,
+  pipeline_id STRING,
+  pipeline_name STRING,
+  update_id STRING,
+  dataflow STRING,
+  owner_kind STRING,
+  owner STRING,
+  target_table STRING,
+  quarantine_table STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  duration_seconds DOUBLE,
+  rows_read BIGINT,
+  rows_written BIGINT,
+  rows_quarantine BIGINT,
+  rows_processed BIGINT,
+  target_status STRING,
+  quarantine_status STRING,
+  expectations STRING,
+  failure_reason STRING,
+  recorded_at TIMESTAMP,
+  archived_at TIMESTAMP
+)
+CLUSTER BY (layer, job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs_archive (
+  job_name STRING,
+  deployed_name STRING,
+  workspace_id STRING,
+  job_id STRING,
+  run_id STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  status STRING,
+  life_cycle_state STRING,
+  result_state STRING,
+  termination_code STRING,
+  failure_reason STRING,
+  trigger_type STRING,
+  setup_seconds DOUBLE,
+  queue_seconds DOUBLE,
+  execution_seconds DOUBLE,
+  run_seconds DOUBLE,
+  run_page_url STRING,
+  recorded_at TIMESTAMP,
+  archived_at TIMESTAMP
+)
 CLUSTER BY (job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs_archive (
+  job_name STRING,
+  workspace_id STRING,
+  job_id STRING,
+  job_run_id STRING,
+  task_run_id STRING,
+  task_key STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  status STRING,
+  life_cycle_state STRING,
+  result_state STRING,
+  termination_code STRING,
+  failure_reason STRING,
+  recorded_at TIMESTAMP,
+  archived_at TIMESTAMP
+)
+CLUSTER BY (job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates_archive (
+  job_name STRING,
+  pipeline_id STRING,
+  pipeline_name STRING,
+  update_id STRING,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  state STRING,
+  status STRING,
+  recorded_at TIMESTAMP,
+  archived_at TIMESTAMP
+)
+CLUSTER BY (job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.table_health_archive (
+  table_name STRING,
+  owner_kind STRING,
+  owner STRING,
+  num_files BIGINT,
+  size_in_bytes BIGINT,
+  last_version BIGINT,
+  last_operation STRING,
+  last_commit_at TIMESTAMP,
+  last_operation_metrics MAP<STRING, STRING>,
+  error STRING,
+  recorded_at TIMESTAMP,
+  event_date DATE,
+  archived_at TIMESTAMP
+)
+CLUSTER BY (owner, event_date, table_name)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true'
+);
+
+-- Daily rollup for 90-day dashboards (day x job x layer x dataflow x target_table).
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_daily_rollup (
+  load_date DATE,
+  job_name STRING,
+  layer STRING,
+  dataflow STRING,
+  target_table STRING,
+  loads BIGINT,
+  rows_read BIGINT,
+  rows_written BIGINT,
+  rows_quarantine BIGINT,
+  rows_processed BIGINT,
+  failed_loads BIGINT,
+  recorded_at TIMESTAMP
+)
+CLUSTER BY (load_date, job_name, layer)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
@@ -269,8 +416,8 @@ SELECT
   recorded_at
 FROM ${catalog}.framework_meta.object_current;
 
--- The latest step per object: an ownership refusal, or a job's last step from before run
--- outcomes moved to the system tables. v_job_status is the current run status.
+-- Deprecated passthrough of run_current. Prefer v_ownership_refusals for refusals and
+-- v_job_status for delivery outcomes. Kept for one release.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_run_current AS
 SELECT
   run_id,
@@ -289,6 +436,7 @@ SELECT
   event_date
 FROM ${catalog}.framework_meta.run_current;
 
+-- Deprecated passthrough of run_ledger. Prefer run_ledger or v_ownership_refusals.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_process AS
 SELECT
   run_id,
@@ -702,6 +850,7 @@ SELECT
   run.life_cycle_state,
   run.result_state,
   run.termination_code,
+  run.failure_reason,
   run.trigger_type,
   run.setup_seconds,
   run.queue_seconds,
@@ -733,6 +882,7 @@ SELECT
   run.status,
   run.result_state,
   run.termination_code,
+  run.failure_reason,
   run.started_at,
   run.ended_at,
   run.run_seconds,
@@ -754,7 +904,8 @@ SELECT
   task.ended_at,
   task.status,
   task.result_state,
-  task.termination_code
+  task.termination_code,
+  task.failure_reason
 FROM ${catalog}.framework_meta.job_task_runs task
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = task.job_name;
 
@@ -775,32 +926,131 @@ SELECT
 FROM ${catalog}.framework_meta.pipeline_updates pu
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;
 
--- Latest append for each load. Retries of record_load_metrics may insert again. This view
--- keeps one row per job, update, and dataflow.
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_loads AS
+-- Latest append for each load across every layer. Retries of record_load_metrics may insert
+-- again. This view keeps one row per job, layer, update, and dataflow.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads AS
 SELECT
   job_name,
+  layer,
   pipeline_id,
   pipeline_name,
   update_id,
   dataflow,
   owner_kind,
   owner,
-  bronze_table,
+  target_table,
   quarantine_table,
   started_at,
   ended_at,
   duration_seconds,
   rows_read,
-  rows_bronze,
+  rows_written,
   rows_quarantine,
   rows_processed,
-  bronze_status,
+  target_status,
   quarantine_status,
   expectations,
+  failure_reason,
   recorded_at
-FROM ${catalog}.framework_meta.bronze_load_ledger
+FROM ${catalog}.framework_meta.load_ledger
 QUALIFY row_number() OVER (
-  PARTITION BY job_name, update_id, dataflow
+  PARTITION BY job_name, layer, update_id, dataflow
   ORDER BY recorded_at DESC
+) = 1;
+
+-- Deprecated: use v_loads WHERE layer = 'bronze'. Kept for one release.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_loads AS
+SELECT
+  job_name,
+  layer,
+  pipeline_id,
+  pipeline_name,
+  update_id,
+  dataflow,
+  owner_kind,
+  owner,
+  target_table AS bronze_table,
+  quarantine_table,
+  started_at,
+  ended_at,
+  duration_seconds,
+  rows_read,
+  rows_written AS rows_bronze,
+  rows_quarantine,
+  rows_processed,
+  target_status AS bronze_status,
+  quarantine_status,
+  expectations,
+  failure_reason,
+  recorded_at
+FROM ${catalog}.framework_meta.v_loads
+WHERE layer = 'bronze';
+
+-- Hot ∪ archive loads for the last 90 days (dashboard window). Archive is forever.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads_90d AS
+WITH combined AS (
+  SELECT
+    job_name, layer, pipeline_id, pipeline_name, update_id, dataflow, owner_kind, owner,
+    target_table, quarantine_table, started_at, ended_at, duration_seconds,
+    rows_read, rows_written, rows_quarantine, rows_processed,
+    target_status, quarantine_status, expectations, failure_reason, recorded_at,
+    CAST(NULL AS TIMESTAMP) AS archived_at
+  FROM ${catalog}.framework_meta.v_loads
+  WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
+  UNION ALL
+  SELECT
+    job_name, layer, pipeline_id, pipeline_name, update_id, dataflow, owner_kind, owner,
+    target_table, quarantine_table, started_at, ended_at, duration_seconds,
+    rows_read, rows_written, rows_quarantine, rows_processed,
+    target_status, quarantine_status, expectations, failure_reason, recorded_at, archived_at
+  FROM ${catalog}.framework_meta.load_ledger_archive
+  WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
+)
+SELECT *
+FROM combined
+QUALIFY row_number() OVER (
+  PARTITION BY job_name, layer, update_id, dataflow
+  ORDER BY recorded_at DESC
+) = 1;
+
+-- What failed and why: loads plus latest job/task status for ops and repair.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_load_failures AS
+SELECT
+  l.job_name,
+  l.layer,
+  l.dataflow,
+  l.target_table,
+  l.update_id,
+  l.pipeline_id,
+  l.target_status,
+  l.quarantine_status,
+  l.failure_reason AS load_failure_reason,
+  l.rows_read,
+  l.rows_written,
+  l.rows_quarantine,
+  l.started_at AS load_started_at,
+  l.recorded_at AS load_recorded_at,
+  j.run_id AS job_run_id,
+  j.status AS job_status,
+  j.result_state AS job_result_state,
+  j.termination_code,
+  j.failure_reason AS job_failure_reason,
+  j.run_page_url,
+  j.started_at AS job_started_at,
+  t.task_key,
+  t.status AS task_status,
+  t.failure_reason AS task_failure_reason
+FROM ${catalog}.framework_meta.v_loads l
+LEFT JOIN ${catalog}.framework_meta.v_job_runs j
+  ON j.job_name = l.job_name
+ AND j.started_at <= coalesce(l.ended_at, l.recorded_at)
+ AND (j.ended_at IS NULL OR j.ended_at >= coalesce(l.started_at, l.recorded_at))
+LEFT JOIN ${catalog}.framework_meta.v_job_task_runs t
+  ON t.job_run_id = j.run_id AND t.task_key = 'refresh_pipeline'
+WHERE l.target_status IN ('FAILED', 'CANCELED')
+   OR l.failure_reason IS NOT NULL
+   OR j.status = 'FAILED'
+QUALIFY row_number() OVER (
+  PARTITION BY l.job_name, l.layer, l.update_id, l.dataflow
+  ORDER BY j.started_at DESC NULLS LAST
 ) = 1;
