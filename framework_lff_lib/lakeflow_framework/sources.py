@@ -45,7 +45,9 @@ WHEEL = "../../../framework_lff_lib/dist/*.whl"
 # Serverless environment for job tasks: version 4 runs Python 3.12.
 ENVIRONMENT_VERSION = "4"
 # Default for generated jobs. Override per source with performance_target in source.yaml.
-PERFORMANCE_TARGET = "STANDARD"
+# TEMPORARY (pre-go-live): PERFORMANCE_OPTIMIZED for fast cold starts while iterating.
+# Switch back to "STANDARD" (cheaper) at go-live.
+PERFORMANCE_TARGET = "PERFORMANCE_OPTIMIZED"
 PACKAGE_VERSION = "0.1.0"  # keep in sync with framework_lff_lib/pyproject.toml [project].version
 # Each pipeline publishes its event log to framework_meta as <job name><suffix>.
 EVENT_LOG_SUFFIX = "_event_log"
@@ -74,8 +76,8 @@ class SourceSystem:
     # Application id or name of the source's service principal. When set, generated job and
     # pipeline resources run_as that principal (grant it only this source's volume / FC / bronze).
     run_as: str = ""
-    # STANDARD (default) or PERFORMANCE_OPTIMIZED. Override in source.yaml when a source needs
-    # fast cold starts; leave STANDARD for scheduled unattended loads.
+    # STANDARD or PERFORMANCE_OPTIMIZED (current default, see PERFORMANCE_TARGET). Override in
+    # source.yaml; prefer STANDARD for scheduled unattended loads once live.
     performance_target: str = PERFORMANCE_TARGET
 
 

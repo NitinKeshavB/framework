@@ -53,7 +53,7 @@ def test_ops_bundle_wires_ddl_system_views_runs_and_archive():
     resources = yaml.safe_load((BUNDLE / "resources" / "framework_ops.job.yml").read_text("utf-8"))
     jobs = resources["resources"]["jobs"]
     assert [task["task_key"] for task in jobs["framework_ddl"]["tasks"]] == ["apply_ddl"]
-    assert jobs["framework_ddl"]["performance_target"] == "STANDARD"
+    assert jobs["framework_ddl"]["performance_target"] == "PERFORMANCE_OPTIMIZED"
     enabled, views = jobs["framework_system_views"]["tasks"]
     assert enabled["condition_task"] == {
         "op": "EQUAL_TO",

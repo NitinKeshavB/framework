@@ -211,7 +211,7 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     ]
     job = _job(bundle)
     assert "run_as" not in job
-    assert job["performance_target"] == "STANDARD"
+    assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
     assert job["environments"]
     metrics = _tasks(bundle)["record_load_metrics"]
     assert metrics["depends_on"] == [{"task_key": "refresh_pipeline"}]

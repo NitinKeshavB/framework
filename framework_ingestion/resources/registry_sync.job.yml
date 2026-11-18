@@ -5,7 +5,7 @@ resources:
   jobs:
     registry_sync:
       name: registry_sync
-      performance_target: STANDARD
+      performance_target: PERFORMANCE_OPTIMIZED # TEMPORARY until go-live; revert to STANDARD
       queue:
         enabled: true
       tasks:
