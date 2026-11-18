@@ -9,7 +9,7 @@ The whole path in this repository, from a spec to a registry row. A team adding 
 3. Open a pull request. The source system's owner reviews it, since every table in a delivery shares one pipeline.
 4. Silver, gold, or a data product: add it to a project's `project.yaml` under `framework_curation` and run `./run.sh projects:generate`.
 
-CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check`. None of them start a cluster.
+CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check`. Lint is pre-commit (Ruff, file hygiene, and local `generate:check` / `projects:check` when those paths change — see [MAINTAINERS.md](MAINTAINERS.md#pre-commit)). None of them start a cluster.
 
 ## What `generate` produces
 

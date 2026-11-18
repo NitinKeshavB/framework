@@ -3,14 +3,22 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
       - id: check-yaml
       - id: check-toml
       - id: end-of-file-fixer
       - id: trailing-whitespace
         args: [--markdown-linebreak-ext=md]
+      # Detect mixed CRLF+LF in one file only; do not force LF (safe on Windows and WSL).
+      - id: mixed-line-ending
       - id: check-added-large-files
         args: ["--maxkb=500"]
       - id: detect-private-key
+      - id: debug-statements
+      - id: name-tests-test
+        args: [--pytest-test-first]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.4
     hooks:
@@ -18,3 +26,17 @@ repos:
         args: [--fix, --config=ruff.toml]
       - id: ruff-format
         args: [--config=ruff.toml]
+  - repo: local
+    hooks:
+      - id: generate-check
+        name: generate:check
+        entry: ./run.sh generate:check
+        language: system
+        pass_filenames: false
+        files: ^(framework_ingestion/|framework_lff_lib/)
+      - id: projects-check
+        name: projects:check
+        entry: ./run.sh projects:check
+        language: system
+        pass_filenames: false
+        files: ^(framework_curation/|framework_examples/ingestion/|framework_lff_lib/)

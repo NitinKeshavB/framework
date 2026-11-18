@@ -121,9 +121,9 @@ WHERE owner = 'billing';
 source venv/bin/activate        # or set PYTHON to a venv's python
 ./run.sh install                # editable install with the dev tools
 ./run.sh test:quick             # package tests; no Spark
-./run.sh lint                   # pre-commit: ruff, formatting, file hygiene
-./run.sh generate:check         # fail if generated ingestion files are stale
-./run.sh projects:check         # fail if project maps are stale
+./run.sh lint                   # pre-commit (see .pre-commit-config.yaml)
+./run.sh generate:check         # also a local pre-commit hook when ingestion paths change
+./run.sh projects:check         # also a local pre-commit hook when curation/example paths change
 ./run.sh clean                  # remove wheels, build output, and caches
 ./run.sh help                   # every task
 ```

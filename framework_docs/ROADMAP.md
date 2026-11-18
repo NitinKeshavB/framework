@@ -14,7 +14,7 @@ What is built, what phase 1 covers, and what has not been verified.
 | Ownership | Bronze is owned by its source system. `requested_by` and `delivery` are recorded. `registry_sync` refuses a second owner. `v_ownership_conflicts` is empty when the rules hold. |
 | Curation structure | `framework_curation/<domain>/<project>/project.yaml` with silver, gold, and data products, reference and ownership checks, `PROJECT_MAP.md` and `PROJECTS_INDEX.md` |
 | Scaffolding | `new-source`, `new-table`, `new-project` |
-| Checks | Package tests (no Spark), pre-commit lint, `generate:check`, `projects:check`, and the GitHub `checks` workflow |
+| Checks | Package tests (no Spark); pre-commit (Ruff, hygiene, local `generate:check` / `projects:check`); GitHub `checks` workflow also runs `lint:ci`, `test:quick`, and the two generate checks |
 
 ## Phase 1
 

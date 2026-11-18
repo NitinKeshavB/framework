@@ -38,7 +38,7 @@ PyPI and a wheel volume are not part of this phase. Every bundle builds `framewo
 
 ## Generated files
 
-`SOURCE_MAP.md`, `pipelines/`, and `resources/` in `framework_ingestion`, and `PROJECT_MAP.md` and `PROJECTS_INDEX.md` in `framework_curation`, are generated and committed. CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check`. Do not edit generated files by hand; the next `generate` overwrites them. A hand-written resource file must not start with the generated marker line.
+`SOURCE_MAP.md`, `pipelines/`, and `resources/` in `framework_ingestion`, and `PROJECT_MAP.md` and `PROJECTS_INDEX.md` in `framework_curation`, are generated and committed. CI runs `./run.sh lint:ci`, `test:quick`, `generate:check`, and `projects:check` (lint already runs the generate/project checks when those paths change). Do not edit generated files by hand; the next `generate` overwrites them. A hand-written resource file must not start with the generated marker line.
 
 ## What not to change
 
@@ -63,12 +63,24 @@ Package tests live in `framework_tests`, not inside the ingestion or curation bu
 ```bash
 ./run.sh install
 ./run.sh test:quick        # framework_tests and the sample consumer tests; no Spark
-./run.sh lint              # pre-commit: ruff, formatting, YAML/TOML, whitespace, private keys
+./run.sh lint              # pre-commit on every file (hooks may auto-fix)
 ./run.sh generate:check
 ./run.sh projects:check
 ```
 
 CI runs the same four checks on every pull request (`.github/workflows/checks.yml`). Coverage reporting is a later phase.
+
+### Pre-commit
+
+Config: [`.pre-commit-config.yaml`](../.pre-commit-config.yaml). Commits run hooks on **staged** files only; a hook with no matching staged files shows `(no files to check) Skipped`. `./run.sh lint` / `lint:ci` run every hook on all files.
+
+| Group | Hooks |
+| --- | --- |
+| Hygiene | merge-conflict markers, case-conflict, symlinks, YAML/TOML parse, EOF newline, trailing whitespace, mixed line endings (fail only when one file mixes CRLF and LF — does not force LF), large files (&gt;500 KB), private keys, leftover `pdb` / `breakpoint()`, pytest test file naming |
+| Python | Ruff lint (`--fix`) and Ruff format, via `ruff.toml` |
+| Local | `./run.sh generate:check` when `framework_ingestion/` or `framework_lff_lib/` changes; `./run.sh projects:check` when `framework_curation/`, `framework_examples/ingestion/`, or `framework_lff_lib/` changes |
+
+After changing the config, run `./run.sh lint` once so hook environments refresh.
 
 ## Runtime checks
 

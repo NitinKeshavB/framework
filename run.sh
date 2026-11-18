@@ -40,7 +40,7 @@ function _require-package {
     fi
 }
 
-# run all pre-commit hooks (ruff, ruff-format, file hygiene) on every file; hooks may fix files
+# run all pre-commit hooks on every file (see .pre-commit-config.yaml); hooks may fix files
 function lint {
     (cd "$THIS_DIR" && "$PYTHON" -m pre_commit run --all-files)
 }
