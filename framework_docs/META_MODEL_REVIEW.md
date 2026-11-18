@@ -33,5 +33,5 @@ Until go-live, drop `framework_meta` (or recreate) so `CREATE TABLE IF NOT EXIST
 
 ## Lucid
 
-- Process: https://lucid.app/lucidchart/3bfb81a4-d831-46b1-9f9f-6950ade7d5dc/edit
-- ERD: https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit
+- Deploy vs Run (tabs: deploy, run + NRT, what writes what): https://lucid.app/lucidchart/3bfb81a4-d831-46b1-9f9f-6950ade7d5dc/edit
+- ERD + catalog + team process: https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit
