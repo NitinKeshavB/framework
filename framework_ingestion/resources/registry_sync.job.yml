@@ -5,7 +5,7 @@ resources:
   jobs:
     registry_sync:
       name: registry_sync
-      performance_target: PERFORMANCE_OPTIMIZED
+      performance_target: STANDARD
       queue:
         enabled: true
       tasks:
@@ -16,6 +16,7 @@ resources:
             parameters:
               - ${var.catalog}
               - ${workspace.file_path}
+              - framework_ingestion
       environments:
         - environment_key: framework_env
           spec:

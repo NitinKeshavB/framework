@@ -30,9 +30,7 @@ targets:
       host: https://adb-1864378597730899.19.azuredatabricks.net/
       root_path: /Workspace/Shared/aztech_finance
     variables:
-      catalog: aal_dev_fdh
+      catalog: aal_prod_fdh
     permissions:
-      - user_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
-        level: CAN_MANAGE
-      - user_name: nitinkeshav.bolla@allianz.com.au
+      - group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
         level: CAN_MANAGE

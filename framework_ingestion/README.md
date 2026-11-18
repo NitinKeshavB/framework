@@ -39,17 +39,26 @@ framework_ingestion/
     <source_system>_<table>.yaml           a spec with no project
     <project>/
       <source_system>_<table>.yaml         a spec that project is bringing in
+  profiles/                                optional shared defaults (`extends:`)
   src/                                     entry points the jobs call
-  SOURCE_MAP.md                            generated
-  pipelines/<source_system>_<delivery>.py  generated
-  resources/<source_system>_<delivery>.pipeline.yml and .job.yml   generated
+  SOURCE_MAP.md                            generated and committed
+  .build/                                  generated at validate/deploy (gitignored)
+    manifests/<delivery>.json
+    pipelines/<delivery>.py
+    resources/<delivery>.pipeline.yml and .job.yml
+  resources/                               hand-written only (e.g. registry_sync)
 ```
 
 The first folder is the source system. The child folder is the project bringing the table in, and it matches `requested_by`. When there is no project, paste the spec next to `source.yaml` and omit `requested_by`. A table is registered once. A second project that needs the same table reads the existing bronze table and does not add a copy.
 
 ## What a spec holds
 
-A spec holds only what is true of the table. The kind, raw volume, and foreign catalog come from the source's `source.yaml`.
+A spec holds only what is true of the table. The kind, raw volume, and foreign catalog come from the source's `source.yaml`. Prefer the terse form — omit domain, delivery, job_name, and requested_by when the folder and `source.yaml` already say them. Set `spec_version: 1` and point editors at the schema:
+
+```yaml
+# yaml-language-server: $schema=../../../.schemas/table-spec.v1.json
+spec_version: 1
+```
 
 ```yaml
 # a file table                          # a database table
@@ -59,11 +68,13 @@ source:                                 source:
   delimiter: ","
 ```
 
+**Precedence (highest wins):** table entry → `extends` profile → `source.yaml` / folder → framework default. Use `extends: profiles/...` and a `tables:` list to share format, classification, and notify across many tables in one file — see `profiles/README.md`.
+
 The spec's `raw_to_bronze` section holds the bronze table, keys, columns, and quality rules. Its `quarantine` section holds the reject table. Specs do not name a catalog. Each job passes the environment's catalog.
 
 ## One delivery, one pipeline, one job
 
-A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline, and the pipeline reads the delivery's deployed spec files, listed in its `lff.specs` setting. Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `record_load_metrics` → `load_ledger` / `v_loads`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
+A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline; the pipeline reads one compiled `lff.manifest` JSON for the delivery (legacy `lff.specs` still works). Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `record_load_metrics` → `load_ledger` / `v_loads`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
 
 ## Add a table to a source system
 

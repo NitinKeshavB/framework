@@ -79,6 +79,26 @@ def _config(tmp_path: Path, source: str, name: str, spec: str, catalog="framewor
     return config
 
 
+class _Frame:
+    """DataFrame-like double: production pipeline code requires .filter / .selectExpr."""
+
+    def __init__(self, reader, payload=None):
+        self.reader = reader
+        self.payload = payload or {}
+
+    def filter(self, where):
+        self.reader.wheres = getattr(self.reader, "wheres", []) + [where]
+        return self
+
+    def selectExpr(self, *parts):
+        self.reader.selects = getattr(self.reader, "selects", []) + [parts]
+        return self
+
+    @property
+    def columns(self):
+        return list(self.payload.get("columns") or [])
+
+
 class _Reader:
     def __init__(self, spark):
         self.spark, self.options, self.format_name = spark, {}, None
@@ -94,11 +114,13 @@ class _Reader:
     def load(self, path):
         self.loads = getattr(self, "loads", 0) + 1
         self.spark.reads.append((self.spark.building, "files", path))
-        return {"format": self.format_name, "path": path, "options": dict(self.options)}
+        return _Frame(
+            self, {"format": self.format_name, "path": path, "options": dict(self.options)}
+        )
 
     def table(self, name):
         self.spark.reads.append((self.spark.building, "table", name))
-        return {"table": name}
+        return _Frame(self, {"table": name})
 
 
 class _Spark:

@@ -14,6 +14,7 @@ import yaml
 from lakeflow_framework.cli import main
 from lakeflow_framework.config import ConfigValidationError
 from lakeflow_framework.ingestion import (
+    BUILD_DIR,
     MAP_NAME,
     generate,
     load_sources,
@@ -100,7 +101,9 @@ def _add_table(bundle: Path, name: str, requested_by: str, **changes: str) -> Pa
 
 
 def _job(bundle: Path, name: str = "billing_daily") -> dict:
-    document = yaml.safe_load((bundle / "resources" / f"{name}.job.yml").read_text("utf-8"))
+    document = yaml.safe_load(
+        (bundle / BUILD_DIR / "resources" / f"{name}.job.yml").read_text("utf-8")
+    )
     return document["resources"]["jobs"][name]
 
 
@@ -109,7 +112,7 @@ def _tasks(bundle: Path, name: str = "billing_daily") -> dict:
 
 
 def _settings(bundle: Path, name: str = "billing_daily") -> dict:
-    text = (bundle / "resources" / f"{name}.pipeline.yml").read_text("utf-8")
+    text = (bundle / BUILD_DIR / "resources" / f"{name}.pipeline.yml").read_text("utf-8")
     (pipeline,) = yaml.safe_load(text)["resources"]["pipelines"].values()
     return pipeline["configuration"]
 
@@ -147,26 +150,32 @@ def test_two_teams_can_add_tables_to_one_source_system(bundle: Path) -> None:
 
 def test_generate_writes_then_is_up_to_date(bundle: Path) -> None:
     written = generate(bundle)
-    assert written == [
-        "SOURCE_MAP.md",
-        "pipelines/billing_daily.py",
-        "resources/billing_daily.job.yml",
-        "resources/billing_daily.pipeline.yml",
-    ]
+    assert written == sorted(
+        [
+            "SOURCE_MAP.md",
+            f"{BUILD_DIR}/manifests/billing_daily.json",
+            f"{BUILD_DIR}/pipelines/billing_daily.py",
+            f"{BUILD_DIR}/resources/billing_daily.job.yml",
+            f"{BUILD_DIR}/resources/billing_daily.pipeline.yml",
+        ]
+    )
+    # --check only drifts the committed map, not gitignored .build/ artifacts.
     assert generate(bundle, check=True) == []
     assert generate(bundle) == []
 
 
 def test_resource_keys_are_unique_and_the_job_refreshes_its_pipeline(bundle: Path) -> None:
     generate(bundle)
-    pipelines = yaml.safe_load((bundle / "resources/billing_daily.pipeline.yml").read_text("utf-8"))
+    pipelines = yaml.safe_load(
+        (bundle / BUILD_DIR / "resources" / "billing_daily.pipeline.yml").read_text("utf-8")
+    )
     (pipeline_key,) = pipelines["resources"]["pipelines"]
     assert pipeline_key != "billing_daily"  # the job's key
     refresh = _tasks(bundle)["refresh_pipeline"]
     assert refresh["pipeline_task"]["pipeline_id"] == f"${{resources.pipelines.{pipeline_key}.id}}"
     assert pipelines["resources"]["pipelines"][pipeline_key]["event_log"] == {
         "catalog": "${var.catalog}",
-        "schema": "framework_meta",
+        "schema": "framework_events",
         "name": "billing_daily_event_log",
     }
     tags = _job(bundle)["tags"]
@@ -192,7 +201,7 @@ def test_check_fails_when_a_table_is_added_without_regenerating(bundle: Path) ->
 def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -> None:
     _add_table(bundle, "credits", "collections")
     generate(bundle)
-    source = (bundle / "pipelines" / "billing_daily.py").read_text("utf-8")
+    source = (bundle / BUILD_DIR / "pipelines" / "billing_daily.py").read_text("utf-8")
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
     # Refresh, then metrics even on failure, then NRT job status.
     assert [task["task_key"] for task in _job(bundle)["tasks"]] == [
@@ -201,7 +210,8 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
         "record_this_run",
     ]
     job = _job(bundle)
-    assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
+    assert "run_as" not in job
+    assert job["performance_target"] == "STANDARD"
     assert job["environments"]
     metrics = _tasks(bundle)["record_load_metrics"]
     assert metrics["depends_on"] == [{"task_key": "refresh_pipeline"}]
@@ -210,6 +220,7 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
         "${var.catalog}",
         "billing_daily",
         "bronze",
+        "{{job.run_id}}",
     ]
     this_run = _tasks(bundle)["record_this_run"]
     assert this_run["run_if"] == "ALL_DONE"
@@ -218,9 +229,36 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
         "billing_daily",
         "{{job.run_id}}",
     ]
-    specs = _settings(bundle)["lff.specs"].split(",")
-    assert len(specs) == 2
-    assert all(spec.startswith("${workspace.file_path}/sources/billing/") for spec in specs)
+    settings = _settings(bundle)
+    assert "lff.manifest" in settings
+    assert settings["lff.manifest"].endswith(f"{BUILD_DIR}/manifests/billing_daily.json")
+    manifest = json.loads(
+        (bundle / BUILD_DIR / "manifests" / "billing_daily.json").read_text("utf-8")
+    )
+    assert {item["pipeline_id"] for item in manifest["pipelines"]} == {
+        "billing_credits",
+        "billing_invoices",
+    }
+    assert manifest["content_hash"]
+
+
+def test_source_run_as_is_written_on_the_job_and_pipeline(bundle: Path) -> None:
+    source = bundle / "sources" / "billing" / "source.yaml"
+    text = source.read_text(encoding="utf-8")
+    source.write_text(
+        text.replace(
+            "kind: sftp_files\n",
+            "kind: sftp_files\nrun_as: 11111111-2222-3333-4444-555555555555\n",
+        ),
+        encoding="utf-8",
+    )
+    generate(bundle)
+    job = _job(bundle)
+    assert job["run_as"] == {"service_principal_name": "11111111-2222-3333-4444-555555555555"}
+    pipeline = yaml.safe_load(
+        (bundle / BUILD_DIR / "resources" / "billing_daily.pipeline.yml").read_text("utf-8")
+    )["resources"]["pipelines"]["billing_daily_pipeline"]
+    assert pipeline["run_as"] == job["run_as"]
 
 
 def test_file_sources_fire_when_files_land_in_the_raw_volume(bundle: Path) -> None:
@@ -236,8 +274,14 @@ def test_database_job_has_a_schedule_and_syncs_both_tables(tmp_path: Path) -> No
     job = _job(tmp_path, "erp_nightly")
     assert job["schedule"]["quartz_cron_expression"] == "0 0 2 * * ?"
     assert "trigger" not in job
-    assert len(_settings(tmp_path, "erp_nightly")["lff.specs"].split(",")) == 2
-    source = (tmp_path / "pipelines" / "erp_nightly.py").read_text("utf-8")
+    manifest = json.loads(
+        (tmp_path / BUILD_DIR / "manifests" / "erp_nightly.json").read_text("utf-8")
+    )
+    assert len(manifest["pipelines"]) == 2
+    assert _settings(tmp_path, "erp_nightly")["lff.manifest"].endswith(
+        f"{BUILD_DIR}/manifests/erp_nightly.json"
+    )
+    source = (tmp_path / BUILD_DIR / "pipelines" / "erp_nightly.py").read_text("utf-8")
     assert 'build_pipelines(["erp_customers", "erp_orders"])' in source
 
 
@@ -311,6 +355,8 @@ def test_specs_do_not_name_a_catalog_and_jobs_pass_the_environment_catalog(bundl
 
 def test_removed_table_removes_its_generated_files_and_leaves_others(bundle: Path) -> None:
     generate(bundle)
+    # Hand-written resources stay under resources/; generated output is under .build/.
+    (bundle / "resources").mkdir(exist_ok=True)
     (bundle / "resources" / "hand_written.job.yml").write_text("resources: {}\n", "utf-8")
     folder = bundle / "sources" / "billing"
     text = (folder / "source.yaml").read_text("utf-8").replace("daily:", "nightly:")
@@ -324,8 +370,8 @@ def test_removed_table_removes_its_generated_files_and_leaves_others(bundle: Pat
         "utf-8",
     )
     generate(bundle)
-    assert not (bundle / "resources" / "billing_daily.job.yml").exists()
-    assert (bundle / "resources" / "billing_nightly.job.yml").exists()
+    assert not (bundle / BUILD_DIR / "resources" / "billing_daily.job.yml").exists()
+    assert (bundle / BUILD_DIR / "resources" / "billing_nightly.job.yml").exists()
     assert (bundle / "resources" / "hand_written.job.yml").exists()
 
 
@@ -362,7 +408,7 @@ def test_a_finished_scaffold_generates(tmp_path: Path) -> None:
         text = path.read_text("utf-8").replace("TODO_column_name", "event_id")
         text = text.replace("TODO_volume", "landing")  # the table names its own volume
         path.write_text(text.replace("TODO describe the column", "Event identifier"), "utf-8")
-    assert "resources/orders_hourly.job.yml" in generate(tmp_path)
+    assert f"{BUILD_DIR}/resources/orders_hourly.job.yml" in generate(tmp_path)
 
 
 def test_scaffold_refuses_to_overwrite_and_to_guess_a_delivery(tmp_path: Path) -> None:
@@ -397,6 +443,71 @@ def test_duplicate_pipeline_id_is_rejected(bundle: Path) -> None:
     with pytest.raises(ConfigValidationError) as caught:
         load_sources(bundle)
     assert any("already used" in error or "written by" in error for error in caught.value.errors)
+
+
+def test_extends_profile_and_table_group_expand(tmp_path: Path) -> None:
+    """Profile + tables: group — table entry beats profile; one file → many configs."""
+
+    from lakeflow_framework.config import DatabaseSourceOptions
+
+    shutil.copytree(SAMPLE / "sources" / "claims_db", tmp_path / "sources" / "claims_db")
+    # Drop per-table files; replace with one group that extends a profile.
+    for path in (tmp_path / "sources" / "claims_db").rglob("claims_db_*.yaml"):
+        path.unlink()
+    (tmp_path / "profiles").mkdir()
+    (tmp_path / "profiles" / "db_merge_confidential.yaml").write_text(
+        "data:\n  classification: confidential\nsource:\n  mode: merge\n",
+        encoding="utf-8",
+    )
+    group = tmp_path / "sources" / "claims_db" / "actuarial" / "claims_tables.yaml"
+    group.write_text(
+        """\
+spec_version: 1
+extends: profiles/db_merge_confidential
+data_domain: claims
+notify:
+  on_failure:
+    - claims.owner@jll.com
+tables:
+  - name: claims
+    source:
+      table: dbo.claims
+    primary_keys: [claim_id]
+    pii: [pii_basic]
+    raw_to_bronze:
+      columns:
+        - name: claim_id
+          type: string
+          description: Claim identifier
+  - name: parties
+    source:
+      table: dbo.parties
+    mode: snapshot
+    primary_keys: [party_id]
+    raw_to_bronze:
+      columns:
+        - name: party_id
+          type: string
+          description: Party identifier
+""",
+        encoding="utf-8",
+    )
+    (system,) = load_sources(tmp_path)
+    assert sorted(t.config.pipeline_id for t in system.tables) == [
+        "claims_db_claims",
+        "claims_db_parties",
+    ]
+    claims = next(t.config for t in system.tables if t.config.pipeline_id == "claims_db_claims")
+    parties = next(t.config for t in system.tables if t.config.pipeline_id == "claims_db_parties")
+    assert claims.tags["bronze"].classification == "confidential"
+    assert claims.tags["bronze"].pii == ["pii_basic"]
+    assert isinstance(claims.source_options, DatabaseSourceOptions)
+    assert claims.source_mode == "merge"  # from profile
+    assert parties.source_mode == "snapshot"  # table entry beats profile
+    assert claims.bronze_table == "claims"
+    assert parties.bronze_table == "parties"
+    generate(tmp_path)
+    assert (tmp_path / BUILD_DIR / "manifests" / "claims_db_nightly.json").is_file()
 
 
 def test_same_target_table_in_two_pipelines_is_rejected(bundle: Path) -> None:
@@ -534,14 +645,14 @@ def test_table_in_the_wrong_source_folder_is_rejected(bundle: Path) -> None:
 
 
 class _Frame:
-    def __init__(self, reader: "_Reader") -> None:
+    def __init__(self, reader: _Reader) -> None:
         self.reader = reader
 
-    def filter(self, where: str) -> "_Frame":
+    def filter(self, where: str) -> _Frame:
         self.reader.wheres.append(where)
         return self
 
-    def selectExpr(self, *parts: str) -> "_Frame":
+    def selectExpr(self, *parts: str) -> _Frame:
         self.reader.selects.append(parts)
         return self
 
@@ -553,11 +664,11 @@ class _Reader:
         self.wheres: list[str] = []
         self.selects: list[tuple[str, ...]] = []
 
-    def format(self, name: str) -> "_Reader":
+    def format(self, name: str) -> _Reader:
         self.format_name = name
         return self
 
-    def option(self, key: str, value: str) -> "_Reader":
+    def option(self, key: str, value: str) -> _Reader:
         self.options[key] = value
         return self
 
@@ -614,7 +725,7 @@ class _Pipelines:
 def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) -> None:
     generate(bundle)
     assert 'build_pipelines(["billing_invoices"])' in (
-        bundle / "pipelines" / "billing_daily.py"
+        bundle / BUILD_DIR / "pipelines" / "billing_daily.py"
     ).read_text("utf-8")
     refresh = _tasks(bundle)["refresh_pipeline"]["pipeline_task"]["pipeline_id"]
     assert refresh == "${resources.pipelines.billing_daily_pipeline.id}"
@@ -707,12 +818,17 @@ def test_registry_rows_use_the_deployed_catalog() -> None:
 
 
 def test_every_registry_row_name_can_be_looked_up() -> None:
+    from lakeflow_framework.metadata import _object_keys
+
     rows = registry_rows(SAMPLE, "aal_dev_fdh")
     assert any("->" in row["full_name"] for row in rows if row["object_kind"] == "link")
-    statement = current_objects_sql("aal_dev_fdh", rows)
-    assert "'billing_invoices->" in statement
+    names, _, _ = _object_keys(rows)
+    assert any("billing_invoices->" in name for name in names)
+    statement = current_objects_sql("aal_dev_fdh")
+    assert "INNER JOIN _framework_lookup_keys" in statement
+    assert "full_name IN (" not in statement
     with pytest.raises(ValueError, match="object name"):
-        current_objects_sql("aal_dev_fdh", [{**rows[0], "full_name": "x' OR '1'='1"}])
+        _object_keys([{**rows[0], "full_name": "x' OR '1'='1"}])
 
 
 def test_registry_rows_carry_each_source_its_schemas_and_its_job_triggers() -> None:

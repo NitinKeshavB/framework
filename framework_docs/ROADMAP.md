@@ -6,15 +6,16 @@ What is built, what phase 1 covers, and what has not been verified.
 
 | Area | State |
 | --- | --- |
-| Platform bundle | Registry DDL in `framework_bundle/sql/framework_meta.sql`, daily `OPTIMIZE` / `archive_hot` / table health, and hourly `framework_runs`. Recon SoR is `load_ledger` / `v_loads` from each delivery job. Ownership columns and checks. |
+| Platform bundle | Registry DDL in `framework_bundle/sql/framework_meta.sql`, daily `OPTIMIZE` / `archive_hot`, and hourly `framework_runs`. Recon SoR is `load_ledger` / `v_loads` from each delivery job. Ownership columns and checks. Serial `table_health` DESCRIBE loop removed — file stats are UC / predictive optimization territory. |
 | Ingestion kinds | `sftp_files` and `sharepoint_files` (raw volume to bronze), `database` (PostgreSQL, Azure SQL, SQL Server, DB2 through a foreign catalog, to bronze), and the original `cloud_files` path, which is frozen: the code is kept but validation rejects `autoloader`, `copy_into`, and `ctas` until they run end to end on serverless |
-| Config-driven output | One pipeline and one job per delivery, plus `SOURCE_MAP.md`, generated from `source.yaml` and the table specs. The job is one `refresh_pipeline` task; the pipeline reads its deployed specs from `lff.specs`. |
-| Registry | Source system, schema, workflow, pipeline, dataflow, flow, securable, link, and column definitions, kept as SCD Type 2 with deletion versions for removed specs. Written once per deploy by `registry_sync`. Views for definitions, lineage, and history. Load recon in `load_ledger` / `v_loads` (FAILED stubs, `v_load_failures`, 7-day hot + forever archive / `v_loads_90d`). Job, task, and pipeline runs from NRT `record_this_run` plus hourly Jobs API / event-log catch-up, with no system table grants. Cost and observed lineage from the system tables when a target turns `system_views` on. |
+| Config-driven output | One pipeline and one job per delivery, plus committed `SOURCE_MAP.md`. Job/pipeline YAML and per-delivery `manifest.json` land under gitignored `.build/` at validate/deploy. Pipeline reads `lff.manifest` (legacy `lff.specs` still works). Specs support `spec_version`, JSON Schema, `extends` profiles, and `tables:` groups. `PipelineConfig` carries a discriminated `source_options` union (`FileSourceOptions` \| `DatabaseSourceOptions`). |
+| Registry | SCD2 `asset_registry` + current snapshot with stable `asset_id` (SHA-256 of source coordinates), informational PK/CHECK constraints, and `ref_*` enum tables. Ownership refusals in `ownership_refusals` (not run_ledger). Load recon: `load_ledger` (`pipeline_id` = spec, `update_pipeline_uuid` = Lakeflow UUID) dual-written to long `load_metric`; `v_loads` / `v_load_metrics` / `v_load_failures`. Job/task runs append-only. Event logs in `framework_events`. `v_metadata_drift` short-circuits while `APPLY_TAGS` is false. `archive_hot` bounds the anti-join by age. |
 | Unity Catalog metadata | `registry_sync` at each deploy sets schema tags from `source.yaml`, table tags from the spec and its source, column tags, and column comments, changing only what differs. Generated jobs carry the source's tags. `v_metadata_drift` and `v_observed_lineage` compare the registry with Unity Catalog and `system.access`. |
 | Ownership | Bronze is owned by its source system. `requested_by` and `delivery` are recorded. `registry_sync` refuses a second owner. `v_ownership_conflicts` is empty when the rules hold. |
 | Curation structure | `framework_curation/<domain>/<project>/project.yaml` with silver, gold, and data products, reference and ownership checks, `PROJECT_MAP.md` and `PROJECTS_INDEX.md` |
 | Scaffolding | `new-source`, `new-table`, `new-project` |
-| Checks | Package tests (no Spark); pre-commit (Ruff, hygiene, local `generate:check` / `projects:check`); GitHub `checks` workflow also runs `lint:ci`, `test:quick`, and the two generate checks |
+| Checks | Package tests (no Spark); pre-commit (Ruff `E,F,I,B,S,UP`, pragmatic mypy, hygiene, local generate checks); GitHub `checks` also runs `lint:ci`, mypy, `test:quick`, and the two generate checks |
+| Deploy scale | Staged-view registry lookups; owner-scoped retirement + `bundle_id`; event logs in `framework_events`; per-log `pipeline_updates`; `system.lakeflow` job-run catch-up; per-spec isolation in `build_pipelines`; optional `run_as` per source + constrained rule expressions. Physical split of `framework_ingestion` into per-source bundles is the next ops step when teams need independent deploys. |
 
 ## Phase 1
 
@@ -31,9 +32,22 @@ Start with one silver and one gold example and review the shape before building.
 
 **3. Deliberately outside the framework (owned by each domain).** Schemas and the raw volume exist before a deploy. The framework does not create them. The catalog, the foreign catalogs, and the external locations also exist already.
 
+## Write-path redesign (after append-only job runs)
+
+**Done (A).** `job_runs` / `job_task_runs` are append-only; views dedupe by `recorded_at`. Removes MERGE conflicts under 1000 concurrent NRT writers. Keep this regardless of B/C.
+
+**Next (B) — one writer, delete bookkeeping tasks.** Drop `record_load_metrics` and `record_this_run` from every delivery job. Run one continuous (or 1–5 min micro-batch) consumer that reads consolidated pipeline events + `system.lakeflow` and appends `load_ledger` / `job_runs` as a single writer. Removes ~2000 serverless cold starts and ~3000 commits per wave. Build toward this once pipeline_events consolidation from §3.3 is in place.
+
+**Optional (C) — Zerobus if per-job push stays.** If B is deferred and jobs must still report, push a few records via Zerobus Ingest instead of a Delta commit per job (~150 ms durable, ~5 s queryable). At-least-once → duplicates OK (views already dedupe). Pre-create UC managed Delta targets; grant MODIFY+SELECT **directly on the table** to the SP (schema inheritance is not enough). Check region availability first.
+
+**Read path (requirement #5).** Materialize leaf definition views (`v_workflows`, `v_pipelines`, `v_tables`, `v_columns`) and hot ops views (`v_job_status`, `v_loads`) as Lakeflow materialized views; keep plain views as the compatibility API. Highest-leverage read change with no API break.
+
+**Control plane (not MVP).** Prototype Lakebase Postgres for registry lookups / concurrent small writes (real PKs, FKs, check constraints) with Delta for history/analytics. Postgres→Delta Lakehouse sync is Beta; DABs `postgres_synced_tables` not ready — drive sync from the CLI for now. Prototype before committing to Delta-only for the control plane.
+
 ## Still open from the framework review
 
-- **Production settings.** Every bundle's `prod` target still uses the `aal_dev_fdh` catalog, and no target sets `run_as`. Set the prod catalog and a service principal before a production deploy.
+- **Production settings.** Every bundle's `prod` target still uses the `aal_dev_fdh` catalog. Set the prod catalog before a production deploy. Set each source's `run_as` (service principal) in `source.yaml` and grant that SP only its raw volume / foreign catalog / bronze schema.
+- **system.lakeflow grant.** Hourly `framework_runs` prefers `system.lakeflow`; grant the job identity `SELECT` on it (or keep the Jobs API fallback). Freshness is typically up to ~1 hour — NRT stays on `record_this_run`.
 - **Large database tables.** An `incremental_column` would let a `database` load read only rows newer than the last load instead of the whole table. Not decided.
 - **Archiving loaded files.** Auto Loader's `cleanSource` could move or delete files after they load. Not decided; the raw volume currently keeps every file.
 
@@ -41,10 +55,9 @@ Start with one silver and one gold example and review the shape before building.
 
 - Turn Unity Catalog tag and comment assignment back on. Set `APPLY_TAGS = True` in `unity.py` once the deploy identity can assign tags under any tag policies on the framework keys (or those policies are removed). Until then the tags are only in the registry and in `v_metadata_drift`.
 - At go-live, stop dropping `framework_meta` for table changes. From then on, each change is an `ALTER` in `framework_meta.sql` that is safe to repeat, as [MAINTAINERS.md](MAINTAINERS.md) describes.
-- Move every job back to `performance_target: STANDARD` once loads run unattended. Set `PERFORMANCE_TARGET` in `ingestion.py`, regenerate, and change `framework_ops.job.yml` and `registry_sync.job.yml`. `PERFORMANCE_OPTIMIZED` is used for now because it starts in seconds instead of minutes.
-- Optional split of a busy delivery, so one bad spec cannot fail the other teams' tables in it.
+- Generated jobs default to `performance_target: STANDARD` (override per source in `source.yaml`). Keep `PERFORMANCE_OPTIMIZED` only for interactive cold-start work.
 - Coverage reporting in CI.
-- A wheel published to a volume or a feed, so project bundles stop rebuilding it on every deploy.
+- Publish the framework wheel once to a UC volume (or feed) so sharded bundles stop rebuilding it on every deploy wave.
 - Dropping the legacy `project:` spelling for `requested_by` in the original example.
 
 ## Not verified on a workspace

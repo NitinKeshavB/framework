@@ -14,7 +14,6 @@ TABLES = (
     "run_ledger",
     "asset_registry_current",
     "run_current",
-    "table_health",
     "load_ledger",
     "job_runs",
     "job_task_runs",

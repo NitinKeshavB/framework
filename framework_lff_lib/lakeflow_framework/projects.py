@@ -145,6 +145,7 @@ _BUNDLE_FILE = """\
 # Curation bundle for the {project} project: silver, gold, and data products.
 # Pipelines and jobs are generated into resources/ once those builders exist. Until then this
 # bundle only declares its targets.
+# Replace workspace hosts and catalog names for your environments before deploy.
 
 bundle:
   name: {project}
@@ -159,17 +160,17 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://adb-7405615469052932.12.azuredatabricks.net
+      host: https://adb-<dev-workspace-id>.azuredatabricks.net
     variables:
       catalog: aal_dev_fdh
 
   prod:
     mode: production
     workspace:
-      host: https://adb-1864378597730899.19.azuredatabricks.net/
+      host: https://adb-<prod-workspace-id>.azuredatabricks.net
       root_path: /Workspace/Shared/aztech_{project}
     variables:
-      catalog: aal_dev_fdh
+      catalog: aal_prod_fdh
 """
 
 

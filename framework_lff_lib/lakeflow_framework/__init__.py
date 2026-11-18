@@ -16,8 +16,16 @@ __all__ = [
 
 
 class LoadMethod:
-    """Names of the raw-landing strategies."""
+    """Names of the raw-landing strategies.
 
+    MVP methods that a spec may use: ``VOLUME_FILES``, ``DATABASE_TABLE``.
+    ``AUTOLOADER`` / ``COPY_INTO`` / ``CTAS`` are frozen (kept in code, rejected by validation
+    unless ``allow_frozen=True``).
+    """
+
+    VOLUME_FILES = "volume_files"
+    DATABASE_TABLE = "database_table"
+    # Frozen — not admitted by generate unless allow_frozen=True.
     AUTOLOADER = "autoloader"
     COPY_INTO = "copy_into"
     CTAS = "ctas"

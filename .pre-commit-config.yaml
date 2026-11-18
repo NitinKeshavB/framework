@@ -26,6 +26,15 @@ repos:
         args: [--fix, --config=ruff.toml]
       - id: ruff-format
         args: [--config=ruff.toml]
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks:
+      - id: mypy
+        # Pragmatic: library package only; missing imports ignored (see mypy.ini).
+        args: [--config-file=framework_lff_lib/mypy.ini]
+        additional_dependencies: [types-PyYAML, PyYAML]
+        files: ^framework_lff_lib/lakeflow_framework/
+        pass_filenames: true
   - repo: local
     hooks:
       - id: generate-check

@@ -17,7 +17,8 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 | Removed | Why |
 | --- | --- |
-| `v_process` | Passthrough of `run_ledger`. Use `v_ownership_refusals` or `run_ledger`. |
+| `run_ledger` / `run_current` | Vestigial step tables used only for ownership refusals. Replaced by `ownership_refusals`. |
+| `v_process` | Passthrough of `run_ledger`. Use `v_ownership_refusals`. |
 | `v_run_current` | Passthrough of `run_current`. Use `v_ownership_refusals` / `v_job_status`. |
 | `v_bronze_loads` | Alias of `v_loads WHERE layer = 'bronze'`. |
 | `load_daily_rollup` | Never written; dashboards use `v_loads_90d` (hot ∪ archive). |
@@ -28,10 +29,16 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 | Pair / object | Role |
 | --- | --- |
 | `asset_registry` + `asset_registry_current` | SCD2 history + current lookup snapshot |
-| `run_ledger` + `run_current` | Ownership-refusal history + current pointer |
+| `ownership_refusals` | Ownership-refusal history (replaced vestigial `run_ledger` / `run_current`) |
 | `config_json` + `config` | Hash source + VARIANT query shape |
 | Hot tables + `*_archive` | 7-day hot; forever archive via `archive_hot` |
 | `<job>_event_log` | Pipeline-native events feeding metrics / `pipeline_updates` |
+
+## Deploy scaling (registry_sync + event logs)
+
+- Lookups join staged temp views (`_framework_lookup_keys`, `_framework_owner_names`) — do not rebuild `full_name IN (...)` for every row in the bundle.
+- Retirement is `owner_kind` **and** `owner IN (this bundle's source systems)` so shards do not delete each other; rows carry `bundle_id`.
+- Event logs are in `{catalog}.framework_events`. Hourly `framework_runs` merges **one event log at a time** (no 1000-way `UNION ALL`).
 
 ## Parallel load: ~1000 delivery jobs at once
 
@@ -57,7 +64,7 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 **Optional (system grants):** `v_job_costs`, `v_pipeline_costs`, `v_observed_lineage`
 
-**Physical tables still written:** `asset_registry`, `asset_registry_current`, `run_ledger`, `run_current`, `job_runs`, `job_task_runs`, `pipeline_updates`, `load_ledger`, `table_health`, matching `*_archive`, `ddl_applied`, plus per-job `*_event_log`
+**Physical tables still written:** `asset_registry`, `asset_registry_current` (with stable `asset_id`), `ownership_refusals`, `job_runs`, `job_task_runs`, `pipeline_updates`, `load_ledger` (`pipeline_id` = spec id, `update_pipeline_uuid` = Lakeflow UUID), `load_metric` (long shape), matching `*_archive`, `ref_*` enum tables, `ddl_applied`, plus per-job `*_event_log` under `framework_events`. `table_health` / `run_ledger` / `run_current` were removed. Append-only facts use views for latest-per-key.
 
 ## Ops: failure and repair
 

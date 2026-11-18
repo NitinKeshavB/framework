@@ -2,7 +2,7 @@ resources:
   jobs:
     framework_ddl:
       name: framework_ddl
-      performance_target: PERFORMANCE_OPTIMIZED
+      performance_target: STANDARD
       tasks:
         - task_key: apply_ddl
           environment_key: framework_env
@@ -25,7 +25,7 @@ resources:
     # system_views to true. When off, the condition task skips the DDL and the run succeeds.
     framework_system_views:
       name: framework_system_views
-      performance_target: PERFORMANCE_OPTIMIZED
+      performance_target: STANDARD
       tasks:
         - task_key: system_views_enabled
           condition_task:
@@ -51,11 +51,11 @@ resources:
       queue:
         enabled: true
 
-    # Job runs from the Jobs API and pipeline updates from the event logs, hourly. Needs no
-    # system table grants: the run_as identity needs CAN_VIEW on the delivery jobs.
+    # Job runs hourly: prefers system.lakeflow (SELECT grant); falls back to Jobs API.
+    # Pipeline updates from framework_events. NRT status is record_this_run on each delivery.
     framework_runs:
       name: framework_runs
-      performance_target: PERFORMANCE_OPTIMIZED
+      performance_target: STANDARD
       schedule:
         quartz_cron_expression: "0 15 * * * ?"
         timezone_id: UTC
@@ -85,7 +85,7 @@ resources:
 
     framework_optimize:
       name: framework_optimize
-      performance_target: PERFORMANCE_OPTIMIZED
+      performance_target: STANDARD
       schedule:
         quartz_cron_expression: "0 0 3 * * ?"
         timezone_id: UTC
@@ -105,14 +105,6 @@ resources:
             parameters:
               - ${var.catalog}
               - "7"
-        - task_key: table_health
-          depends_on:
-            - task_key: archive_hot
-          environment_key: framework_env
-          spark_python_task:
-            python_file: ../src/record_table_health.py
-            parameters:
-              - ${var.catalog}
       environments:
         - environment_key: framework_env
           spec:
@@ -120,4 +112,4 @@ resources:
             dependencies:
               - ../../framework_lff_lib/dist/*.whl
 
-    # framework_metrics (flow_events / table_load_metrics) retired: recon is load_ledger / v_loads.
+    # Recon is load_ledger / v_loads from each delivery's record_load_metrics task.

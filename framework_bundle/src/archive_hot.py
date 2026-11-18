@@ -1,7 +1,9 @@
 """Move run/load facts older than 7 days into forever archive tables (insert then delete).
 
-Idempotent: anti-join on natural keys so reruns do not duplicate archive rows. Never truncates
-or drops archive. Dashboards use v_*_90d over hot ∪ archive.
+Idempotent: anti-join on natural keys so reruns do not duplicate archive rows. The archive
+side of the anti-join is bounded by the same age cutoff so cost does not grow with the
+forever archive. The returned count is the number of hot rows deleted (not a full-table
+before/after scan that concurrent inserts can make wrong or negative).
 """
 
 from __future__ import annotations
@@ -12,13 +14,19 @@ from pyspark.sql import SparkSession
 
 from lakeflow_framework.logs import job_logging, step
 
-# (hot table, archive table, key columns for anti-join, age column)
+# (hot table, archive table, key columns for anti-join, age expression)
 MOVES = (
     (
         "load_ledger",
         "load_ledger_archive",
         ("job_name", "layer", "update_id", "dataflow", "recorded_at"),
         "coalesce(started_at, recorded_at)",
+    ),
+    (
+        "load_metric",
+        "load_metric_archive",
+        ("job_name", "layer", "update_id", "dataflow", "metric_name", "recorded_at"),
+        "recorded_at",
     ),
     (
         "job_runs",
@@ -37,12 +45,6 @@ MOVES = (
         "pipeline_updates_archive",
         ("pipeline_id", "update_id"),
         "coalesce(started_at, recorded_at)",
-    ),
-    (
-        "table_health",
-        "table_health_archive",
-        ("table_name", "recorded_at"),
-        "coalesce(cast(event_date as timestamp), recorded_at)",
     ),
 )
 
@@ -64,29 +66,53 @@ def _move(
     spark, meta: str, hot: str, archive: str, keys: tuple[str, ...], age: str, days: int
 ) -> int:
     on = " AND ".join(f"a.{key} <=> h.{key}" for key in keys)
+    cutoff = f"current_timestamp() - INTERVAL {days} DAYS"
+    # Bound archive scan to the same age window so the anti-join does not grow forever.
+    if age == "recorded_at":
+        archive_age = f"a.recorded_at < {cutoff}"
+        hot_pred = f"h.recorded_at < {cutoff}"
+    else:
+        archive_age = f"coalesce(a.started_at, a.recorded_at) < {cutoff}"
+        hot_pred = f"coalesce(h.started_at, h.recorded_at) < {cutoff}"
+
     spark.sql(
         f"""
         INSERT INTO {meta}.{archive}
         SELECT h.*, current_timestamp() AS archived_at
         FROM {meta}.{hot} h
-        WHERE {age} < current_timestamp() - INTERVAL {days} DAYS
+        WHERE {hot_pred}
           AND NOT EXISTS (
-            SELECT 1 FROM {meta}.{archive} a WHERE {on}
+            SELECT 1 FROM {meta}.{archive} a
+            WHERE {on}
+              AND {archive_age}
           )
         """
     )
-    before = spark.sql(f"SELECT count(*) AS n FROM {meta}.{hot}").collect()[0]["n"]
+    # Count only the doomed hot rows, then delete them — not a full-table before/after.
+    doomed = spark.sql(
+        f"""
+        SELECT count(*) AS n
+        FROM {meta}.{hot} h
+        WHERE {hot_pred}
+          AND EXISTS (
+            SELECT 1 FROM {meta}.{archive} a
+            WHERE {on}
+              AND {archive_age}
+          )
+        """
+    ).collect()[0]["n"]
     spark.sql(
         f"""
         DELETE FROM {meta}.{hot} h
-        WHERE {age} < current_timestamp() - INTERVAL {days} DAYS
+        WHERE {hot_pred}
           AND EXISTS (
-            SELECT 1 FROM {meta}.{archive} a WHERE {on}
+            SELECT 1 FROM {meta}.{archive} a
+            WHERE {on}
+              AND {archive_age}
           )
         """
     )
-    after = spark.sql(f"SELECT count(*) AS n FROM {meta}.{hot}").collect()[0]["n"]
-    return int(before) - int(after)
+    return int(doomed)
 
 
 if __name__ == "__main__":

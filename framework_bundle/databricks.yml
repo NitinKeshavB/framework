@@ -1,5 +1,5 @@
 # Framework bundle. Dev uses development mode. Prod uses production mode.
-# The catalog is a bundle variable.
+# The catalog is a bundle variable. Replace workspace hosts per environment before deploy.
 
 bundle:
   name: framework_bundle
@@ -8,6 +8,7 @@ include:
   - resources/*.yml
 
 # bundle deploy builds this wheel and uploads it. Jobs reference dist/*.whl.
+# With sharding, publish the wheel once to a UC volume instead of N artifact builds (ROADMAP).
 artifacts:
   framework_wheel:
     type: whl
@@ -38,12 +39,8 @@ targets:
       host: https://adb-1864378597730899.19.azuredatabricks.net/
       root_path: /Workspace/Shared/aztech_framework
     variables:
-      catalog: aal_dev_fdh
-    # Each entry names exactly one user or group.
+      catalog: aal_prod_fdh
+    # Prefer groups over personal user_name entries.
     permissions:
-      - user_name: adm_ye9z286@allianzms.onmicrosoft.com
-        level: CAN_MANAGE
-      - user_name: nitinkeshav.bolla@allianz.com.au
-        level: CAN_MANAGE
       - group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
         level: CAN_MANAGE

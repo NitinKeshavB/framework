@@ -4,5 +4,19 @@ src = ["framework_lff_lib", "framework_tests", "framework_examples", "framework_
 extend-exclude = ["venv", ".venv", "dist"]
 
 [lint]
-select = ["E", "F", "I"]
-ignore = ["E501"]
+# E/F/I baseline; B (bugbear), S (bandit/security), UP (pyupgrade).
+select = ["E", "F", "I", "B", "S", "UP"]
+ignore = [
+  "E501",
+  # Asserts are the point of tests.
+  "S101",
+  # YAML/specs and SQL builders use intentional dynamic construction.
+  "S608",
+  # subprocess in run helpers / CLI is intentional.
+  "S603",
+  "S607",
+]
+
+[lint.per-file-ignores]
+"framework_tests/**" = ["S"]
+"framework_examples/**" = ["S"]

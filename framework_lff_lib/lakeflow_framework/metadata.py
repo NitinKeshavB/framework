@@ -5,19 +5,24 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
+from typing import Any
 
 from lakeflow_framework.config import PipelineConfig
 from lakeflow_framework.quality import compile_rules
 
 
 def ddl_text() -> str:
-    """Registry DDL. It lives in the framework bundle, next to the job that applies it."""
+    """Registry DDL shipped as package data (works from a wheel, not only a repo checkout)."""
 
-    path = Path(__file__).resolve().parents[2] / "framework_bundle" / "sql" / "framework_meta.sql"
-    return path.read_text(encoding="utf-8")
+    from importlib import resources
+
+    return (
+        resources.files("lakeflow_framework")
+        .joinpath("sql/framework_meta.sql")
+        .read_text(encoding="utf-8")
+    )
 
 
 def render_ddl(catalog: str, text: str | None = None) -> str:
@@ -40,9 +45,27 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
     recorded = recorded_at or _now()
     pipeline_name = config.pipeline_id
     scope = _scope(config)
+    root = pipeline_stable_key(config)
 
-    def row(kind: str, name: str, parent: str | None, relation: str | None, payload: Any):
-        return framework_object(kind, name, scope, parent, relation, payload, recorded)
+    def row(
+        kind: str,
+        name: str,
+        parent: str | None,
+        relation: str | None,
+        payload: Any,
+        *,
+        suffix: str = "",
+    ):
+        return framework_object(
+            kind,
+            name,
+            scope,
+            parent,
+            relation,
+            payload,
+            recorded,
+            stable_key=f"{root}|{suffix}" if suffix else root,
+        )
 
     rules = [
         {"name": rule.name, "expression": rule.expression, "origin": rule.origin}
@@ -55,8 +78,16 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             config.job_name,
             "owns" if config.job_name else None,
             {"config": config.canonical(), "rules": rules},
+            suffix="pipeline",
         ),
-        row("dataflow", pipeline_name, pipeline_name, "contains", _dataflow_record(config)),
+        row(
+            "dataflow",
+            pipeline_name,
+            pipeline_name,
+            "contains",
+            _dataflow_record(config),
+            suffix="dataflow",
+        ),
     ]
     if config.load_method == "volume_files":
         rows.append(
@@ -66,6 +97,7 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 pipeline_name,
                 "reads",
                 {"layer": "raw", "path": config.path},
+                suffix="flow|raw|reads",
             )
         )
     for layer, relation in (("raw", "writes"), ("bronze", "writes"), ("quarantine", "rejects_to")):
@@ -74,13 +106,21 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
         full_name = config.table_name(layer)
         flow_name = f"{pipeline_name}.{layer}"
         rows += [
-            row("flow", flow_name, pipeline_name, relation, {"table": full_name, "layer": layer}),
+            row(
+                "flow",
+                flow_name,
+                pipeline_name,
+                relation,
+                {"table": full_name, "layer": layer},
+                suffix=f"flow|{layer}|{relation}",
+            ),
             row(
                 _securable_kind(config, layer),
                 full_name,
                 flow_name,
                 relation,
                 _table_record(config, layer),
+                suffix=f"table|{layer}",
             ),
             row(
                 "link",
@@ -88,9 +128,10 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
                 pipeline_name,
                 relation,
                 {"child": full_name},
+                suffix=f"link|{layer}|{relation}",
             ),
         ]
-    rows.extend(_column_rows(config, recorded))
+    rows.extend(_column_rows(config, recorded, root))
     return rows
 
 
@@ -122,7 +163,18 @@ def workflow_rows(
         scope = dict(_scope(group[0]))
         if len(requesters) != 1:
             scope["requested_by"] = None
-        rows.append(framework_object("workflow", job_name, scope, None, None, payload, recorded))
+        rows.append(
+            framework_object(
+                "workflow",
+                job_name,
+                scope,
+                None,
+                None,
+                payload,
+                recorded,
+                stable_key=f"workflow|{job_name}",
+            )
+        )
     return rows
 
 
@@ -153,7 +205,9 @@ def _dataflow_record(config: PipelineConfig) -> dict[str, Any]:
     }
 
 
-def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any]]:
+def _column_rows(
+    config: PipelineConfig, recorded_at: str, root_stable_key: str
+) -> list[dict[str, Any]]:
     """One version per column of each table the pipeline writes."""
 
     scope = _scope(config)
@@ -212,6 +266,7 @@ def _column_rows(config: PipelineConfig, recorded_at: str) -> list[dict[str, Any
                     _column_hash(record),
                     "framework",
                     recorded_at,
+                    stable_key=f"{root_stable_key}|column|{layer}|{name}",
                 )
             )
     return rows
@@ -295,6 +350,8 @@ def framework_object(
     relation: str | None,
     payload: Any,
     recorded_at: str,
+    *,
+    stable_key: str | None = None,
 ) -> dict[str, Any]:
     config_json = json.dumps(payload, sort_keys=True)
     return _object(
@@ -307,7 +364,34 @@ def framework_object(
         _digest(config_json),
         "framework",
         recorded_at,
+        stable_key=stable_key,
     )
+
+
+def asset_id(kind: str, stable_key: str) -> str:
+    """Stable surrogate for an asset. Derived from coordinates, not the display name."""
+
+    return _digest(f"{kind}|{stable_key}")
+
+
+def pipeline_stable_key(config: PipelineConfig) -> str:
+    """Source coordinates that survive a pipeline_id / table rename."""
+
+    if config.load_method == "database_table":
+        return (
+            f"db|{config.source_system}|{config.source_table}|"
+            f"{config.bronze_schema}.{config.bronze_table}"
+        )
+    path = (config.path or "").strip("/")
+    parts = path.split("/")
+    if len(parts) >= 4 and parts[0] == "Volumes":
+        # Drop the environment catalog: Volumes/<catalog>/<schema>/<volume>/...
+        without_catalog = "/".join(parts[2:])
+        return (
+            f"vol|{config.source_system}|{without_catalog}|"
+            f"{config.bronze_schema}.{config.bronze_table}"
+        )
+    return f"path|{config.source_system}|{path}|{config.bronze_schema}.{config.bronze_table}"
 
 
 def _object(
@@ -320,8 +404,13 @@ def _object(
     content_hash: str,
     source: str,
     recorded_at: str,
+    bundle_id: str | None = None,
+    *,
+    stable_key: str | None = None,
 ) -> dict[str, Any]:
+    key = stable_key if stable_key is not None else f"{kind}|{full_name}"
     return {
+        "asset_id": asset_id(kind, key),
         "object_kind": kind,
         "full_name": full_name,
         "owner_kind": scope["owner_kind"],
@@ -333,11 +422,13 @@ def _object(
         "config_json": config_json,
         "content_hash": content_hash,
         "source": source,
+        "bundle_id": bundle_id,
         "recorded_at": recorded_at,
     }
 
 
 OBJECT_COLUMNS = (
+    "asset_id",
     "object_kind",
     "full_name",
     "owner_kind",
@@ -349,26 +440,29 @@ OBJECT_COLUMNS = (
     "config_json",
     "content_hash",
     "source",
+    "bundle_id",
     "recorded_at",
 )
+# Staged Spark views for point lookups (avoids megabyte IN lists on large deploys).
+LOOKUP_KEYS_VIEW = "_framework_lookup_keys"
+OWNER_NAMES_VIEW = "_framework_owner_names"
+# Pipeline event logs live here so framework_meta.SHOW TABLES stays small.
+EVENTS_SCHEMA = "framework_events"
 
-LEDGER_COLUMNS = (
-    "run_id",
-    "parent_run_id",
+# Ownership refusals only (replaces the vestigial run_ledger / run_current step tables).
+REFUSAL_COLUMNS = (
     "object_kind",
     "full_name",
-    "owner_kind",
-    "owner",
-    "step_no",
-    "step_name",
-    "status",
-    "started_at",
-    "ended_at",
+    "refused_owner_kind",
+    "refused_owner",
+    "holder_owner_kind",
+    "holder_owner",
     "failure_reason",
-    "recon_json",
+    "content_hash",
     "recorded_at",
-    "event_date",
 )
+# Back-compat alias for imports that still say LEDGER_COLUMNS.
+LEDGER_COLUMNS = REFUSAL_COLUMNS
 
 OWNER_KINDS = ("source_system", "project")
 # Definitions registry_sync refuses to hand to a second owner. Flows, links, workflows, and
@@ -413,6 +507,35 @@ def new_object_rows(
     return fresh
 
 
+def ownership_refusal_row(
+    *,
+    object_kind: str,
+    full_name: str,
+    refused_owner_kind: str,
+    refused_owner: str,
+    holder_owner_kind: str,
+    holder_owner: str,
+    failure_reason: str,
+    content_hash: str,
+    recorded_at: str | None = None,
+) -> dict[str, Any]:
+    if refused_owner_kind not in OWNER_KINDS:
+        raise ValueError(f"owner_kind must be one of {', '.join(OWNER_KINDS)}")
+    if holder_owner_kind and holder_owner_kind not in OWNER_KINDS:
+        raise ValueError(f"owner_kind must be one of {', '.join(OWNER_KINDS)}")
+    return {
+        "object_kind": object_kind,
+        "full_name": full_name,
+        "refused_owner_kind": refused_owner_kind,
+        "refused_owner": refused_owner,
+        "holder_owner_kind": holder_owner_kind,
+        "holder_owner": holder_owner,
+        "failure_reason": failure_reason,
+        "content_hash": content_hash,
+        "recorded_at": recorded_at or _now(),
+    }
+
+
 def step_payload(
     *,
     owner: str,
@@ -427,13 +550,18 @@ def step_payload(
     failure_reason: str | None = None,
     started_at: str | None = None,
     ended_at: str | None = None,
+    content_hash: str | None = None,
+    holder_owner_kind: str | None = None,
+    holder_owner: str | None = None,
 ) -> dict[str, Any]:
+    """Build an ownership-refusal payload. Kept name for call-site compatibility."""
+
     if status not in {"RUNNING", "SUCCEEDED", "FAILED"}:
         raise ValueError("status must be RUNNING, SUCCEEDED, or FAILED")
     if owner_kind not in OWNER_KINDS:
         raise ValueError(f"owner_kind must be one of {', '.join(OWNER_KINDS)}")
     return {
-        "kind": "step",
+        "kind": "ownership_refusal",
         "owner_kind": owner_kind,
         "owner": owner,
         "full_name": full_name,
@@ -446,39 +574,40 @@ def step_payload(
         "started_at": started_at,
         "ended_at": ended_at,
         "failure_reason": failure_reason,
+        "content_hash": content_hash or "",
+        "holder_owner_kind": holder_owner_kind or "",
+        "holder_owner": holder_owner or "",
         "recorded_at": _now(),
     }
 
 
 def ledger_row(payload: Mapping[str, Any]) -> dict[str, Any]:
-    recorded = str(payload.get("recorded_at") or _now())
-    return {
-        "run_id": payload["run_id"],
-        "parent_run_id": payload.get("parent_run_id"),
-        "object_kind": payload.get("object_kind", "pipeline"),
-        "full_name": payload["full_name"],
-        "owner_kind": payload["owner_kind"],
-        "owner": payload["owner"],
-        "step_no": int(payload["step_no"]),
-        "step_name": payload["step_name"],
-        "status": payload["status"],
-        "started_at": payload.get("started_at"),
-        "ended_at": payload.get("ended_at"),
-        "failure_reason": payload.get("failure_reason"),
-        # Rows recorded before load counts moved to load_ledger can carry this.
-        "recon_json": payload.get("recon_json"),
-        "recorded_at": recorded,
-        "event_date": recorded[:10],
-    }
+    """Map a refusal payload to an ``ownership_refusals`` row."""
+
+    return ownership_refusal_row(
+        object_kind=str(payload.get("object_kind") or "pipeline"),
+        full_name=str(payload["full_name"]),
+        refused_owner_kind=str(payload["owner_kind"]),
+        refused_owner=str(payload["owner"]),
+        holder_owner_kind=str(payload.get("holder_owner_kind") or ""),
+        holder_owner=str(payload.get("holder_owner") or ""),
+        failure_reason=str(payload.get("failure_reason") or ""),
+        content_hash=str(payload.get("content_hash") or ""),
+        recorded_at=str(payload.get("recorded_at") or _now()),
+    )
 
 
-def step_key(payload: Mapping[str, Any]) -> tuple[str, int, str]:
-    return (str(payload["run_id"]), int(payload["step_no"]), str(payload["status"]))
+def step_key(payload: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(payload["object_kind"]),
+        str(payload["full_name"]),
+        str(payload.get("content_hash") or payload.get("run_id") or ""),
+    )
 
 
 def ingest_steps(
     payloads: list[Mapping[str, Any]],
-    seen: set[tuple[str, int, str]] | None = None,
+    seen: set[tuple[str, str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     seen_keys = seen if seen is not None else set()
     rows: list[dict[str, Any]] = []
@@ -491,41 +620,54 @@ def ingest_steps(
     return rows
 
 
-def current_objects_sql(catalog: str, rows: list[Mapping[str, Any]]) -> str:
-    """Current hash for each object. asset_registry_current has one row, so this is a point lookup."""
+def current_objects_sql(catalog: str, staged: str = LOOKUP_KEYS_VIEW) -> str:
+    """Current hash for staged keys. Join a temp view — never an ``IN`` list of every row."""
 
     _require_catalog(catalog)
-    names, kinds, owners = _object_keys(rows)
-    owner_kinds = sorted({str(row.get("owner_kind") or "") for row in rows})
-    if any(not _SAFE_TOKEN.match(value) for value in owner_kinds):
-        raise ValueError("owner is required")
+    _require_staged_view(staged)
     return (
-        "SELECT object_kind, full_name, content_hash "
-        f"FROM {catalog}.framework_meta.asset_registry_current "
-        f"WHERE owner_kind IN ({_sql_in(owner_kinds)}) AND owner IN ({_sql_in(owners)}) "
-        f"AND object_kind IN ({_sql_in(kinds)}) "
-        f"AND full_name IN ({_sql_in(names)})"
+        "SELECT c.object_kind, c.full_name, c.content_hash "
+        f"FROM {catalog}.framework_meta.asset_registry_current c "
+        f"INNER JOIN {staged} s "
+        "ON c.object_kind = s.object_kind AND c.full_name = s.full_name"
     )
 
 
-def owners_sql(catalog: str, full_names: list[str]) -> str:
-    """Current owner of each named table or pipeline, from the registry."""
+def owners_sql(catalog: str, staged: str = OWNER_NAMES_VIEW) -> str:
+    """Current owner of each staged full_name, from the registry.
+
+    Callers must validate and stage names first (``require_safe_names``). Joining a temp
+    view avoids megabyte ``IN`` lists and never silently drops an unsafe name.
+    """
 
     _require_catalog(catalog)
-    names = [value for value in full_names if _SAFE_NAME.match(value)]
-    if not names:
+    _require_staged_view(staged)
+    return (
+        f"SELECT c.object_kind, c.full_name, c.owner_kind, c.owner "
+        f"FROM {catalog}.framework_meta.v_asset_registry_current c "
+        f"INNER JOIN {staged} s ON s.full_name = c.full_name "
+        f"WHERE c.object_kind IN ({_sql_in(OWNED_KINDS)})"
+    )
+
+
+def require_safe_names(full_names: list[str]) -> list[str]:
+    """Every name must be safe; an unsafe name raises (do not filter it out)."""
+
+    names = [str(name) for name in full_names]
+    if not names or any(not _SAFE_NAME.match(name) for name in names):
         raise ValueError("full name is required")
-    return (
-        f"SELECT object_kind, full_name, owner_kind, owner "
-        f"FROM {catalog}.framework_meta.v_asset_registry_current "
-        f"WHERE object_kind IN ({_sql_in(OWNED_KINDS)}) "
-        f"AND full_name IN ({_sql_in(names)})"
-    )
+    return names
 
 
 def _require_catalog(catalog: str) -> None:
-    if not catalog or not _SAFE_TOKEN.match(catalog):
-        raise ValueError("catalog is required")
+    from lakeflow_framework.sqlnames import require_catalog
+
+    require_catalog(catalog)
+
+
+def _require_staged_view(staged: str) -> None:
+    if not re.fullmatch(r"_?[A-Za-z0-9_]+", staged or ""):
+        raise ValueError("staged view is required")
 
 
 def _sql_in(values: Iterable[str]) -> str:
@@ -571,32 +713,25 @@ def ownership_conflicts(
 
 def step_keys_sql(
     catalog: str,
-    run_ids: list[str],
-    owners: list[str] | None = None,
-    event_dates: list[str] | None = None,
+    content_hashes: list[str],
+    full_names: list[str] | None = None,
+    **_ignored: Any,
 ) -> str:
-    """Steps already stored for these runs.
-
-    ``owner`` and ``event_date`` are the leading cluster columns. They are added only when every
-    value is safe, so a bad value widens the lookup instead of hiding a row that should dedupe.
-    """
+    """Ownership refusals already stored for these content hashes (dedupe key)."""
 
     _require_catalog(catalog)
-    safe_ids = [value for value in run_ids if _SAFE_TOKEN.match(value)]
-    if not safe_ids:
-        raise ValueError("run id is required")
-    filters = [f"run_id IN ({_sql_in(dict.fromkeys(safe_ids))})"]
-    if owners:
-        unique_owners = list(dict.fromkeys(owners))
-        if all(_SAFE_TOKEN.match(value) for value in unique_owners):
-            filters.append(f"owner IN ({_sql_in(sorted(unique_owners))})")
-    if event_dates:
-        unique_dates = list(dict.fromkeys(event_dates))
-        if all(_SAFE_DATE.match(value) for value in unique_dates):
-            quoted_dates = ", ".join(f"DATE '{value}'" for value in sorted(unique_dates))
-            filters.append(f"event_date IN ({quoted_dates})")
+    safe_hashes = [value for value in content_hashes if value and len(value) >= 8]
+    if not safe_hashes:
+        raise ValueError("content hash is required")
+    # Hashes are hex; quote safely.
+    quoted = ", ".join(f"'{value}'" for value in dict.fromkeys(safe_hashes))
+    filters = [f"content_hash IN ({quoted})"]
+    if full_names:
+        names = require_safe_names(list(full_names))
+        filters.append(f"full_name IN ({_sql_in(names)})")
     return (
-        f"SELECT run_id, step_no, status FROM {catalog}.framework_meta.run_ledger "
+        f"SELECT object_kind, full_name, content_hash "
+        f"FROM {catalog}.framework_meta.ownership_refusals "
         f"WHERE {' AND '.join(filters)}"
     )
 
@@ -606,4 +741,4 @@ def utc_now() -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

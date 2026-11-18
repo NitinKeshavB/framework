@@ -16,7 +16,8 @@ if __name__ == "__main__":
     parser.add_argument("--catalog", required=True)
     parser.add_argument("specs", nargs="+", type=Path)
     args = parser.parse_args()
-    configs = validate_configs(args.specs, catalog=args.catalog)
+    # batch_load is generated only for frozen copy_into/ctas methods.
+    configs = validate_configs(args.specs, catalog=args.catalog, allow_frozen=True)
     spark = SparkSession.builder.getOrCreate()
     for config in configs:
         for statement in assemble(config).batch_sql:

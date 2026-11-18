@@ -13,7 +13,7 @@ source system ──delivery──▶ bronze ──▶ silver / gold / product
 | Folder | Role | Owner |
 | --- | --- | --- |
 | `framework_lff_lib` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
-| `framework_bundle` | The deployed framework: the wheel, frozen `framework_meta` DDL, hourly `framework_runs` catch-up, and daily `OPTIMIZE` / archive / table health | Platform team |
+| `framework_bundle` | The deployed framework: the wheel, frozen `framework_meta` DDL, hourly `framework_runs` catch-up, and daily `OPTIMIZE` / archive | Platform team |
 | `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
 | `framework_curation` | One bundle per project for silver, gold, and data products, with ownership checks and maps | One project each |
 | `framework_examples/ingestion` | Specs for each ingestion kind: a raw volume, SharePoint, a database, and cloud files | None |
@@ -46,7 +46,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 ./run.sh generate
 ```
 
-`generate` validates every source and spec, then writes the pipelines, jobs, and `SOURCE_MAP.md`. Details are in [framework_ingestion/README.md](framework_ingestion/README.md).
+`generate` validates every source and spec, then writes committed `SOURCE_MAP.md` and gitignored `.build/` artifacts (pipelines, jobs, delivery manifests). Details are in [framework_ingestion/README.md](framework_ingestion/README.md).
 
 ## Add a project, silver, gold, or data product
 
@@ -73,7 +73,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 2. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry and applies the specs' tags and column comments in Unity Catalog. It is the only writer of definitions.
 3. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
 
-`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job is one `refresh_pipeline` task: the pipeline reads its deployed specs from its `lff.specs` setting, and a run does not write the registry.
+`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job refreshes its pipeline (then records load metrics and NRT run status): the pipeline reads its delivery from `lff.manifest`, and a run does not write the registry.
 
 ## See what is running
 
@@ -97,11 +97,10 @@ Query `<catalog>.framework_meta`:
 | `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
 | `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations (NRT + hourly catch-up) |
 | `v_job_costs`, `v_pipeline_costs` | DBUs and list cost per run and update. Only when `system_views` is `true` |
-| `table_health` | Daily file count, size, and last load commit of each bronze table |
 | `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
 | `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source. Only when `system_views` is `true` |
 
-Filter by `owner`. Definitions are SCD Type 2: a changed spec closes its old version, a removed spec gets a deletion version, and nothing is deleted. Events (`run_ledger`, `table_health`) are insert-only.
+Filter by `owner`. Definitions are SCD Type 2: a changed spec closes its old version, a removed spec gets a deletion version, and nothing is deleted. Events (`run_ledger`, `load_ledger`) are insert-only.
 
 ```sql
 -- latest status for every job owned by billing
@@ -121,7 +120,7 @@ WHERE owner = 'billing';
 source venv/bin/activate        # or set PYTHON to a venv's python
 ./run.sh install                # editable install with the dev tools
 ./run.sh test:quick             # package tests; no Spark
-./run.sh lint                   # pre-commit (see .pre-commit-config.yaml)
+./run.sh lint                   # pre-commit: Ruff, mypy, hygiene, generate checks
 ./run.sh generate:check         # also a local pre-commit hook when ingestion paths change
 ./run.sh projects:check         # also a local pre-commit hook when curation/example paths change
 ./run.sh clean                  # remove wheels, build output, and caches

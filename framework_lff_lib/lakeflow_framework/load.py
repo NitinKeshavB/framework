@@ -153,7 +153,9 @@ def schema_hints(config: PipelineConfig) -> str:
 
 
 def _sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+    from lakeflow_framework.sqlnames import sql_string
+
+    return sql_string(value)
 
 
 def _read_files(config: PipelineConfig) -> str:

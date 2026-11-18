@@ -19,6 +19,10 @@ source_system: billing           # must equal the folder name
 domain: finance                  # must equal the parent folder name
 owner: billing.owner@jll.com
 kind: sftp_files                 # sftp_files, sharepoint_files, database, or cloud_files
+# Optional. When set, the generated job and pipeline run_as this principal.
+# run_as: 00000000-0000-0000-0000-000000000000
+# Optional. STANDARD (default) or PERFORMANCE_OPTIMIZED.
+# performance_target: STANDARD
 
 raw_volume:                      # file kinds: where files land as delivered
   schema: billing_raw
@@ -32,7 +36,9 @@ deliveries:
 
 | Field | Rule |
 | --- | --- |
-| `kind` | `sftp_files` and `sharepoint_files` need `raw_volume` (schema and volume). `database` needs `foreign_catalog` and takes an optional `engine` of `postgresql`, `azure_sql`, `sql_server`, or `db2`. `cloud_files` is the original raw-table path. |
+| `kind` | `sftp_files` and `sharepoint_files` need `raw_volume` (schema and volume). `database` needs `foreign_catalog` and takes an optional `engine` of `postgresql`, `azure_sql`, `sql_server`, or `db2`. `cloud_files` is the original raw-table path (frozen methods). |
+| `run_as` | Optional service principal application id or name for the generated job and pipeline. |
+| `performance_target` | Optional. `STANDARD` (default, cheaper) or `PERFORMANCE_OPTIMIZED` (faster cold starts). |
 | `deliveries` | At least one. Each has exactly one of `schedule` (a Quartz cron) or `trigger: file_arrival`. A database delivery has a schedule only. A `cloud_files` file-arrival delivery needs a path that starts with `abfss://` or `s3://`, or a `/Volumes/<catalog>/<schema>/<volume>` path. |
 | `fetch` | Rejected. Copying files from SFTP or SharePoint into the raw volume is not built. |
 

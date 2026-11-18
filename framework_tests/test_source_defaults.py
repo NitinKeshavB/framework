@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from lakeflow_framework.config import ConfigValidationError
-from lakeflow_framework.ingestion import generate, load_sources, new_source, new_table
+from lakeflow_framework.ingestion import BUILD_DIR, generate, load_sources, new_source, new_table
 
 SOURCE = """\
 source_system: files
@@ -146,7 +146,9 @@ def test_source_yaml_needs_the_raw_schema(tmp_path: Path) -> None:
 def test_the_trigger_watches_the_volume_the_tables_read(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, spec=SPEC.replace("volume: landing", "volume: month_end"))
     generate(bundle)
-    job = yaml.safe_load((bundle / "resources" / "files_daily.job.yml").read_text("utf-8"))
+    job = yaml.safe_load(
+        (bundle / BUILD_DIR / "resources" / "files_daily.job.yml").read_text("utf-8")
+    )
     trigger = job["resources"]["jobs"]["files_daily"]["trigger"]
     assert trigger == {"file_arrival": {"url": "/Volumes/${var.catalog}/files_raw/month_end/"}}
     assert generate(bundle, check=True) == []

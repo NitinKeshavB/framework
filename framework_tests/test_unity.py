@@ -134,7 +134,7 @@ def test_a_removed_tag_is_unset_and_a_changed_comment_is_set():
     assert not any("cost_centre" in statement for statement in statements)
     assert (
         f"ALTER STREAMING TABLE {QUOTED} ALTER COLUMN `amount` COMMENT "
-        "'Invoice amount, it\\'s in AUD'"
+        "'Invoice amount, it''s in AUD'"
     ) in statements
 
 

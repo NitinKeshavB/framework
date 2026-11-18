@@ -1,0 +1,12 @@
+# Example profile: confidential database merge loads.
+# Usage in a table or table-group file:
+#   extends: profiles/db_merge_confidential
+
+data:
+  classification: confidential
+
+source:
+  mode: merge
+
+raw_to_bronze:
+  dedup: false

@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
+
+from lakeflow_framework.sqlnames import IDENTIFIER, TYPE_NAME
 
 # autoloader, copy_into, and ctas land files in a raw table first. volume_files reads files that
 # are already in a raw Unity Catalog volume, and database_table reads a database table through a
@@ -21,9 +24,14 @@ FROZEN_METHODS = ("autoloader", "copy_into", "ctas")
 FILE_EVENT_METHODS = ("autoloader", "volume_files")
 # Liquid clustering takes up to four keys, and none of these types.
 MAX_CLUSTER_KEYS = 4
-# Pipeline configuration keys: the deployed spec files, comma-separated, and the catalog.
+# Pipeline configuration keys. Prefer one compiled manifest (lff.manifest); lff.specs remains
+# as a comma-joined fallback for older deploys. Catalog is the environment catalog.
 SPECS_SETTING = "lff.specs"
+MANIFEST_SETTING = "lff.manifest"
 CATALOG_SETTING = "lff.catalog"
+# Spec files declare this so validation can evolve across thousands of tables.
+SPEC_VERSION = 1
+SUPPORTED_SPEC_VERSIONS = frozenset({1})
 UNCLUSTERABLE = ("boolean", "array", "map", "struct", "binary")
 FILE_KINDS = ("sftp_files", "sharepoint_files")
 DATABASE_KIND = "database"
@@ -42,8 +50,6 @@ FORMATS = (
     "yaml",
 )
 SECRET_PARTS = ("account_key", "access_key", "secret", "password", "token")
-IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-TYPE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_(), ]*$")
 UNRESOLVED = re.compile(r"\$\{[^}]+\}")
 CLOUD_PATH = re.compile(r"^(abfss|s3)://", re.IGNORECASE)
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -93,8 +99,43 @@ class TableTags:
 
 
 @dataclass
+class FileSourceOptions:
+    """Typed options for file / volume load strategies. Meaningless for database loads."""
+
+    file_format: str
+    path: str
+    external_location: str | None = None
+    delimiter: str | None = None
+    header: bool = True
+    header_rows: int | None = None
+    data_address: str | None = None
+    max_files_per_trigger: int | None = None
+    path_glob: str | None = None
+    json_multiline: bool = False
+    file_events: bool = False
+    fixed_columns: list[FixedColumn] = field(default_factory=list)
+
+
+@dataclass
+class DatabaseSourceOptions:
+    """Typed options for ``database_table`` loads. Meaningless for file loads."""
+
+    source_catalog: str
+    source_table: str
+    source_mode: str = "snapshot"
+
+
+SourceOptions = FileSourceOptions | DatabaseSourceOptions
+
+
+@dataclass
 class PipelineConfig:
-    """A bronze load: files land in raw, then raw is published to bronze."""
+    """A bronze load: identity, ownership, target, and quality in the core; source options
+    are a discriminated union on ``load_method`` (see ``source_options``).
+
+    Flat file/database fields remain for call sites and the load strategies; they mirror
+    ``source_options`` and are empty when that kind does not apply.
+    """
 
     pipeline_id: str
     requested_by: str
@@ -140,6 +181,7 @@ class PipelineConfig:
     source_table: str = ""
     source_mode: str = ""
     delivery: str = ""
+    source_options: SourceOptions | None = None
 
     @property
     def owner_kind(self) -> str:
@@ -234,6 +276,7 @@ class PipelineConfig:
                 self.raw_schema, self.raw_table, self.tags["raw"]
             )
         document = {
+            "spec_version": SPEC_VERSION,
             "pipeline_id": self.pipeline_id,
             "requested_by": self.requested_by,
             "domain": self.domain,
@@ -294,7 +337,9 @@ def validate_configs(
     """Validate spec files. ``catalog`` sets the environment's catalog for every spec, so a
     spec does not hard-code dev or prod. Without it each spec must name its own catalog.
 
-    ``allow_frozen`` admits the FROZEN_METHODS. Only tests and the consumer reference set it.
+    Precedence when composing: table entry beats ``extends`` profile beats ``source.yaml`` /
+    folder beats framework default. A file with a ``tables:`` list expands to one config per
+    entry. ``allow_frozen`` admits the FROZEN_METHODS (tests / consumer reference only).
     """
 
     errors: list[str] = []
@@ -303,29 +348,158 @@ def validate_configs(
         document = read_mapping(path, errors)
         if document is None:
             continue
-        if catalog:
-            document = {**document, "catalog": catalog}
-        if "source" in document and "source_to_raw" not in document:
-            source_file = path.parent / "source.yaml"
-            if not source_file.is_file():
-                source_file = path.parent.parent / "source.yaml"
-            document, composed = compose_document(document, source_file, str(path), path)
-            if composed:
-                errors.extend(composed)
+        documents, expand_errors = expand_spec_documents(document, path)
+        errors.extend(expand_errors)
+        for document in documents:
+            if catalog:
+                document = {**document, "catalog": catalog}
+            document, profile_errors = apply_extends(document, path)
+            errors.extend(profile_errors)
+            if profile_errors:
                 continue
-        found, parsed = _validate_one(document, str(path))
-        errors.extend(found)
-        if parsed is not None and parsed.load_method in FROZEN_METHODS and not allow_frozen:
-            errors.append(
-                f"{path}: {parsed.load_method} is not in the MVP; "
-                "land files in a volume (volume_files) or read a database (database_table)"
-            )
-        elif parsed is not None:
-            configs.append(parsed)
+            if "source" in document and "source_to_raw" not in document:
+                source_file = path.parent / "source.yaml"
+                if not source_file.is_file():
+                    source_file = path.parent.parent / "source.yaml"
+                document, composed = compose_document(document, source_file, str(path), path)
+                if composed:
+                    errors.extend(composed)
+                    continue
+            found, parsed = _validate_one(document, str(path))
+            errors.extend(found)
+            if parsed is not None and parsed.load_method in FROZEN_METHODS and not allow_frozen:
+                errors.append(
+                    f"{path}: {parsed.load_method} is not in the MVP; "
+                    "land files in a volume (volume_files) or read a database (database_table)"
+                )
+            elif parsed is not None:
+                configs.append(parsed)
     errors.extend(_target_conflicts(configs))
     if errors:
         raise ConfigValidationError(errors)
     return configs
+
+
+def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge mappings; override wins. Nested dicts merge; lists and scalars replace."""
+
+    merged = dict(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, Mapping):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def apply_extends(document: dict[str, Any], spec_path: Path) -> tuple[dict[str, Any], list[str]]:
+    """Apply ``extends: profiles/...`` before source.yaml inheritance. Spec keys win."""
+
+    extends = document.get("extends")
+    if extends is None:
+        return document, []
+    if not isinstance(extends, str) or not extends.strip():
+        return document, [f"{spec_path}: extends must be a profile path like profiles/name"]
+    # Resolve from the ingestion bundle root (folder that holds sources/ and profiles/).
+    cursor = spec_path.resolve().parent
+    bundle_root = None
+    for _ in range(6):
+        if (cursor / "sources").is_dir() or (cursor / "profiles").is_dir():
+            bundle_root = cursor
+            break
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    if bundle_root is None:
+        return document, [f"{spec_path}: could not find bundle root for extends {extends}"]
+    relative = extends if extends.endswith((".yaml", ".yml")) else f"{extends}.yaml"
+    profile_path = bundle_root / relative
+    if not profile_path.is_file():
+        return document, [f"{spec_path}: extends profile not found: {extends}"]
+    profile_errors: list[str] = []
+    profile = read_mapping(profile_path, profile_errors)
+    if profile_errors:
+        return document, profile_errors
+    if profile is None:
+        return document, [f"{spec_path}: extends profile is not a mapping: {extends}"]
+    without = {key: value for key, value in document.items() if key != "extends"}
+    # Profile under, table on top — table entry beats profile.
+    return deep_merge(profile, without), []
+
+
+_TABLE_SHORTCUTS = frozenset(
+    {"name", "pipeline_id", "primary_keys", "columns", "mode", "pii", "classification"}
+)
+
+
+def expand_spec_documents(
+    document: dict[str, Any], path: Path
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Expand a ``tables:`` group file into one document per table entry.
+
+    Shortcuts on each entry (``primary_keys``, ``mode``, ``pii``, …) map into the usual
+    nested sections; any other key deep-merges onto the shared document. Table entry wins.
+    """
+
+    tables = document.get("tables")
+    if tables is None:
+        return [document], []
+    if not isinstance(tables, list) or not tables:
+        return [], [f"{path}: tables must be a non-empty list"]
+    shared = {key: value for key, value in document.items() if key != "tables"}
+    expanded: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, entry in enumerate(tables):
+        if not isinstance(entry, dict):
+            errors.append(f"{path}: tables[{index}] must be a mapping")
+            continue
+        name = str(entry.get("name") or entry.get("pipeline_id") or "")
+        if not name:
+            errors.append(f"{path}: tables[{index}] needs name or pipeline_id")
+            continue
+        override = {key: value for key, value in entry.items() if key not in _TABLE_SHORTCUTS}
+        if "pipeline_id" in entry:
+            override["pipeline_id"] = entry["pipeline_id"]
+        item = deep_merge(shared, override)
+        if "pipeline_id" not in item:
+            if (path.parent / "source.yaml").is_file():
+                source_system = path.parent.name
+            elif (path.parent.parent / "source.yaml").is_file():
+                source_system = path.parent.parent.name
+            else:
+                source_system = path.parent.name
+            item["pipeline_id"] = (
+                name if name.startswith(f"{source_system}_") else f"{source_system}_{name}"
+            )
+        # Default bronze (and quarantine) table name to the short ``name`` when omitted.
+        short_name = str(entry.get("name") or "")
+        if short_name and IDENTIFIER.match(short_name):
+            bronze_block = dict((item.get("raw_to_bronze") or {}).get("bronze") or {})
+            if "table" not in bronze_block:
+                bronze_block["table"] = short_name
+                raw_to_bronze = dict(item.get("raw_to_bronze") or {})
+                raw_to_bronze["bronze"] = bronze_block
+                item["raw_to_bronze"] = raw_to_bronze
+        if any(key in entry for key in ("primary_keys", "columns")):
+            bronze = dict(item.get("raw_to_bronze") or {})
+            if "primary_keys" in entry:
+                bronze["primary_keys"] = entry["primary_keys"]
+            if "columns" in entry:
+                bronze["columns"] = entry["columns"]
+            item["raw_to_bronze"] = bronze
+        if "mode" in entry:
+            source = dict(item.get("source") or {})
+            source["mode"] = entry["mode"]
+            item["source"] = source
+        if "pii" in entry or "classification" in entry:
+            data = dict(item.get("data") or {})
+            if "pii" in entry:
+                data["pii"] = entry["pii"]
+            if "classification" in entry:
+                data["classification"] = entry["classification"]
+            item["data"] = data
+        expanded.append(item)
+    return expanded, errors
 
 
 def inherit_from_source(
@@ -411,6 +585,8 @@ def compose_document(
             )
         if not catalog:
             problems.append(f"{label}: catalog is required")
+        elif not IDENTIFIER.match(catalog):
+            problems.append(f"{label}: catalog must be an identifier")
         if problems:
             return spec, problems
         path = f"/Volumes/{catalog}/{schema}/{name}/" + (f"{raw_path}/" if raw_path else "")
@@ -465,6 +641,17 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     _reject_unresolved(document, label, errors)
 
     pipeline_id = _identifier(document, "pipeline_id", label, errors)
+    version = document.get("spec_version", SPEC_VERSION)
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        errors.append(f"{label}: spec_version must be an integer")
+        version = None
+    if version is not None and version not in SUPPORTED_SPEC_VERSIONS:
+        errors.append(
+            f"{label}: spec_version {version} is not supported "
+            f"(supported: {sorted(SUPPORTED_SPEC_VERSIONS)})"
+        )
     # requested_by is the project that brought the table in. Older specs call it project.
     # Omitted when the spec sits directly under the source system.
     requested_by = _optional_text(document.get("requested_by")) or _optional_text(
@@ -478,6 +665,8 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     catalog = str(document.get("catalog") or "")
     if not catalog:
         errors.append(f"{label}: catalog is required")
+    elif not IDENTIFIER.match(catalog):
+        errors.append(f"{label}: catalog must be an identifier")
     layer = document.get("layer")
     if layer != "bronze":
         if layer in {"silver", "gold", "product"}:
@@ -504,35 +693,24 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     if source_to_raw and load_method not in LOAD_METHODS:
         errors.append(f"{label}: source_to_raw.method must be one of {', '.join(LOAD_METHODS)}")
     is_database = load_method == "database_table"
-    file_format = "" if is_database else str(source.get("format") or "")
-    if source and not is_database and file_format not in FORMATS:
-        errors.append(f"{label}: format must be one of {', '.join(FORMATS)}")
-    if file_format == "excel" and load_method == "copy_into":
-        errors.append(f"{label}: excel cannot use copy_into")
-    if load_method == "volume_files" and file_format in {"fixed_width", "yaml"}:
-        errors.append(f"{label}: {file_format} is not supported from a raw volume yet")
-
     source_system = (
         _identifier(source, "system", f"{label}: source_to_raw.source", errors) if source else None
     )
-    path = "" if is_database else str(source.get("path") or "")
-    if source and not is_database and not path:
-        errors.append(f"{label}: path is required")
-    elif path and load_method == "volume_files" and not VOLUME_PATH.match(path):
-        errors.append(f"{label}: path must be a /Volumes/<catalog>/<schema>/<volume> path")
-    elif path and load_method != "volume_files" and not _storage_path(path):
-        errors.append(f"{label}: path must start with abfss:// or s3://, or be a /Volumes path")
 
-    source_catalog = str(source.get("catalog") or "") if is_database else ""
-    source_table = str(source.get("table") or "") if is_database else ""
-    source_mode = str(source.get("mode") or "snapshot") if is_database else ""
-    if is_database:
-        if not IDENTIFIER.match(source_catalog):
-            errors.append(f"{label}: the source system needs a foreign_catalog identifier")
-        if not SOURCE_TABLE.match(source_table):
-            errors.append(f"{label}: source.table must be <schema>.<table> in the database")
-        if source_mode not in DATABASE_MODES:
-            errors.append(f"{label}: source.mode must be one of {', '.join(DATABASE_MODES)}")
+    file_options: FileSourceOptions | None = None
+    database_options: DatabaseSourceOptions | None = None
+    if source and is_database:
+        database_options = _parse_database_source(source, label, errors)
+        _reject_file_only_keys(source, label, errors)
+    elif source:
+        file_options = _parse_file_source(source, load_method, label, errors)
+        _reject_database_only_keys(source, label, errors)
+
+    file_format = file_options.file_format if file_options else ""
+    path = file_options.path if file_options else ""
+    source_catalog = database_options.source_catalog if database_options else ""
+    source_table = database_options.source_table if database_options else ""
+    source_mode = database_options.source_mode if database_options else ""
 
     raw_table = _target_table(raw_target, "raw", pipeline_id, label, errors) if has_raw else ""
     bronze_table = _target_table(bronze_target, "bronze", raw_table or pipeline_id, label, errors)
@@ -565,45 +743,21 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
             f"{label}: dedup sequences on watermark_column '{watermark}', "
             "so it must be in columns with its type"
         )
-    rules = _rules(raw_to_bronze.get("rules"), label, errors)
-    fixed_columns = _fixed_columns(source.get("fixed_columns"), label, errors)
-    if file_format == "fixed_width" and not fixed_columns:
-        errors.append(f"{label}: fixed_width requires fixed_columns")
-
-    delimiter = source.get("delimiter")
-    if file_format in {"csv", "delimited"} and not delimiter:
-        errors.append(f"{label}: delimiter is required for {file_format}")
-    elif delimiter and ("'" in str(delimiter) or len(str(delimiter)) > 3):
-        errors.append(f"{label}: delimiter must be a short literal")
-
-    header_rows = source.get("header_rows")
-    data_address = source.get("data_address")
-    if file_format == "excel":
-        if header_rows not in (0, 1):
-            errors.append(f"{label}: header_rows must be 0 or 1 for excel")
-        if not data_address:
-            errors.append(f"{label}: data_address is required for excel")
-    multiline = source.get("multiline", False)
-    if not isinstance(multiline, bool):
-        errors.append(f"{label}: multiline must be true or false")
-        multiline = False
-
-    file_events = source.get("file_events", False)
-    if not isinstance(file_events, bool):
-        errors.append(f"{label}: file_events must be true or false")
-        file_events = False
-    elif file_events and load_method not in FILE_EVENT_METHODS:
-        errors.append(f"{label}: file_events applies only to files read by Auto Loader")
+    fixed_columns = file_options.fixed_columns if file_options else []
+    rule_columns = (
+        {column.name for column in columns}
+        | {column.name for column in fixed_columns}
+        | set(primary_keys)
+        | ({str(watermark)} if watermark else set())
+        | {"_source_file", "_ingested_at", "_rescued_data"}
+    )
+    rules = _rules(
+        raw_to_bronze.get("rules"),
+        label,
+        errors,
+        columns=rule_columns,
+    )
     cluster_by = _cluster_by(bronze_target.get("cluster_by"), columns, label, errors)
-
-    max_files = source.get("max_files_per_trigger")
-    if max_files is not None:
-        try:
-            if int(max_files) <= 0:
-                errors.append(f"{label}: max_files_per_trigger must be greater than 0")
-        except (TypeError, ValueError):
-            errors.append(f"{label}: max_files_per_trigger must be an integer")
-            max_files = None
 
     if (
         errors
@@ -620,9 +774,14 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         or not team
         or not technical_owner
         or any(name not in tags for name in (["raw"] if has_raw else []) + ["bronze", "quarantine"])
+        or (is_database and database_options is None)
+        or (not is_database and file_options is None)
     ):
         return errors, None
 
+    source_options: SourceOptions = (
+        database_options if is_database else file_options  # type: ignore[assignment]
+    )
     parsed = PipelineConfig(
         pipeline_id=pipeline_id,
         requested_by=requested_by,
@@ -639,21 +798,21 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         raw_table=raw_table,
         bronze_table=bronze_table,
         quarantine_table=quarantine_table,
-        external_location=_optional_text(source.get("external_location")),
+        external_location=file_options.external_location if file_options else None,
         dedup=dedup,
         primary_keys=primary_keys,
         watermark_column=str(watermark) if watermark else None,
         columns=columns,
         rules=rules,
         fixed_columns=fixed_columns,
-        delimiter=str(delimiter) if delimiter else None,
-        header=bool(source.get("header", True)),
-        header_rows=int(header_rows) if header_rows in (0, 1) else None,
-        data_address=str(data_address) if data_address else None,
-        max_files_per_trigger=int(max_files) if max_files is not None else None,
-        path_glob=_optional_text(source.get("path_glob")),
-        json_multiline=multiline,
-        file_events=file_events,
+        delimiter=file_options.delimiter if file_options else None,
+        header=file_options.header if file_options else True,
+        header_rows=file_options.header_rows if file_options else None,
+        data_address=file_options.data_address if file_options else None,
+        max_files_per_trigger=(file_options.max_files_per_trigger if file_options else None),
+        path_glob=file_options.path_glob if file_options else None,
+        json_multiline=file_options.json_multiline if file_options else False,
+        file_events=file_options.file_events if file_options else False,
         cluster_by=cluster_by,
         job_name=_optional_text(document.get("job_name")),
         domain=domain,
@@ -668,8 +827,160 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         source_table=source_table,
         source_mode=source_mode,
         delivery=_optional_text(document.get("delivery")) or "",
+        source_options=source_options,
     )
     return errors, parsed
+
+
+_FILE_ONLY_KEYS = frozenset(
+    {
+        "format",
+        "path",
+        "delimiter",
+        "header",
+        "header_rows",
+        "data_address",
+        "path_glob",
+        "multiline",
+        "file_events",
+        "max_files_per_trigger",
+        "fixed_columns",
+        "external_location",
+    }
+)
+_DATABASE_ONLY_KEYS = frozenset({"catalog", "table", "mode"})
+
+
+def _reject_file_only_keys(source: Mapping[str, Any], label: str, errors: list[str]) -> None:
+    found = sorted(
+        key for key in _FILE_ONLY_KEYS if key in source and source[key] not in (None, "")
+    )
+    if found:
+        errors.append(f"{label}: database source must not set file options {', '.join(found)}")
+
+
+def _reject_database_only_keys(source: Mapping[str, Any], label: str, errors: list[str]) -> None:
+    # ``catalog`` / ``table`` / ``mode`` are database-only in composed source_to_raw.
+    found = sorted(
+        key for key in _DATABASE_ONLY_KEYS if key in source and source[key] not in (None, "")
+    )
+    if found:
+        errors.append(f"{label}: file source must not set database options {', '.join(found)}")
+
+
+def _parse_database_source(
+    source: Mapping[str, Any], label: str, errors: list[str]
+) -> DatabaseSourceOptions | None:
+    source_catalog = str(source.get("catalog") or "")
+    source_table = str(source.get("table") or "")
+    source_mode = str(source.get("mode") or "snapshot")
+    ok = True
+    if not IDENTIFIER.match(source_catalog):
+        errors.append(f"{label}: the source system needs a foreign_catalog identifier")
+        ok = False
+    if not SOURCE_TABLE.match(source_table):
+        errors.append(f"{label}: source.table must be <schema>.<table> in the database")
+        ok = False
+    if source_mode not in DATABASE_MODES:
+        errors.append(f"{label}: source.mode must be one of {', '.join(DATABASE_MODES)}")
+        ok = False
+    if not ok:
+        return None
+    return DatabaseSourceOptions(source_catalog, source_table, source_mode)
+
+
+def _parse_file_source(
+    source: Mapping[str, Any], load_method: str, label: str, errors: list[str]
+) -> FileSourceOptions | None:
+    file_format = str(source.get("format") or "")
+    path = str(source.get("path") or "")
+    ok = True
+    if file_format not in FORMATS:
+        errors.append(f"{label}: format must be one of {', '.join(FORMATS)}")
+        ok = False
+    if file_format == "excel" and load_method == "copy_into":
+        errors.append(f"{label}: excel cannot use copy_into")
+        ok = False
+    if load_method == "volume_files" and file_format in {"fixed_width", "yaml"}:
+        errors.append(f"{label}: {file_format} is not supported from a raw volume yet")
+        ok = False
+    if not path:
+        errors.append(f"{label}: path is required")
+        ok = False
+    elif load_method == "volume_files" and not VOLUME_PATH.match(path):
+        errors.append(f"{label}: path must be a /Volumes/<catalog>/<schema>/<volume> path")
+        ok = False
+    elif load_method != "volume_files" and not _storage_path(path):
+        errors.append(f"{label}: path must start with abfss:// or s3://, or be a /Volumes path")
+        ok = False
+
+    fixed_columns = _fixed_columns(source.get("fixed_columns"), label, errors)
+    if file_format == "fixed_width" and not fixed_columns:
+        errors.append(f"{label}: fixed_width requires fixed_columns")
+        ok = False
+
+    delimiter = source.get("delimiter")
+    if file_format in {"csv", "delimited"} and not delimiter:
+        errors.append(f"{label}: delimiter is required for {file_format}")
+        ok = False
+    elif delimiter and ("'" in str(delimiter) or len(str(delimiter)) > 3):
+        errors.append(f"{label}: delimiter must be a short literal")
+        ok = False
+
+    header_rows = source.get("header_rows")
+    data_address = source.get("data_address")
+    if file_format == "excel":
+        if header_rows not in (0, 1):
+            errors.append(f"{label}: header_rows must be 0 or 1 for excel")
+            ok = False
+        if not data_address:
+            errors.append(f"{label}: data_address is required for excel")
+            ok = False
+
+    multiline = source.get("multiline", False)
+    if not isinstance(multiline, bool):
+        errors.append(f"{label}: multiline must be true or false")
+        multiline = False
+        ok = False
+
+    file_events = source.get("file_events", False)
+    if not isinstance(file_events, bool):
+        errors.append(f"{label}: file_events must be true or false")
+        file_events = False
+        ok = False
+    elif file_events and load_method not in FILE_EVENT_METHODS:
+        errors.append(f"{label}: file_events applies only to files read by Auto Loader")
+        ok = False
+
+    max_files = source.get("max_files_per_trigger")
+    max_files_value: int | None = None
+    if max_files is not None:
+        try:
+            max_files_value = int(max_files)
+            if max_files_value <= 0:
+                errors.append(f"{label}: max_files_per_trigger must be greater than 0")
+                ok = False
+                max_files_value = None
+        except (TypeError, ValueError):
+            errors.append(f"{label}: max_files_per_trigger must be an integer")
+            ok = False
+
+    if not ok:
+        return None
+    return FileSourceOptions(
+        file_format=file_format,
+        path=path,
+        external_location=_optional_text(source.get("external_location")),
+        delimiter=str(delimiter) if delimiter else None,
+        header=bool(source.get("header", True)),
+        header_rows=int(header_rows) if header_rows in (0, 1) else None,
+        data_address=str(data_address) if data_address else None,
+        max_files_per_trigger=max_files_value,
+        path_glob=_optional_text(source.get("path_glob")),
+        json_multiline=multiline,
+        file_events=file_events,
+        fixed_columns=fixed_columns,
+    )
 
 
 def _table_document(schema: str, table: str, tags: TableTags) -> dict[str, Any]:
@@ -893,7 +1204,9 @@ def _target_schema(
     return str(schema)
 
 
-def _target_conflicts(configs: list[PipelineConfig]) -> list[str]:
+def target_conflicts(configs: list[PipelineConfig]) -> list[str]:
+    """Reject two pipelines that write the same catalog.schema.table at any layer."""
+
     seen: dict[str, str] = {}
     errors: list[str] = []
     for config in configs:
@@ -904,6 +1217,10 @@ def _target_conflicts(configs: list[PipelineConfig]) -> list[str]:
                 errors.append(f"{target} is written by {owner} and {config.pipeline_id}")
             seen[target] = config.pipeline_id
     return errors
+
+
+def _target_conflicts(configs: list[PipelineConfig]) -> list[str]:
+    return target_conflicts(configs)
 
 
 def _reject_secrets(value: Any, label: str, errors: list[str]) -> None:
@@ -1048,7 +1365,11 @@ def _column_tags(
     return classification, pii
 
 
-def _rules(value: Any, label: str, errors: list[str]) -> list[QualityRule]:
+def _rules(
+    value: Any, label: str, errors: list[str], *, columns: set[str] | None = None
+) -> list[QualityRule]:
+    from lakeflow_framework.quality import assert_safe_rule_expression
+
     if value is None:
         return []
     if not isinstance(value, list):
@@ -1056,6 +1377,7 @@ def _rules(value: Any, label: str, errors: list[str]) -> list[QualityRule]:
         return []
     rules: list[QualityRule] = []
     seen: set[str] = set()
+    known = columns or set()
     for item in value:
         if not isinstance(item, dict):
             errors.append(f"{label}: each rule must be a mapping")
@@ -1068,8 +1390,9 @@ def _rules(value: Any, label: str, errors: list[str]) -> list[QualityRule]:
         if name in seen:
             errors.append(f"{label}: rule name '{name}' is duplicated")
         seen.add(name)
-        if not expression or ";" in expression or "--" in expression:
-            errors.append(f"{label}: rule '{name}' needs one boolean expression")
+        before = len(errors)
+        assert_safe_rule_expression(expression, known, label=label, name=name, errors=errors)
+        if len(errors) > before:
             continue
         rules.append(QualityRule(name, expression))
     return rules

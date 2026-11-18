@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from lakeflow_framework.logs import statement_summary
 
@@ -313,7 +314,9 @@ def _quoted_schema(full_name: str) -> str:
 
 
 def _literal(value: str) -> str:
-    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    from lakeflow_framework.sqlnames import sql_string
+
+    return sql_string(value)
 
 
 def _text(value: Any) -> str:
@@ -321,5 +324,6 @@ def _text(value: Any) -> str:
 
 
 def _rows(frame: Any) -> list[dict[str, Any]]:
-    collected = frame.collect() if hasattr(frame, "collect") else list(frame)
-    return [row if isinstance(row, dict) else row.asDict() for row in collected]
+    from lakeflow_framework.sqlnames import spark_rows
+
+    return spark_rows(frame)

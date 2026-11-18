@@ -1,5 +1,5 @@
 -- Registry for Lakeflow source systems, schemas, workflows, pipelines, flows, securables,
--- ownership refusals, and table health. ${catalog} is replaced by the DDL task.
+-- and ownership refusals. ${catalog} is replaced by the DDL task.
 -- registry_sync is the only writer of definitions. It runs at deploy, so these tables change
 -- once per deploy, not once per job run.
 --
@@ -7,45 +7,128 @@
 -- changed definition closes its current version and adds a new one. A definition removed
 -- from the bundle closes its current version and adds a deletion version (is_deleted true)
 -- that stays current until the definition comes back. Nothing in it is updated except
--- valid_to and is_current, and nothing is deleted. run_ledger and table_health are events
--- and stay insert-only. asset_registry_current and run_current hold one row per key
--- so a lookup does not window the history. Delivery jobs append load_ledger (record_load_metrics)
--- and merge job_runs NRT (record_this_run). Hourly framework_runs is catch-up for job_runs /
--- job_task_runs / pipeline_updates from the Jobs API and event logs (no system table grants).
--- Cost views live in system_views.sql.
+-- valid_to and is_current, and nothing is deleted.
+-- asset_id is a stable SHA-256 of source coordinates (not the display full_name), so a rename
+-- is a new version of the same asset rather than an unrelated object.
 --
--- Every row has an owner: owner_kind says what kind of owner (source_system for ingestion,
--- project for silver, gold, and data products) and owner is its name. A table has one owner. Bronze tables are
--- owned by their source system. requested_by is the team that asked for a bronze table, and
--- delivery is how its source delivers.
+-- load_ledger is append-only recon. pipeline_id is the spec id (joins v_pipelines), the
+-- Lakeflow pipeline UUID from the event log is update_pipeline_uuid. Metric values also land
+-- in load_metric (long shape) so new metrics do not require a wide-column ALTER.
+-- job_runs / job_task_runs are append-only, v_job_runs / v_job_task_runs keep latest per key.
+-- ownership_refusals replaces the vestigial run_ledger / run_current step tables.
 --
--- config is config_json parsed to VARIANT, so the views read it with config:path. config_json
--- stays: content_hash is computed over that text.
---
--- This file creates a fresh framework_meta. It has no ALTER statements, so a table created
--- with an older shape keeps it. Until go-live, drop the schema to change a table. After
--- go-live, add an ALTER here for each change instead.
+-- Constraints are informational PRIMARY KEY / FOREIGN KEY (Unity Catalog) plus enforced
+-- CHECK on enumerations where Delta supports them. Until go-live, DROP SCHEMA … CASCADE
+-- and recreate, after go-live, add ALTER statements instead of editing CREATE shapes.
 
 CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_meta;
 
+-- Per-delivery pipeline event logs. Kept out of framework_meta so SHOW TABLES there
+-- does not grow with every job (hourly pipeline_updates and load metrics look here).
+CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_events;
+
+-- Enumeration registration (discipline from the legacy Synapse framework).
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ref_object_kind (
+  object_kind STRING NOT NULL,
+  CONSTRAINT ref_object_kind_pk PRIMARY KEY (object_kind)
+);
+INSERT INTO ${catalog}.framework_meta.ref_object_kind (object_kind)
+SELECT object_kind FROM (VALUES
+  ('source_system'),
+  ('schema'),
+  ('workflow'),
+  ('pipeline'),
+  ('dataflow'),
+  ('flow'),
+  ('table'),
+  ('streaming_table'),
+  ('materialized_view'),
+  ('column'),
+  ('link')
+) AS v(object_kind)
+WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.framework_meta.ref_object_kind r WHERE r.object_kind = v.object_kind);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ref_owner_kind (
+  owner_kind STRING NOT NULL,
+  CONSTRAINT ref_owner_kind_pk PRIMARY KEY (owner_kind)
+);
+INSERT INTO ${catalog}.framework_meta.ref_owner_kind (owner_kind)
+SELECT owner_kind FROM (VALUES
+  ('source_system'),
+  ('project')
+) AS v(owner_kind)
+WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.framework_meta.ref_owner_kind r WHERE r.owner_kind = v.owner_kind);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ref_relation (
+  relation STRING NOT NULL,
+  CONSTRAINT ref_relation_pk PRIMARY KEY (relation)
+);
+INSERT INTO ${catalog}.framework_meta.ref_relation (relation)
+SELECT relation FROM (VALUES
+  ('owns'),
+  ('contains'),
+  ('reads'),
+  ('writes'),
+  ('rejects_to'),
+  ('column_of')
+) AS v(relation)
+WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.framework_meta.ref_relation r WHERE r.relation = v.relation);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ref_layer (
+  layer STRING NOT NULL,
+  CONSTRAINT ref_layer_pk PRIMARY KEY (layer)
+);
+INSERT INTO ${catalog}.framework_meta.ref_layer (layer)
+SELECT layer FROM (VALUES
+  ('raw'),
+  ('bronze'),
+  ('quarantine'),
+  ('silver'),
+  ('gold'),
+  ('product'),
+  ('staged')
+) AS v(layer)
+WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.framework_meta.ref_layer r WHERE r.layer = v.layer);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ref_metric_name (
+  metric_name STRING NOT NULL,
+  CONSTRAINT ref_metric_name_pk PRIMARY KEY (metric_name)
+);
+INSERT INTO ${catalog}.framework_meta.ref_metric_name (metric_name)
+SELECT metric_name FROM (VALUES
+  ('rows_read'),
+  ('rows_written'),
+  ('rows_upserted'),
+  ('rows_deleted'),
+  ('rows_quarantine'),
+  ('rows_processed')
+) AS v(metric_name)
+WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.framework_meta.ref_metric_name r WHERE r.metric_name = v.metric_name);
+
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry (
-  object_kind STRING,
-  full_name STRING,
-  owner_kind STRING,
-  owner STRING,
+  asset_id STRING NOT NULL,
+  object_kind STRING NOT NULL,
+  full_name STRING NOT NULL,
+  owner_kind STRING NOT NULL,
+  owner STRING NOT NULL,
   requested_by STRING,
   delivery STRING,
   parent_full_name STRING,
   relation STRING,
-  config_json STRING,
-  content_hash STRING,
-  source STRING,
-  recorded_at TIMESTAMP,
+  config_json STRING NOT NULL,
+  content_hash STRING NOT NULL,
+  source STRING NOT NULL,
+  bundle_id STRING,
+  recorded_at TIMESTAMP NOT NULL,
   config VARIANT,
-  valid_from TIMESTAMP,
+  valid_from TIMESTAMP NOT NULL,
   valid_to TIMESTAMP,
-  is_current BOOLEAN,
-  is_deleted BOOLEAN
+  is_current BOOLEAN NOT NULL,
+  is_deleted BOOLEAN NOT NULL,
+  CONSTRAINT asset_registry_pk PRIMARY KEY (object_kind, full_name, valid_from),
+  CONSTRAINT asset_registry_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link')),
+  CONSTRAINT asset_registry_owner_kind CHECK (owner_kind IN ('source_system', 'project')),
+  CONSTRAINT asset_registry_relation CHECK (relation IS NULL OR relation IN ('owns', 'contains', 'reads', 'writes', 'rejects_to', 'column_of'))
 )
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
@@ -53,47 +136,26 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- Ownership refusals: a FAILED ownership_check step per refused pipeline or table.
--- Delivery jobs no longer write steps here. The step columns and recon_json stay so rows
--- from before that change still read.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger (
-  run_id STRING,
-  parent_run_id STRING,
-  object_kind STRING,
-  full_name STRING,
-  owner_kind STRING,
-  owner STRING,
-  step_no INT,
-  step_name STRING,
-  status STRING,
-  started_at TIMESTAMP,
-  ended_at TIMESTAMP,
-  failure_reason STRING,
-  recon_json STRING,
-  recorded_at TIMESTAMP,
-  event_date DATE
-)
-CLUSTER BY (owner, event_date, run_id)
-TBLPROPERTIES (
-  'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'true'
-);
-
--- One row per object. Lookups and dashboards read this, not the history window.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry_current (
-  object_kind STRING,
-  full_name STRING,
-  owner_kind STRING,
-  owner STRING,
+  asset_id STRING NOT NULL,
+  object_kind STRING NOT NULL,
+  full_name STRING NOT NULL,
+  owner_kind STRING NOT NULL,
+  owner STRING NOT NULL,
   requested_by STRING,
   delivery STRING,
   parent_full_name STRING,
   relation STRING,
-  config_json STRING,
-  content_hash STRING,
-  source STRING,
-  recorded_at TIMESTAMP,
-  config VARIANT
+  config_json STRING NOT NULL,
+  content_hash STRING NOT NULL,
+  source STRING NOT NULL,
+  bundle_id STRING,
+  recorded_at TIMESTAMP NOT NULL,
+  config VARIANT,
+  CONSTRAINT asset_registry_current_pk PRIMARY KEY (object_kind, full_name),
+  CONSTRAINT asset_registry_current_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link')),
+  CONSTRAINT asset_registry_current_owner_kind CHECK (owner_kind IN ('source_system', 'project')),
+  CONSTRAINT asset_registry_current_relation CHECK (relation IS NULL OR relation IN ('owns', 'contains', 'reads', 'writes', 'rejects_to', 'column_of'))
 )
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
@@ -101,61 +163,36 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- One row per object: its latest run_ledger step. run_ledger keeps every step.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_current (
-  run_id STRING,
-  parent_run_id STRING,
-  object_kind STRING,
-  full_name STRING,
-  owner_kind STRING,
-  owner STRING,
-  step_no INT,
-  step_name STRING,
-  status STRING,
-  started_at TIMESTAMP,
-  ended_at TIMESTAMP,
-  failure_reason STRING,
-  recon_json STRING,
-  recorded_at TIMESTAMP,
-  event_date DATE
+-- Ownership refusals only (replaces run_ledger / run_current step tables).
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ownership_refusals (
+  object_kind STRING NOT NULL,
+  full_name STRING NOT NULL,
+  refused_owner_kind STRING NOT NULL,
+  refused_owner STRING NOT NULL,
+  holder_owner_kind STRING NOT NULL,
+  holder_owner STRING NOT NULL,
+  failure_reason STRING NOT NULL,
+  content_hash STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT ownership_refusals_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link')),
+  CONSTRAINT ownership_refusals_refused_owner_kind CHECK (refused_owner_kind IN ('source_system', 'project')),
+  CONSTRAINT ownership_refusals_holder_owner_kind CHECK (holder_owner_kind IN ('source_system', 'project'))
 )
-CLUSTER BY (owner, object_kind, full_name)
+CLUSTER BY (full_name, recorded_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- One row per bronze table per framework_optimize run.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.table_health (
-  table_name STRING,
-  owner_kind STRING,
-  owner STRING,
-  num_files BIGINT,
-  size_in_bytes BIGINT,
-  last_version BIGINT,
-  last_operation STRING,
-  last_commit_at TIMESTAMP,
-  last_operation_metrics MAP<STRING, STRING>,
-  error STRING,
-  recorded_at TIMESTAMP,
-  event_date DATE
-)
-CLUSTER BY (owner, event_date, table_name)
-TBLPROPERTIES (
-  'delta.autoOptimize.optimizeWrite' = 'true'
-);
-
--- One row per run of a framework job, from the Jobs API. status is RUNNING, SUCCEEDED,
--- SKIPPED, or FAILED.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs (
-  job_name STRING,
+  job_name STRING NOT NULL,
   deployed_name STRING,
   workspace_id STRING,
-  job_id STRING,
-  run_id STRING,
+  job_id STRING NOT NULL,
+  run_id STRING NOT NULL,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
-  status STRING,
+  status STRING NOT NULL,
   life_cycle_state STRING,
   result_state STRING,
   termination_code STRING,
@@ -166,7 +203,8 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs (
   execution_seconds DOUBLE,
   run_seconds DOUBLE,
   run_page_url STRING,
-  recorded_at TIMESTAMP
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT job_runs_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'SKIPPED', 'FAILED'))
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
@@ -174,22 +212,22 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- One row per task run of a framework job run.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs (
-  job_name STRING,
+  job_name STRING NOT NULL,
   workspace_id STRING,
-  job_id STRING,
-  job_run_id STRING,
-  task_run_id STRING,
-  task_key STRING,
+  job_id STRING NOT NULL,
+  job_run_id STRING NOT NULL,
+  task_run_id STRING NOT NULL,
+  task_key STRING NOT NULL,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
-  status STRING,
+  status STRING NOT NULL,
   life_cycle_state STRING,
   result_state STRING,
   termination_code STRING,
   failure_reason STRING,
-  recorded_at TIMESTAMP
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT job_task_runs_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'SKIPPED', 'FAILED'))
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
@@ -197,18 +235,17 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- One row per update of an ingestion pipeline, from the update_progress events in its event
--- log. state is the last update state. status is RUNNING, SUCCEEDED, FAILED, or CANCELED.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates (
-  job_name STRING,
-  pipeline_id STRING,
+  job_name STRING NOT NULL,
+  pipeline_id STRING NOT NULL,
   pipeline_name STRING,
-  update_id STRING,
+  update_id STRING NOT NULL,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
   state STRING,
-  status STRING,
-  recorded_at TIMESTAMP
+  status STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT pipeline_updates_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED'))
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
@@ -216,19 +253,18 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- Append-only counts for every medallion layer (bronze, silver, gold, product). Each delivery
--- or curation job inserts a few rows after its pipeline refresh, from that update's event log
--- only. No MERGE. A retry may append again. v_loads keeps the latest recorded_at per job,
--- layer, update, and dataflow. Until go-live, drop framework_meta to replace bronze_load_ledger.
+-- Append-only recon. pipeline_id = spec id, update_pipeline_uuid = Lakeflow UUID from events.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
-  job_name STRING,
-  layer STRING,
-  pipeline_id STRING,
+  job_name STRING NOT NULL,
+  layer STRING NOT NULL,
+  job_run_id STRING,
+  pipeline_id STRING NOT NULL,
+  update_pipeline_uuid STRING,
   pipeline_name STRING,
-  update_id STRING,
-  dataflow STRING,
-  owner_kind STRING,
-  owner STRING,
+  update_id STRING NOT NULL,
+  dataflow STRING NOT NULL,
+  owner_kind STRING NOT NULL,
+  owner STRING NOT NULL,
   target_table STRING,
   quarantine_table STRING,
   started_at TIMESTAMP,
@@ -236,13 +272,17 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
   duration_seconds DOUBLE,
   rows_read BIGINT,
   rows_written BIGINT,
+  rows_upserted BIGINT,
+  rows_deleted BIGINT,
   rows_quarantine BIGINT,
   rows_processed BIGINT,
   target_status STRING,
   quarantine_status STRING,
   expectations STRING,
   failure_reason STRING,
-  recorded_at TIMESTAMP
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT load_ledger_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged')),
+  CONSTRAINT load_ledger_owner_kind CHECK (owner_kind IN ('source_system', 'project'))
 )
 CLUSTER BY (layer, job_name, started_at)
 TBLPROPERTIES (
@@ -250,16 +290,36 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- Forever archives: rows moved out of the 7-day hot tables by archive_hot. Never purged.
+-- Long-shape recon metrics (canonical for new metrics). Wide columns on load_ledger stay for
+-- the frozen v_loads API, writers dual-write here.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_metric (
+  job_name STRING NOT NULL,
+  layer STRING NOT NULL,
+  update_id STRING NOT NULL,
+  dataflow STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  metric_name STRING NOT NULL,
+  metric_value BIGINT,
+  CONSTRAINT load_metric_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged')),
+  CONSTRAINT load_metric_name CHECK (metric_name IN ('rows_read', 'rows_written', 'rows_upserted', 'rows_deleted', 'rows_quarantine', 'rows_processed'))
+)
+CLUSTER BY (job_name, layer, recorded_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
-  job_name STRING,
-  layer STRING,
-  pipeline_id STRING,
+  job_name STRING NOT NULL,
+  layer STRING NOT NULL,
+  job_run_id STRING,
+  pipeline_id STRING NOT NULL,
+  update_pipeline_uuid STRING,
   pipeline_name STRING,
-  update_id STRING,
-  dataflow STRING,
-  owner_kind STRING,
-  owner STRING,
+  update_id STRING NOT NULL,
+  dataflow STRING NOT NULL,
+  owner_kind STRING NOT NULL,
+  owner STRING NOT NULL,
   target_table STRING,
   quarantine_table STRING,
   started_at TIMESTAMP,
@@ -267,30 +327,48 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
   duration_seconds DOUBLE,
   rows_read BIGINT,
   rows_written BIGINT,
+  rows_upserted BIGINT,
+  rows_deleted BIGINT,
   rows_quarantine BIGINT,
   rows_processed BIGINT,
   target_status STRING,
   quarantine_status STRING,
   expectations STRING,
   failure_reason STRING,
-  recorded_at TIMESTAMP,
-  archived_at TIMESTAMP
+  recorded_at TIMESTAMP NOT NULL,
+  archived_at TIMESTAMP NOT NULL
 )
 CLUSTER BY (layer, job_name, started_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_metric_archive (
+  job_name STRING NOT NULL,
+  layer STRING NOT NULL,
+  update_id STRING NOT NULL,
+  dataflow STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  metric_name STRING NOT NULL,
+  metric_value BIGINT,
+  archived_at TIMESTAMP NOT NULL
+)
+CLUSTER BY (job_name, layer, recorded_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs_archive (
-  job_name STRING,
+  job_name STRING NOT NULL,
   deployed_name STRING,
   workspace_id STRING,
-  job_id STRING,
-  run_id STRING,
+  job_id STRING NOT NULL,
+  run_id STRING NOT NULL,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
-  status STRING,
+  status STRING NOT NULL,
   life_cycle_state STRING,
   result_state STRING,
   termination_code STRING,
@@ -301,8 +379,8 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs_archive (
   execution_seconds DOUBLE,
   run_seconds DOUBLE,
   run_page_url STRING,
-  recorded_at TIMESTAMP,
-  archived_at TIMESTAMP
+  recorded_at TIMESTAMP NOT NULL,
+  archived_at TIMESTAMP NOT NULL
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
@@ -311,21 +389,21 @@ TBLPROPERTIES (
 );
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs_archive (
-  job_name STRING,
+  job_name STRING NOT NULL,
   workspace_id STRING,
-  job_id STRING,
-  job_run_id STRING,
-  task_run_id STRING,
-  task_key STRING,
+  job_id STRING NOT NULL,
+  job_run_id STRING NOT NULL,
+  task_run_id STRING NOT NULL,
+  task_key STRING NOT NULL,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
-  status STRING,
+  status STRING NOT NULL,
   life_cycle_state STRING,
   result_state STRING,
   termination_code STRING,
   failure_reason STRING,
-  recorded_at TIMESTAMP,
-  archived_at TIMESTAMP
+  recorded_at TIMESTAMP NOT NULL,
+  archived_at TIMESTAMP NOT NULL
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
@@ -334,16 +412,16 @@ TBLPROPERTIES (
 );
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates_archive (
-  job_name STRING,
-  pipeline_id STRING,
+  job_name STRING NOT NULL,
+  pipeline_id STRING NOT NULL,
   pipeline_name STRING,
-  update_id STRING,
+  update_id STRING NOT NULL,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
   state STRING,
-  status STRING,
-  recorded_at TIMESTAMP,
-  archived_at TIMESTAMP
+  status STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  archived_at TIMESTAMP NOT NULL
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
@@ -351,35 +429,14 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.table_health_archive (
-  table_name STRING,
-  owner_kind STRING,
-  owner STRING,
-  num_files BIGINT,
-  size_in_bytes BIGINT,
-  last_version BIGINT,
-  last_operation STRING,
-  last_commit_at TIMESTAMP,
-  last_operation_metrics MAP<STRING, STRING>,
-  error STRING,
-  recorded_at TIMESTAMP,
-  event_date DATE,
-  archived_at TIMESTAMP
-)
-CLUSTER BY (owner, event_date, table_name)
-TBLPROPERTIES (
-  'delta.autoOptimize.optimizeWrite' = 'true'
-);
-
--- One row per SQL file version apply_ddl has applied, by the hash of its statements. A deploy
--- whose SQL is already here skips the DDL. Delete the rows to make the next run apply it all.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
-  sql_hash STRING,
-  applied_at TIMESTAMP
+  sql_hash STRING NOT NULL,
+  applied_at TIMESTAMP NOT NULL
 );
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_asset_registry_current AS
 SELECT
+  asset_id,
   object_kind,
   full_name,
   owner_kind,
@@ -392,24 +449,26 @@ SELECT
   config,
   content_hash,
   source,
+  bundle_id,
   recorded_at
 FROM ${catalog}.framework_meta.asset_registry_current;
 
--- Each definition registry_sync refused because another owner holds the name.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_refusals AS
 SELECT
   object_kind,
   full_name,
-  owner_kind AS refused_owner_kind,
-  owner AS refused_owner,
+  refused_owner_kind,
+  refused_owner,
+  holder_owner_kind,
+  holder_owner,
   failure_reason,
-  recorded_at,
-  event_date
-FROM ${catalog}.framework_meta.run_ledger
-WHERE step_name = 'ownership_check' AND status = 'FAILED';
+  content_hash,
+  recorded_at
+FROM ${catalog}.framework_meta.ownership_refusals;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_lineage AS
 SELECT
+  asset_id,
   full_name,
   owner_kind,
   owner,
@@ -425,6 +484,7 @@ WHERE object_kind = 'link';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_workflows AS
 SELECT
+  asset_id,
   full_name AS job_name,
   owner_kind,
   owner,
@@ -443,6 +503,7 @@ WHERE object_kind = 'workflow';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_pipelines AS
 SELECT
+  asset_id,
   full_name AS pipeline,
   owner_kind,
   owner,
@@ -460,6 +521,7 @@ WHERE object_kind = 'pipeline';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_dataflows AS
 SELECT
+  asset_id,
   full_name AS dataflow,
   owner_kind,
   owner,
@@ -475,6 +537,7 @@ WHERE object_kind = 'dataflow';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_flows AS
 SELECT
+  asset_id,
   full_name AS flow,
   owner_kind,
   owner,
@@ -491,6 +554,7 @@ WHERE object_kind = 'flow';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_tables AS
 SELECT
+  asset_id,
   full_name AS table_name,
   owner_kind,
   owner,
@@ -510,10 +574,6 @@ SELECT
 FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
 
--- A table has one current owner. This view is empty when that holds. A row here means
--- asset_registry_current was written by hand with two rows for the same name.
--- The owners are made distinct first. Photon fails to compile a distinct count in HAVING
--- next to collect_set over the same expression.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ownership_conflicts AS
 WITH holders AS (
   SELECT DISTINCT
@@ -531,11 +591,9 @@ FROM holders
 GROUP BY object_kind, full_name
 HAVING count(*) > 1;
 
--- Every version of every object. A version was active during [valid_from, valid_to). A
--- null valid_to is still active. A deletion version (is_deleted) says the definition was
--- removed from its bundle at valid_from.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_asset_registry_history AS
 SELECT
+  asset_id,
   object_kind,
   full_name,
   owner_kind,
@@ -548,15 +606,16 @@ SELECT
   config,
   content_hash,
   source,
+  bundle_id,
   valid_from,
   valid_to,
   is_current,
   is_deleted
 FROM ${catalog}.framework_meta.asset_registry;
 
--- Each source system as its source.yaml declares it.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_source_systems AS
 SELECT
+  asset_id,
   full_name AS source_system,
   config:domain::STRING AS domain,
   config:owner_email::STRING AS owner_email,
@@ -571,9 +630,9 @@ SELECT
 FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind = 'source_system';
 
--- Each schema a source system reads or writes, with the tags registry_sync sets on it.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_schemas AS
 SELECT
+  asset_id,
   full_name AS schema_name,
   owner_kind,
   owner,
@@ -586,6 +645,7 @@ WHERE object_kind = 'schema';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_columns AS
 SELECT
+  asset_id,
   parent_full_name AS table_name,
   config:name::STRING AS column_name,
   owner_kind,
@@ -601,6 +661,7 @@ WHERE object_kind = 'column';
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_column_history AS
 SELECT
+  asset_id,
   parent_full_name AS table_name,
   config:name::STRING AS column_name,
   owner_kind,
@@ -617,7 +678,6 @@ SELECT
 FROM ${catalog}.framework_meta.v_asset_registry_history
 WHERE object_kind = 'column';
 
--- Bronze tables, for the daily table health step.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_tables AS
 SELECT DISTINCT
   config:table::STRING AS table_name,
@@ -627,12 +687,12 @@ FROM ${catalog}.framework_meta.asset_registry_current
 WHERE object_kind = 'flow'
   AND config:layer::STRING = 'bronze';
 
--- Declared tags and column comments that Unity Catalog does not hold, or holds differently.
--- Empty once registry_sync has run after the schemas and tables exist. Only schemas and
--- tables that exist are compared, and only the tags this framework sets. securable is
--- schema, table, or column. table_name is the schema's name on a schema row.
+-- Tags are parked (unity.APPLY_TAGS = False). Flip drift_enabled.on to true when tags apply.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_metadata_drift AS
-WITH existing AS (
+WITH drift_enabled AS (
+  SELECT false AS enabled
+),
+existing AS (
   SELECT lower(concat_ws('.', table_catalog, table_schema, table_name)) AS table_name
   FROM ${catalog}.information_schema.tables
 ),
@@ -739,6 +799,7 @@ SELECT
   a.applied
 FROM declared_schemas d
 JOIN existing_schemas e ON e.schema_name = d.schema_name
+JOIN drift_enabled ON drift_enabled.enabled
 LEFT JOIN applied_schemas a ON a.schema_name = d.schema_name AND a.item = d.item
 WHERE NOT (d.declared <=> a.applied)
 UNION ALL
@@ -753,6 +814,7 @@ SELECT
   a.applied
 FROM declared_tables d
 JOIN existing e ON e.table_name = d.table_name
+JOIN drift_enabled ON drift_enabled.enabled
 LEFT JOIN applied_tables a ON a.table_name = d.table_name AND a.item = d.item
 WHERE NOT (d.declared <=> a.applied)
 UNION ALL
@@ -767,12 +829,12 @@ SELECT
   a.applied
 FROM declared_columns d
 JOIN existing e ON e.table_name = d.table_name
+JOIN drift_enabled ON drift_enabled.enabled
 LEFT JOIN applied_columns a
   ON a.table_name = d.table_name AND a.column_name = d.column_name AND a.item = d.item
 WHERE NOT (d.declared <=> a.applied)
   AND NOT (d.item = 'comment' AND d.declared IS NULL);
 
--- Each run of a framework job, with its workflow's owner.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_runs AS
 SELECT
   run.job_name,
@@ -799,9 +861,12 @@ SELECT
   run.run_page_url,
   run.recorded_at
 FROM ${catalog}.framework_meta.job_runs run
-JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = run.job_name;
+JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = run.job_name
+QUALIFY row_number() OVER (
+  PARTITION BY run.job_id, run.run_id
+  ORDER BY run.recorded_at DESC
+) = 1;
 
--- Each workflow and its latest run. A workflow that has not run has a null status.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_job_status AS
 WITH latest AS (
   SELECT *
@@ -845,11 +910,15 @@ SELECT
   task.status,
   task.result_state,
   task.termination_code,
-  task.failure_reason
+  task.failure_reason,
+  task.recorded_at
 FROM ${catalog}.framework_meta.job_task_runs task
-JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = task.job_name;
+JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = task.job_name
+QUALIFY row_number() OVER (
+  PARTITION BY task.job_run_id, task.task_run_id
+  ORDER BY task.recorded_at DESC
+) = 1;
 
--- Each update of a framework pipeline, from its event log.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_pipeline_updates AS
 SELECT
   pu.job_name,
@@ -866,13 +935,13 @@ SELECT
 FROM ${catalog}.framework_meta.pipeline_updates pu
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;
 
--- Latest append for each load across every layer. Retries of record_load_metrics may insert
--- again. This view keeps one row per job, layer, update, and dataflow.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads AS
 SELECT
   job_name,
   layer,
+  job_run_id,
   pipeline_id,
+  update_pipeline_uuid,
   pipeline_name,
   update_id,
   dataflow,
@@ -885,6 +954,8 @@ SELECT
   duration_seconds,
   rows_read,
   rows_written,
+  rows_upserted,
+  rows_deleted,
   rows_quarantine,
   rows_processed,
   target_status,
@@ -898,22 +969,39 @@ QUALIFY row_number() OVER (
   ORDER BY recorded_at DESC
 ) = 1;
 
--- Hot ∪ archive loads for the last 90 days (dashboard window). Archive is forever.
+-- Long-shape recon for BI / new metrics without wide-column ALTERs.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_load_metrics AS
+SELECT
+  job_name,
+  layer,
+  update_id,
+  dataflow,
+  recorded_at,
+  metric_name,
+  metric_value
+FROM ${catalog}.framework_meta.load_metric
+QUALIFY row_number() OVER (
+  PARTITION BY job_name, layer, update_id, dataflow, metric_name
+  ORDER BY recorded_at DESC
+) = 1;
+
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads_90d AS
 WITH combined AS (
   SELECT
-    job_name, layer, pipeline_id, pipeline_name, update_id, dataflow, owner_kind, owner,
+    job_name, layer, job_run_id, pipeline_id, update_pipeline_uuid, pipeline_name, update_id,
+    dataflow, owner_kind, owner,
     target_table, quarantine_table, started_at, ended_at, duration_seconds,
-    rows_read, rows_written, rows_quarantine, rows_processed,
+    rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
     target_status, quarantine_status, expectations, failure_reason, recorded_at,
     CAST(NULL AS TIMESTAMP) AS archived_at
   FROM ${catalog}.framework_meta.v_loads
   WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
   UNION ALL
   SELECT
-    job_name, layer, pipeline_id, pipeline_name, update_id, dataflow, owner_kind, owner,
+    job_name, layer, job_run_id, pipeline_id, update_pipeline_uuid, pipeline_name, update_id,
+    dataflow, owner_kind, owner,
     target_table, quarantine_table, started_at, ended_at, duration_seconds,
-    rows_read, rows_written, rows_quarantine, rows_processed,
+    rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
     target_status, quarantine_status, expectations, failure_reason, recorded_at, archived_at
   FROM ${catalog}.framework_meta.load_ledger_archive
   WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
@@ -925,7 +1013,6 @@ QUALIFY row_number() OVER (
   ORDER BY recorded_at DESC
 ) = 1;
 
--- What failed and why: loads plus latest job/task status for ops and repair.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_load_failures AS
 SELECT
   l.job_name,
@@ -934,15 +1021,18 @@ SELECT
   l.target_table,
   l.update_id,
   l.pipeline_id,
+  l.update_pipeline_uuid,
   l.target_status,
   l.quarantine_status,
   l.failure_reason AS load_failure_reason,
   l.rows_read,
   l.rows_written,
+  l.rows_upserted,
+  l.rows_deleted,
   l.rows_quarantine,
   l.started_at AS load_started_at,
   l.recorded_at AS load_recorded_at,
-  j.run_id AS job_run_id,
+  coalesce(l.job_run_id, j.run_id) AS job_run_id,
   j.status AS job_status,
   j.result_state AS job_result_state,
   j.termination_code,
@@ -955,8 +1045,14 @@ SELECT
 FROM ${catalog}.framework_meta.v_loads l
 LEFT JOIN ${catalog}.framework_meta.v_job_runs j
   ON j.job_name = l.job_name
- AND j.started_at <= coalesce(l.ended_at, l.recorded_at)
- AND (j.ended_at IS NULL OR j.ended_at >= coalesce(l.started_at, l.recorded_at))
+ AND (
+   (l.job_run_id IS NOT NULL AND j.run_id = l.job_run_id)
+   OR (
+     l.job_run_id IS NULL
+     AND j.started_at <= coalesce(l.ended_at, l.recorded_at)
+     AND (j.ended_at IS NULL OR j.ended_at >= coalesce(l.started_at, l.recorded_at))
+   )
+ )
 LEFT JOIN ${catalog}.framework_meta.v_job_task_runs t
   ON t.job_run_id = j.run_id AND t.task_key = 'refresh_pipeline'
 WHERE l.target_status IN ('FAILED', 'CANCELED')

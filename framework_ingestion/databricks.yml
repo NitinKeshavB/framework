@@ -1,14 +1,19 @@
 # Source ingestion bundle: source -> raw -> bronze. Domain-owned, shared by projects.
 # It needs the framework bundle deployed first (framework_meta must exist).
 # Catalog must match the framework bundle's catalog for the same target.
+# Workspace hosts and catalog names are environment-specific — replace before first deploy.
 
 bundle:
   name: framework_ingestion
 
 include:
+  # Hand-written (registry_sync). Generated jobs/pipelines live under .build/ (gitignored);
+  # ./run.sh bundle:validate|deploy regenerates them first.
   - resources/*.yml
+  - .build/resources/*.yml
 
-# Same artifact as the framework bundle. Deploy builds the wheel and uploads it.
+# Same artifact as the framework bundle. Prefer a UC-volume wheel once published once per
+# wave (see ROADMAP); until then each bundle rebuilds from framework_lff_lib.
 artifacts:
   framework_wheel:
     type: whl
@@ -34,14 +39,10 @@ targets:
       host: https://adb-1864378597730899.19.azuredatabricks.net/
       root_path: /Workspace/Shared/aztech_ingestion
     variables:
-      catalog: aal_dev_fdh
+      catalog: aal_prod_fdh
     presets:
       name_prefix: '[fdh] '
-    # Each entry names exactly one user or group.
+    # Prefer groups over personal user_name entries.
     permissions:
-      - user_name: adm_ye9z286@allianzms.onmicrosoft.com
-        level: CAN_MANAGE
-      - user_name: nitinkeshav.bolla@allianz.com.au
-        level: CAN_MANAGE
       - group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
         level: CAN_MANAGE

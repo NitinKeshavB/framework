@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _ROOT = "lakeflow_framework"

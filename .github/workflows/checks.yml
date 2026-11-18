@@ -19,6 +19,8 @@ jobs:
           python -m pip install --editable "framework_lff_lib[dev]"
       - name: Lint
         run: ./run.sh lint:ci
+      - name: Typecheck
+        run: python -m mypy --config-file framework_lff_lib/mypy.ini framework_lff_lib/lakeflow_framework
       - name: Test
         run: ./run.sh test:quick
       - name: Generated ingestion files

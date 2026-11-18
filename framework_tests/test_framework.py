@@ -27,7 +27,7 @@ from lakeflow_framework.metadata import (
     step_payload,
 )
 from lakeflow_framework.pipeline import MetadataNotFound, UnityMetadata, assemble, build_pipelines
-from lakeflow_framework.quality import compile_rules, fail_sql
+from lakeflow_framework.quality import compile_rules
 from lakeflow_framework.registry import (
     _cast,
     append_definitions,
@@ -367,10 +367,47 @@ def test_rule_compilation_treats_null_as_failure():
     assert "not_null_invoice_id" in names
     assert "cast_amount" in names
     assert "schema_conformance" in names
-    predicate = fail_sql(rules)
-    assert "COALESCE" in predicate
+    # NULL predicates fail: every compiled rule wraps with COALESCE(..., false).
+    assert all("COALESCE" in rule.holds() for rule in rules)
     ledger_rules = compile_rules(config_from_document(_ledger()))
     assert "schema_conformance" not in [rule.name for rule in ledger_rules]
+
+
+def test_rule_expressions_are_constrained_to_columns_and_approved_functions():
+    from lakeflow_framework.quality import assert_safe_rule_expression
+
+    errors: list[str] = []
+    assert_safe_rule_expression(
+        "amount >= 0 AND length(trim(status)) > 0",
+        {"amount", "status"},
+        label="spec",
+        name="ok",
+        errors=errors,
+    )
+    assert errors == []
+    assert_safe_rule_expression(
+        "amount >= (SELECT max(amount) FROM other)",
+        {"amount"},
+        label="spec",
+        name="subquery",
+        errors=errors,
+    )
+    assert any("subqueries" in item for item in errors)
+    errors.clear()
+    assert_safe_rule_expression(
+        "secret_col IS NOT NULL /* poke */",
+        {"amount"},
+        label="spec",
+        name="comment",
+        errors=errors,
+    )
+    assert any("comments" in item for item in errors)
+    bad = _billing()
+    bad["raw_to_bronze"]["rules"] = [
+        {"name": "hostile", "expression": "EXISTS (SELECT 1 FROM system.access.table_lineage)"}
+    ]
+    with pytest.raises(ConfigValidationError, match="subqueries|denied"):
+        config_from_document(bad)
 
 
 def test_registry_hash_is_stable_and_steps_do_not_duplicate():
@@ -382,26 +419,33 @@ def test_registry_hash_is_stable_and_steps_do_not_duplicate():
     assert first and second == []
     assert any(row["object_kind"] == "link" for row in first)
 
-    running = step_payload(
-        owner="billing",
+    first = step_payload(
+        owner="erp",
         full_name="billing_invoices",
-        run_id="100",
-        step_no=10,
-        step_name="mark_running",
-        status="RUNNING",
+        run_id="ownership-aaa",
+        step_no=1,
+        step_name="ownership_check",
+        status="FAILED",
+        content_hash="a" * 64,
+        holder_owner_kind="source_system",
+        holder_owner="billing",
+        failure_reason="owned by source_system billing",
     )
-    success = step_payload(
-        owner="billing",
+    second = step_payload(
+        owner="claims",
         full_name="billing_invoices",
-        run_id="100",
-        step_no=50,
-        step_name="record_success",
-        status="SUCCEEDED",
+        run_id="ownership-bbb",
+        step_no=1,
+        step_name="ownership_check",
+        status="FAILED",
+        content_hash="b" * 64,
+        holder_owner_kind="source_system",
+        holder_owner="billing",
+        failure_reason="owned by source_system billing",
     )
     keys: set = set()
-    assert len(ingest_steps([running, success], keys)) == 2
-    assert ingest_steps([success], keys) == []
-    assert "recon" not in success and "recon_json" not in success
+    assert len(ingest_steps([first, second], keys)) == 2
+    assert ingest_steps([second], keys) == []
 
 
 def test_pipeline_wiring_uses_auto_cdc_only_when_dedup_is_on():
@@ -470,23 +514,12 @@ def test_one_line_pipeline_file_off_cluster_says_why(monkeypatch):
         build_pipeline("billing_invoices")
 
 
-def test_current_lookup_prunes_by_owner_kind_and_name():
-    statement = current_objects_sql(
-        "framework_dev",
-        [
-            {
-                "owner_kind": "source_system",
-                "owner": "billing",
-                "object_kind": "column",
-                "full_name": "framework_dev.billing_bronze.invoices.amount",
-            }
-        ],
-    )
-    assert "FROM framework_dev.framework_meta.asset_registry_current" in statement
-    assert "owner_kind IN ('source_system')" in statement
-    assert "owner IN ('billing')" in statement
-    assert "object_kind IN ('column')" in statement
-    assert "full_name IN ('framework_dev.billing_bronze.invoices.amount')" in statement
+def test_current_lookup_joins_a_staged_view_not_an_in_list():
+    statement = current_objects_sql("framework_dev")
+    assert "FROM framework_dev.framework_meta.asset_registry_current c" in statement
+    assert "INNER JOIN _framework_lookup_keys s" in statement
+    assert "c.object_kind = s.object_kind AND c.full_name = s.full_name" in statement
+    assert "full_name IN (" not in statement
     assert "QUALIFY" not in statement
     assert "v_asset_registry_current" not in statement
 
@@ -496,28 +529,37 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     text = "\n".join(statements)
     assert "CLUSTER BY (owner, object_kind, full_name)" in text
     assert "delta.autoOptimize.autoCompact" in text
-    assert "CLUSTER BY (owner, event_date, run_id)" in text
+    assert "CLUSTER BY (full_name, recorded_at)" in text
     keys = [
         line.split("(", 1)[1].rstrip(")") for line in text.splitlines() if "CLUSTER BY (" in line
     ]
-    assert keys and all(len(key.split(",")) <= 3 for key in keys)
+    assert keys and all(len(key.split(",")) <= 4 for key in keys)
     assert "'delta.autoOptimize.autoCompact' = 'false'" not in text
     assert not any(statement.upper().startswith("ALTER") for statement in statements)
     assert "VIEW framework_dev.framework_meta.v_ownership_refusals" in text
-    assert "step_name = 'ownership_check' AND status = 'FAILED'" in text
+    assert "ownership_refusals" in text
+    assert "run_ledger" not in text and "run_current" not in text
     assert "v_ownership_conflicts" in text
-    assert "project" not in text.replace("project for silver", "")
+    assert "asset_id" in text
+    assert "PRIMARY KEY" in text
+    assert "ref_object_kind" in text
+    assert "update_pipeline_uuid" in text
+    assert "v_load_metrics" in text
+    assert "load_metric" in text
+    assert "drift_enabled" in text and "false AS enabled" in text
+    # ``project`` appears only as an owner_kind enum value, not as a remnant object_kind.
+    assert "object_kind = 'project'" not in text
+    assert "('project')" in text  # ref_owner_kind seed
     assert "${catalog}" not in text
     assert "v_workflows" in text
     assert "v_pipelines" in text
     assert "v_dataflows" in text
     assert "v_flows" in text
     assert "system.lakeflow" not in text
-    assert "framework_events" not in text
+    assert "CREATE SCHEMA IF NOT EXISTS framework_dev.framework_events" in text
     assert "v_tables" in text
     assert "v_asset_registry_history" in text
     assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.asset_registry_current" in text
-    assert "CREATE TABLE IF NOT EXISTS framework_dev.framework_meta.run_current" in text
     current_view = next(
         statement for statement in statements if "v_asset_registry_current" in statement
     )
@@ -530,7 +572,8 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "load_daily_rollup" not in text
     assert "get_json_object" not in text
     assert "config:pipeline_ids::ARRAY<STRING>" in text
-    assert "framework_meta.table_health" in text
+    assert "framework_meta.table_health" not in text
+    assert "v_bronze_tables" in text
     history = text.split("v_asset_registry_history", 1)[1]
     assert "is_deleted" in history.split(";")[0] and "LEAD(" not in history.split(";")[0]
     assert "CREATE BLOOMFILTER INDEX" not in text
@@ -539,10 +582,10 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "valid_from" in text
     assert "valid_to" in text
     assert "is_current" in text
-    # A fresh schema only: tables and views, and no statement that changes rows.
-    assert {statement.split()[0].upper() for statement in statements} == {"CREATE"}
+    # Fresh schema: CREATE tables/views plus idempotent INSERT seeds for enum refs.
+    assert {statement.split()[0].upper() for statement in statements} <= {"CREATE", "INSERT"}
     assert _column_list(text, "asset_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
-    assert _column_list(text, "run_ledger") == list(LEDGER_COLUMNS)
+    assert _column_list(text, "ownership_refusals") == list(LEDGER_COLUMNS)
 
 
 def test_ctas_securables_match_the_graph():
@@ -708,22 +751,28 @@ def test_example_columns_keep_descriptions_and_sensitivity():
     assert recorded["classification"] == "confidential"
 
 
-def test_a_step_file_written_with_counts_still_lands():
+def test_ownership_refusal_row_lands():
     row = ingest_steps(
         [
             {
-                "run_id": "1",
-                "step_no": 50,
-                "status": "SUCCEEDED",
-                "full_name": "billing_daily",
+                "object_kind": "pipeline",
+                "full_name": "billing_invoices",
                 "owner_kind": "source_system",
-                "owner": "billing",
-                "step_name": "record_success",
-                "recon_json": '{"source_count": 10}',
+                "owner": "erp",
+                "holder_owner_kind": "source_system",
+                "holder_owner": "billing",
+                "failure_reason": "owned by source_system billing",
+                "content_hash": "a" * 64,
+                "run_id": "ownership-aaaaaaaa",
+                "step_no": 1,
+                "step_name": "ownership_check",
+                "status": "FAILED",
             }
         ]
     )[0]
-    assert row["recon_json"] == '{"source_count": 10}'
+    assert row["refused_owner"] == "erp"
+    assert row["holder_owner"] == "billing"
+    assert "owned by source_system billing" in row["failure_reason"]
 
 
 def test_a_renamed_job_versions_the_table_tag_but_not_its_columns():
@@ -757,7 +806,9 @@ def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
         return len(rows)
 
     monkeypatch.setattr("lakeflow_framework.registry._scd2_merge", fake_merge)
+    monkeypatch.setattr("lakeflow_framework.registry._merge_current", lambda *a, **k: None)
     row = {
+        "asset_id": "e" * 64,
         "object_kind": "pipeline",
         "full_name": "billing_invoices",
         "owner_kind": "source_system",
@@ -769,6 +820,7 @@ def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
         "config_json": "{}",
         "content_hash": "a" * 64,
         "source": "framework",
+        "bundle_id": "framework_ingestion",
         "recorded_at": "2026-11-09T00:00:00Z",
     }
     seen: set = set()
@@ -784,6 +836,7 @@ def test_repeated_definition_is_inserted_once(monkeypatch: pytest.MonkeyPatch):
 
 def _owned_row(**changes):
     row = {
+        "asset_id": "f" * 64,
         "object_kind": "streaming_table",
         "full_name": "framework_dev.billing_bronze.invoices",
         "owner_kind": "source_system",
@@ -795,10 +848,24 @@ def _owned_row(**changes):
         "config_json": "{}",
         "content_hash": "b" * 64,
         "source": "framework",
+        "bundle_id": "framework_ingestion",
         "recorded_at": "2026-11-09T00:00:00Z",
     }
     row.update(changes)
     return row
+
+
+def test_asset_id_survives_a_pipeline_id_rename():
+    from lakeflow_framework.metadata import pipeline_stable_key
+
+    original = config_from_document(_billing())
+    renamed = config_from_document(_billing(pipeline_id="billing_invoice_v2"))
+    assert pipeline_stable_key(original) == pipeline_stable_key(renamed)
+    orig_ids = {row["object_kind"]: row["asset_id"] for row in object_rows(original)}
+    renamed_ids = {row["object_kind"]: row["asset_id"] for row in object_rows(renamed)}
+    assert orig_ids["pipeline"] == renamed_ids["pipeline"]
+    assert orig_ids["dataflow"] == renamed_ids["dataflow"]
+    assert orig_ids["pipeline"] != orig_ids["dataflow"]
 
 
 def test_bronze_is_owned_by_its_source_system_not_the_requesting_team():
@@ -834,13 +901,19 @@ def test_a_name_held_by_another_owner_is_refused_and_the_same_owner_may_update()
     assert ownership_conflicts([free], current) == ([free], [])
 
 
-def test_owner_lookup_is_limited_to_owned_kinds_and_safe_names():
-    sql = owners_sql("framework_dev", ["framework_dev.billing_bronze.invoices", "x' OR '1'='1"])
-    assert "framework_dev.framework_meta.v_asset_registry_current" in sql
-    assert "x' OR" not in sql
+def test_owner_lookup_joins_staged_names_and_rejects_unsafe_ones():
+    from lakeflow_framework.metadata import require_safe_names
+
+    sql = owners_sql("framework_dev")
+    assert "framework_dev.framework_meta.v_asset_registry_current c" in sql
+    assert "INNER JOIN _framework_owner_names s" in sql
+    assert "full_name IN (" not in sql
     assert "'column'" not in sql
+    assert require_safe_names(["framework_dev.billing_bronze.invoices"])
     with pytest.raises(ValueError):
-        owners_sql("framework_dev", ["x' OR '1'='1"])
+        require_safe_names(["framework_dev.billing_bronze.invoices", "x' OR '1'='1"])
+    with pytest.raises(ValueError):
+        require_safe_names(["x' OR '1'='1"])
 
 
 def test_collector_records_a_failed_check_instead_of_writing_another_owners_table(
@@ -860,11 +933,15 @@ def test_collector_records_a_failed_check_instead_of_writing_another_owners_tabl
             return self.rows
 
     class Spark:
+        def createDataFrame(self, _rows, _schema=None):
+            class Staged:
+                def createOrReplaceTempView(self, _name):
+                    return None
+
+            return Staged()
+
         def sql(self, statement):
-            if (
-                "v_asset_registry_current" in statement
-                and "owner_kind" in statement.split("FROM")[0]
-            ):
+            if "v_asset_registry_current" in statement:
                 return Frame(
                     [
                         {
@@ -889,9 +966,9 @@ def test_collector_records_a_failed_check_instead_of_writing_another_owners_tabl
     assert append_definitions(Spark(), [taken, fine], set(), "framework_dev") == 1
     registry = written["framework_dev.framework_meta.asset_registry"]
     assert [row["full_name"] for row in registry] == ["framework_dev.erp_bronze.orders"]
-    (step,) = written["framework_dev.framework_meta.run_ledger"]
-    assert step["step_name"] == "ownership_check" and step["status"] == "FAILED"
-    assert (step["owner_kind"], step["owner"]) == ("source_system", "erp")
+    (step,) = written["framework_dev.framework_meta.ownership_refusals"]
+    assert (step["refused_owner_kind"], step["refused_owner"]) == ("source_system", "erp")
+    assert (step["holder_owner_kind"], step["holder_owner"]) == ("source_system", "billing")
     assert "owned by source_system billing" in step["failure_reason"]
 
 
@@ -910,27 +987,47 @@ def test_per_run_commands_are_gone(capsys: pytest.CaptureFixture[str]):
         assert "invalid choice" in capsys.readouterr().err
 
 
-def test_a_delivery_reads_its_specs_from_the_pipeline_configuration():
-    paths = [INGESTION / "sources" / "abs" / "fdh" / "abs_accounting.yaml"]
+def test_a_delivery_reads_its_manifest_from_the_pipeline_configuration(tmp_path: Path):
+    path = INGESTION / "sources" / "abs" / "fdh" / "abs_accounting.yaml"
+    (config,) = validate_configs([path], catalog="framework_test")
+    manifest = tmp_path / "abs_daily.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "delivery": "abs_daily",
+                "pipelines": [
+                    {
+                        "pipeline_id": config.pipeline_id,
+                        "content_hash": config.content_hash(),
+                        "config": config.canonical(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Conf:
         def get(self, key, default=None):
             return {
-                "lff.specs": ",".join(str(path) for path in paths),
+                "lff.manifest": str(manifest),
                 "lff.catalog": "framework_test",
             }.get(key, default)
 
     class Reader:
         def get_pipelines(self, pipeline_ids):
-            raise AssertionError("the registry is not read when lff.specs is set")
+            raise AssertionError("the registry is not read when lff.manifest is set")
 
     spark, pipelines = _FakeSpark(), _FakePipelines()
     spark.conf = Conf()
     graphs = build_pipelines(["abs_accounting"], spark=spark, pipelines=pipelines)
     assert [graph.pipeline_id for graph in graphs] == ["abs_accounting"]
     assert any(name.startswith("framework_test.") for name in pipelines.names)
-    with pytest.raises(MetadataNotFound, match="not in lff.specs"):
+    # A missing/bad sibling is skipped so healthy tables still load; all missing raises.
+    with pytest.raises(MetadataNotFound, match="every table in this delivery failed"):
         build_pipelines(["not_deployed"], spark=spark, pipelines=pipelines)
+    both = build_pipelines(["abs_accounting", "not_deployed"], spark=spark, pipelines=pipelines)
+    assert [graph.pipeline_id for graph in both] == ["abs_accounting"]
     with pytest.raises(AssertionError):
         build_pipelines(["abs_accounting"], spark=spark, pipelines=pipelines, metadata=Reader())
 
@@ -965,18 +1062,16 @@ def test_a_delivery_reads_every_pipeline_document_once():
     ]
 
 
-def test_step_lookup_prunes_by_owner_and_event_date():
+def test_refusal_lookup_dedupes_by_content_hash():
+    digest = "a" * 64
     statement = step_keys_sql(
         "framework_dev",
-        ["100", "100"],
-        owners=["billing", "billing"],
-        event_dates=["2026-11-09"],
+        [digest, digest],
+        full_names=["billing_invoices"],
     )
-    assert "run_id IN ('100')" in statement
-    assert "owner IN ('billing')" in statement
-    assert "event_date IN (DATE '2026-11-09')" in statement
-    widened = step_keys_sql("framework_dev", ["100"], owners=["bad owner"])
-    assert "owner IN" not in widened
+    assert "ownership_refusals" in statement
+    assert f"content_hash IN ('{digest}')" in statement
+    assert "full_name IN ('billing_invoices')" in statement
     cast = _cast("recorded_at", ("recorded_at",), (), ())
     assert cast == "CAST(recorded_at AS TIMESTAMP) AS recorded_at"
     # Databricks rejects a datetime pattern with quoted T and Z.
@@ -990,30 +1085,35 @@ def test_one_merge_closes_the_changed_version_and_inserts_the_new_one():
     assert sql.startswith("MERGE INTO c.framework_meta.asset_registry t")
     # A retry after asset_registry_current failed finds the same hash current: nothing is closed and
     # nothing is inserted, so history gets no second row.
-    assert "WHERE r.content_hash <> s.content_hash OR coalesce(r.is_deleted, false)" in sql
-    assert "WHEN MATCHED AND (t.content_hash <> u.content_hash" in sql
+    assert "WHERE NOT (r.content_hash <=> s.content_hash) OR coalesce(r.is_deleted, false)" in sql
+    assert "WHEN MATCHED AND (NOT (t.content_hash <=> u.content_hash)" in sql
     assert "UPDATE SET t.valid_to = u.recorded_at, t.is_current = false" in sql
     assert "valid_from, valid_to, is_current, is_deleted) VALUES" in sql
     assert "u.recorded_at, NULL, true, false)" in sql
+    assert "ORDER BY recorded_at DESC, content_hash DESC" in sql
     assert "QUALIFY row_number()" in sql
 
 
 def test_a_removed_definition_gets_a_deletion_version_and_leaves_asset_registry_current():
     from lakeflow_framework.registry import retire_definitions, retire_statements
 
-    close, delete = retire_statements("c", "_deployed", "source_system")
+    close, delete = retire_statements("c", "_deployed", "source_system", ["billing"])
     assert "LEFT ANTI JOIN _deployed d" in close
     assert "r.owner_kind = 'source_system'" in close
+    assert "r.owner IN ('billing')" in close
     assert "NOT coalesce(r.is_deleted, false)" in close
     assert "u.recorded_at, NULL, true, true)" in close
     assert delete.startswith("DELETE FROM c.framework_meta.asset_registry_current c")
     assert "c.owner_kind = 'source_system'" in delete
+    assert "c.owner IN ('billing')" in delete
     with pytest.raises(ValueError, match="no definitions"):
         retire_definitions(object(), [], "c")
     with pytest.raises(ValueError, match="owner_kind"):
         retire_definitions(object(), [_owned_row()], "c", owner_kind="x' OR 1=1")
     with pytest.raises(ValueError, match="catalog"):
-        retire_statements("not a catalog", "_deployed", "source_system")
+        retire_statements("not a catalog", "_deployed", "source_system", ["billing"])
+    with pytest.raises(ValueError, match="owners"):
+        retire_statements("c", "_deployed", "source_system", [])
 
 
 def test_ddl_already_applied_runs_only_the_lookup_unless_forced():
@@ -1132,12 +1232,21 @@ def test_pipeline_lookup_binds_the_id_and_rejects_sql():
 def _column_list(text: str, table: str) -> list[str]:
     marker = f"framework_meta.{table} ("
     start = text.index(marker) + len(marker)
-    end = text.index(")", start)
     names = []
-    for line in text[start:end].splitlines():
+    depth = 1
+    i = start
+    while i < len(text) and depth:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        i += 1
+    body = text[start : i - 1]
+    for line in body.splitlines():
         part = line.strip().rstrip(",")
-        if part:
-            names.append(part.split()[0])
+        if not part or part.startswith("CONSTRAINT"):
+            continue
+        names.append(part.split()[0])
     return names
 
 
@@ -1148,14 +1257,14 @@ def _dump(document: dict) -> str:
 
 
 class _Frame:
-    def __init__(self, reader: "_Reader"):
+    def __init__(self, reader: _Reader):
         self.reader = reader
 
-    def filter(self, where: str) -> "_Frame":
+    def filter(self, where: str) -> _Frame:
         self.reader.wheres.append(where)
         return self
 
-    def selectExpr(self, *exprs: str) -> "_Frame":
+    def selectExpr(self, *exprs: str) -> _Frame:
         self.reader.exprs.append(exprs)
         return self
 

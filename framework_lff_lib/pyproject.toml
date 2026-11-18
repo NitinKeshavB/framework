@@ -29,7 +29,7 @@ lakeflow-framework = "lakeflow_framework.cli:main"
 # dev is the local tool set. test is pytest only.
 [project.optional-dependencies]
 test = ["pytest>=8"]
-dev = ["lakeflow_framework[test]", "ruff==0.17.4", "pre-commit"]
+dev = ["lakeflow_framework[test]", "ruff==0.17.4", "pre-commit", "mypy>=1.14"]
 
 [build-system]
 requires = ["setuptools>=77.0.0", "wheel"]
@@ -38,6 +38,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lakeflow_framework*"]
+
+[tool.setuptools.package-data]
+lakeflow_framework = ["sql/*.sql"]
 
 
 ##############################

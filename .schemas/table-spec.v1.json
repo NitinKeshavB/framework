@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lakeflow-framework.local/schemas/table-spec.v1.json",
+  "title": "Lakeflow table spec v1",
+  "description": "One bronze table. Prefer the terse form that inherits domain, delivery, and ownership from source.yaml and the folder. Precedence: table entry > profile (extends) > source.yaml > framework default.",
+  "type": "object",
+  "anyOf": [
+    { "required": ["pipeline_id"] },
+    { "required": ["tables"] }
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "spec_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Required for evolution across thousands of specs. Defaults to 1 when omitted."
+    },
+    "pipeline_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+      "description": "Must start with the source system name."
+    },
+    "extends": {
+      "type": "string",
+      "description": "Optional profile path relative to the ingestion bundle (for example profiles/db_merge_confidential)."
+    },
+    "domain": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "data_domain": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "team": { "type": "string" },
+    "technical_owner": { "type": "string", "format": "email" },
+    "requested_by": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "delivery": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "job_name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "layer": { "type": "string", "const": "bronze" },
+    "notify": {
+      "type": "object",
+      "properties": {
+        "on_failure": { "type": "array", "items": { "type": "string", "format": "email" } },
+        "on_success": { "type": "array", "items": { "type": "string", "format": "email" } }
+      }
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "classification": {
+          "type": "string",
+          "enum": ["internal", "confidential", "highly_confidential"]
+        },
+        "pii": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["pii_health", "pii_basic", "pii_finance", "pii_biometric", "pii_personal"]
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "description": "File volume fields or database foreign-catalog fields — not both.",
+      "properties": {
+        "volume": { "type": "string" },
+        "raw_path": { "type": "string" },
+        "format": {
+          "type": "string",
+          "enum": ["csv", "delimited", "text", "fixed_width", "json", "parquet", "avro", "excel", "yaml"]
+        },
+        "delimiter": { "type": "string" },
+        "header": { "type": "boolean" },
+        "header_rows": { "type": "integer", "enum": [0, 1] },
+        "data_address": { "type": "string" },
+        "path_glob": { "type": "string" },
+        "multiline": { "type": "boolean" },
+        "file_events": { "type": "boolean" },
+        "max_files_per_trigger": { "type": "integer", "minimum": 1 },
+        "catalog": { "type": "string" },
+        "table": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$" },
+        "mode": { "type": "string", "enum": ["snapshot", "merge"] }
+      }
+    },
+    "raw_to_bronze": {
+      "type": "object",
+      "properties": {
+        "bronze": {
+          "type": "object",
+          "properties": {
+            "schema": { "type": "string" },
+            "table": { "type": "string" },
+            "cluster_by": { "type": "array", "items": { "type": "string" }, "maxItems": 4 }
+          }
+        },
+        "dedup": { "type": "boolean" },
+        "primary_keys": { "type": "array", "items": { "type": "string" } },
+        "watermark_column": { "type": "string" },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string" },
+              "description": { "type": "string" },
+              "classification": { "type": "string" },
+              "pii": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "expression"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "expression": {
+                "type": "string",
+                "description": "Boolean SQL over this table's columns, literals, and approved functions only."
+              }
+            }
+          }
+        }
+      }
+    },
+    "quarantine": {
+      "type": "object",
+      "properties": {
+        "schema": { "type": "string" },
+        "table": { "type": "string" }
+      }
+    },
+    "tables": {
+      "type": "array",
+      "description": "Table group form: one profile plus many short table entries (see docs).",
+      "items": { "type": "object" }
+    }
+  }
+}

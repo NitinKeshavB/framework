@@ -68,7 +68,7 @@ function build {
 }
 
 # validate the source systems and table specs, then regenerate from them:
-# SOURCE_MAP.md, and one pipeline file, pipeline resource, and job per source delivery
+# SOURCE_MAP.md (committed) plus .build/ pipelines, resources, and manifests per delivery
 function generate {
     _require-package
     "$PYTHON" -m lakeflow_framework.cli generate "$THIS_DIR/framework_ingestion"

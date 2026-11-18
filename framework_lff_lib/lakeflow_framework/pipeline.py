@@ -6,10 +6,15 @@ Two shapes, chosen by the load method:
   bronze and quarantine;
 - rawless methods (volume_files, database_table) read the source directly. The raw layer is the
   files already in the raw volume, or the database table itself.
+
+``build_pipelines`` isolates per-spec failures: one bad or missing spec is logged and skipped so
+the other tables in the delivery still register. ``record_load_metrics`` then appends FAILED for
+registered dataflows with no event-log progress.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,8 +22,10 @@ from typing import Any
 from lakeflow_framework.config import (
     CATALOG_SETTING,
     IDENTIFIER,
+    MANIFEST_SETTING,
     MAX_CLUSTER_KEYS,
     SPECS_SETTING,
+    ConfigValidationError,
     PipelineConfig,
     config_from_document,
     validate_configs,
@@ -32,6 +39,8 @@ from lakeflow_framework.quality import (
     expectations,
     failed_rules_sql,
 )
+
+log = logging.getLogger(__name__)
 
 
 class MetadataNotFound(Exception):
@@ -85,8 +94,11 @@ def build_pipelines(
 ) -> list[Graph]:
     """Register every table in a delivery.
 
-    The generated pipeline sets ``lff.specs`` to its deployed spec files, so the specs are read
+    The generated pipeline sets ``lff.manifest`` to its delivery JSON, so the specs are read
     from the bundle. Without it, the registry is queried once for the whole list.
+
+    One table that fails to load or register is skipped so the rest of the delivery still runs.
+    ``record_load_metrics`` marks that dataflow FAILED when the event log has no progress for it.
     """
 
     if not pipeline_ids:
@@ -94,22 +106,25 @@ def build_pipelines(
     if spark is None and pipelines is None and metadata is None:
         pipelines = _cluster_pipelines()
         spark = _cluster_session()
+    graphs: list[Graph] = []
     if metadata is None:
         configured = bundle_configs(spark)
         if configured is not None:
-            graphs = []
             for pipeline_id in pipeline_ids:
-                if pipeline_id not in configured:
-                    raise MetadataNotFound(f"{pipeline_id} is not in {SPECS_SETTING}")
-                graphs.append(
-                    build_pipeline(
+                config = configured.get(pipeline_id)
+                if config is None:
+                    log.error(
+                        "%s: not loadable from %s/%s (missing or invalid); skipping so other "
+                        "tables in this delivery still load",
                         pipeline_id,
-                        spark=spark,
-                        pipelines=pipelines,
-                        config=configured[pipeline_id],
+                        MANIFEST_SETTING,
+                        SPECS_SETTING,
                     )
-                )
-            return graphs
+                    continue
+                graph = _try_build(pipeline_id, spark=spark, pipelines=pipelines, config=config)
+                if graph is not None:
+                    graphs.append(graph)
+            return _require_some(graphs, pipeline_ids)
     reader = metadata
     if reader is None:
         if spark is None:
@@ -119,29 +134,106 @@ def build_pipelines(
         documents = reader.get_pipelines(list(pipeline_ids))
     else:
         documents = {pipeline_id: reader.get_pipeline(pipeline_id) for pipeline_id in pipeline_ids}
-    graphs: list[Graph] = []
     for pipeline_id in pipeline_ids:
         document = documents.get(pipeline_id) if isinstance(documents, dict) else None
         if not document:
-            raise MetadataNotFound(f"{pipeline_id} is not in the metadata registry")
-        graphs.append(
-            build_pipeline(pipeline_id, spark=spark, pipelines=pipelines, config=document)
-        )
-    return graphs
+            log.error(
+                "%s: not in the metadata registry; skipping so other tables in this delivery "
+                "still load",
+                pipeline_id,
+            )
+            continue
+        graph = _try_build(pipeline_id, spark=spark, pipelines=pipelines, config=document)
+        if graph is not None:
+            graphs.append(graph)
+    return _require_some(graphs, pipeline_ids)
 
 
 def bundle_configs(spark: Any) -> dict[str, PipelineConfig] | None:
-    """The specs named in the pipeline's ``lff.specs`` setting, or None when it is not set."""
+    """Configs from ``lff.manifest`` (preferred) or legacy ``lff.specs``, or None if unset.
+
+    Manifest: one JSON read/parse for the whole delivery. Specs: each path validated alone so
+    one bad file does not block the others.
+    """
 
     conf = getattr(spark, "conf", None)
     if conf is None:
         return None
+    catalog = conf.get(CATALOG_SETTING, None) or None
+    manifest = conf.get(MANIFEST_SETTING, None)
+    if manifest:
+        return _configs_from_manifest(Path(str(manifest).strip()), catalog)
     specs = conf.get(SPECS_SETTING, None)
     if not specs:
         return None
     paths = [Path(path.strip()) for path in specs.split(",") if path.strip()]
-    catalog = conf.get(CATALOG_SETTING, None) or None
-    return {config.pipeline_id: config for config in validate_configs(paths, catalog=catalog)}
+    configured: dict[str, PipelineConfig] = {}
+    for path in paths:
+        try:
+            for config in validate_configs([path], catalog=catalog):
+                configured[config.pipeline_id] = config
+        except ConfigValidationError as exc:
+            log.error("%s: invalid spec; skipping: %s", path, "; ".join(exc.errors))
+        except Exception as exc:
+            log.exception("%s: could not read spec; skipping: %s", path, exc)
+    return configured
+
+
+def _configs_from_manifest(path: Path, catalog: str | None) -> dict[str, PipelineConfig]:
+    import json
+
+    configured: dict[str, PipelineConfig] = {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.exception("%s: could not read delivery manifest; skipping all tables: %s", path, exc)
+        return configured
+    for item in payload.get("pipelines") or []:
+        pipeline_id = str(item.get("pipeline_id") or "")
+        document = item.get("config")
+        if not pipeline_id or not isinstance(document, dict):
+            log.error("%s: malformed pipeline entry; skipping", path)
+            continue
+        if catalog:
+            document = {**document, "catalog": catalog}
+        try:
+            configured[pipeline_id] = config_from_document(document)
+        except ConfigValidationError as exc:
+            log.error(
+                "%s (%s): invalid manifest config; skipping: %s",
+                path,
+                pipeline_id,
+                "; ".join(exc.errors),
+            )
+        except Exception as exc:
+            log.exception("%s (%s): could not load; skipping: %s", path, pipeline_id, exc)
+    return configured
+
+
+def _try_build(
+    pipeline_id: str,
+    *,
+    spark: Any,
+    pipelines: Any,
+    config: PipelineConfig | dict[str, Any],
+) -> Graph | None:
+    try:
+        return build_pipeline(pipeline_id, spark=spark, pipelines=pipelines, config=config)
+    except Exception as exc:
+        log.exception(
+            "%s: failed to register; skipping so other tables in this delivery still load: %s",
+            pipeline_id,
+            exc,
+        )
+        return None
+
+
+def _require_some(graphs: list[Graph], pipeline_ids: list[str]) -> list[Graph]:
+    if graphs:
+        return graphs
+    raise MetadataNotFound(
+        f"every table in this delivery failed to register: {', '.join(pipeline_ids)}"
+    )
 
 
 def _cluster_session() -> Any:
@@ -278,10 +370,13 @@ def _resolve_config(
 
 
 def _filtered(frame: Any, where: str) -> Any:
-    """Keep the rows matching ``where``. Test doubles without ``filter`` return a description."""
+    """Keep the rows matching ``where``. Requires a DataFrame-like with ``.filter``."""
 
     if not hasattr(frame, "filter"):
-        return {"where": where, "frame": frame}
+        raise TypeError(
+            "pipeline frames must support .filter; inject a DataFrame-like test double, "
+            "not a bare dict"
+        )
     return frame.filter(where)
 
 
@@ -364,9 +459,11 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
     def _staged() -> Any:
         frame = _read_source()
         failed_rules = f"{staged.detail['failed_rules']} AS {DQ_COLUMN}"
-        if hasattr(frame, "selectExpr"):
-            return frame.selectExpr("*", failed_rules)
-        return {"frame": frame, "select": failed_rules}
+        if not hasattr(frame, "selectExpr"):
+            raise TypeError(
+                "pipeline frames must support .selectExpr; inject a DataFrame-like test double"
+            )
+        return frame.selectExpr("*", failed_rules)
 
     registered = _staged
     if graph.expectations:

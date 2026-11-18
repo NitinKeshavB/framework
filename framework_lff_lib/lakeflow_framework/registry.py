@@ -7,20 +7,25 @@ import logging
 import re
 import time
 from collections import Counter
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from lakeflow_framework.logs import statement_summary
 from lakeflow_framework.metadata import (
-    LEDGER_COLUMNS,
+    LOOKUP_KEYS_VIEW,
     OBJECT_COLUMNS,
     OWNER_KINDS,
+    OWNER_NAMES_VIEW,
+    REFUSAL_COLUMNS,
     SCD_COLUMNS,
+    _sql_in,
     current_objects_sql,
     ddl_statements,
     ingest_steps,
     new_object_rows,
     owners_sql,
     ownership_conflicts,
+    require_safe_names,
     step_key,
     step_keys_sql,
     step_payload,
@@ -28,15 +33,12 @@ from lakeflow_framework.metadata import (
 
 log = logging.getLogger(__name__)
 
-RUN_KEYS = ("owner_kind", "owner", "object_kind", "full_name")
 OBJECT_KEYS = ("object_kind", "full_name")
 # Columns the writer computes from the staged columns.
 OBJECT_DERIVED = {"config": "parse_json(config_json)"}
 OBJECT_TABLE_COLUMNS = (*OBJECT_COLUMNS, *OBJECT_DERIVED)
-_STEP_TYPES = {
-    "timestamp_columns": ("started_at", "ended_at", "recorded_at"),
-    "date_columns": ("event_date",),
-    "int_columns": ("step_no",),
+_REFUSAL_TYPES = {
+    "timestamp_columns": ("recorded_at",),
 }
 
 
@@ -98,23 +100,22 @@ def _ddl_applied(spark, catalog: str, digest: str) -> bool:
 
 
 def append_steps(spark, payloads: list[dict], seen: set | None = None, catalog: str = "") -> int:
+    """Append ownership refusals. Name kept for call-site compatibility."""
+
     candidates = [payload for payload in payloads if seen is None or step_key(payload) not in seen]
     if catalog and candidates:
-        already = _existing_step_keys(spark, catalog, candidates)
+        already = _existing_refusal_keys(spark, catalog, candidates)
         candidates = [payload for payload in candidates if step_key(payload) not in already]
-    staged: set[tuple[str, int, str]] = set()
+    staged: set[tuple[str, str, str]] = set()
     rows = ingest_steps(candidates, staged)
     if not rows:
         return 0
-    written = _insert(spark, _table(catalog, "run_ledger"), rows, LEDGER_COLUMNS, **_STEP_TYPES)
-    _merge_current(
+    written = _insert(
         spark,
-        _table(catalog, "run_current"),
+        _table(catalog, "ownership_refusals"),
         rows,
-        LEDGER_COLUMNS,
-        RUN_KEYS,
-        newer_than="recorded_at",
-        **_STEP_TYPES,
+        REFUSAL_COLUMNS,
+        **_REFUSAL_TYPES,
     )
     if seen is not None:
         seen.update(staged)
@@ -131,8 +132,9 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
     held = seen if seen is not None else set()
     # Copy so a failed write does not mark this batch as the current version.
     fresh = new_object_rows(rows, set(held))
+    _reject_duplicate_object_keys(fresh)
     log.info("definitions: %d declared (%s)", len(rows), _by_kind(rows))
-    current: dict[tuple[str, str], str] = {}
+    current: dict[tuple[str, str], str | None] = {}
     if catalog and fresh:
         # Ownership comes first: another owner's identical definition must be refused and
         # recorded, not skipped as already current.
@@ -153,9 +155,16 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
     if not fresh:
         log.info("definitions: nothing to write")
         return 0
-    for row in fresh:
-        change = "changed" if (row["object_kind"], row["full_name"]) in current else "new"
-        log.info("definition %s %s: %s", row["object_kind"], row["full_name"], change)
+    if len(fresh) <= 20:
+        for row in fresh:
+            change = "changed" if (row["object_kind"], row["full_name"]) in current else "new"
+            log.info("definition %s %s: %s", row["object_kind"], row["full_name"], change)
+    else:
+        log.info(
+            "definitions: writing %d version(s) (%s)",
+            len(fresh),
+            _by_kind(fresh),
+        )
     written = _scd2_merge(spark, _table(catalog, "asset_registry"), fresh)
     log.info(
         "definitions: wrote %d version(s) to asset_registry and asset_registry_current", written
@@ -180,11 +189,12 @@ def append_definitions(spark, rows: list[dict], seen: set | None = None, catalog
 def retire_definitions(
     spark, deployed: list[dict], catalog: str, owner_kind: str = "source_system"
 ) -> None:
-    """Close every current version of ``owner_kind`` that this deploy no longer defines.
+    """Close current versions this bundle no longer defines, scoped to its owners only.
 
+    Retirement is limited to ``owner`` values present in ``deployed``, so one ingestion
+    bundle can be sharded per source system without deleting another bundle's rows.
     Each retired object gets a deletion version (``is_deleted = true``) and leaves
-    asset_registry_current, so its name is free and v_asset_registry_current no longer lists it. A deploy with
-    no definitions retires nothing: an empty bundle is a mistake, not a removal.
+    asset_registry_current. A deploy with no definitions retires nothing.
     """
 
     if owner_kind not in OWNER_KINDS:
@@ -192,32 +202,34 @@ def retire_definitions(
     keys = sorted({(str(row["object_kind"]), str(row["full_name"])) for row in deployed})
     if not keys:
         raise ValueError("a deploy with no definitions cannot retire anything")
-    if spark is None or not hasattr(spark, "createDataFrame"):
-        return
-    from lakeflow_framework.spark_types import types_module
+    owners = _deployed_owners(deployed, owner_kind)
+    from lakeflow_framework.spark_types import require_writer, string_schema
 
-    t = types_module()
-    schema = (
-        t.StructType([t.StructField(key, t.StringType(), False) for key in OBJECT_KEYS])
-        if t is not None
-        else None
+    writer = require_writer(spark)
+    rows = [dict(zip(OBJECT_KEYS, key, strict=True)) for key in keys]
+    writer.createDataFrame(rows, string_schema(OBJECT_KEYS)).createOrReplaceTempView(
+        "_framework_deployed"
     )
-    rows = [dict(zip(OBJECT_KEYS, key)) for key in keys]
-    spark.createDataFrame(rows, schema).createOrReplaceTempView("_framework_deployed")
+    owner_in = _sql_in(owners)
     gone = _rows(
         spark.sql(
             f"SELECT c.object_kind, c.full_name FROM {_table(catalog, 'asset_registry_current')} c "
             "LEFT ANTI JOIN _framework_deployed d "
             "ON d.object_kind = c.object_kind AND d.full_name = c.full_name "
-            f"WHERE c.owner_kind = '{owner_kind}' ORDER BY c.object_kind, c.full_name"
+            f"WHERE c.owner_kind = '{owner_kind}' AND c.owner IN ({owner_in}) "
+            "ORDER BY c.object_kind, c.full_name"
         )
     )
     if not gone:
-        log.info("retire: every current %s definition is still deployed", owner_kind)
+        log.info(
+            "retire: every current %s definition for owner(s) %s is still deployed",
+            owner_kind,
+            ", ".join(owners),
+        )
         return
     for row in gone:
         log.info("retire: %s %s is no longer deployed", row["object_kind"], row["full_name"])
-    for statement in retire_statements(catalog, "_framework_deployed", owner_kind):
+    for statement in retire_statements(catalog, "_framework_deployed", owner_kind, owners):
         spark.sql(statement)
     log.info("retire: wrote %d deletion version(s)", len(gone))
 
@@ -233,7 +245,7 @@ def scd2_merge_sql(table: str, staged: str) -> str:
     columns = OBJECT_TABLE_COLUMNS
     latest = (
         f"SELECT * FROM ({staged}) QUALIFY row_number() OVER "
-        "(PARTITION BY object_kind, full_name ORDER BY recorded_at DESC) = 1"
+        "(PARTITION BY object_kind, full_name ORDER BY recorded_at DESC, content_hash DESC) = 1"
     )
     source = (
         f"SELECT s.*, {key} AS merge_key FROM ({latest}) s "
@@ -241,7 +253,7 @@ def scd2_merge_sql(table: str, staged: str) -> str:
         f"SELECT s.*, NULL AS merge_key FROM ({latest}) s "
         f"JOIN {table} r ON r.object_kind = s.object_kind AND r.full_name = s.full_name "
         f"AND r.is_current "
-        f"WHERE r.content_hash <> s.content_hash OR coalesce(r.is_deleted, false)"
+        f"WHERE {_content_hash_changed('r', 's')}"
     )
     inserted = ", ".join((*columns, *SCD_COLUMNS))
     values = ", ".join(
@@ -250,24 +262,34 @@ def scd2_merge_sql(table: str, staged: str) -> str:
     return (
         f"MERGE INTO {table} t USING ({source}) u "
         f"ON concat(t.object_kind, '|', t.full_name) = u.merge_key AND t.is_current "
-        f"WHEN MATCHED AND (t.content_hash <> u.content_hash OR coalesce(t.is_deleted, false)) "
+        f"WHEN MATCHED AND ({_content_hash_changed('t', 'u')}) "
         f"THEN UPDATE SET t.valid_to = u.recorded_at, t.is_current = false "
         f"WHEN NOT MATCHED THEN INSERT ({inserted}) VALUES ({values})"
     )
 
 
-def retire_statements(catalog: str, deployed: str, owner_kind: str) -> list[str]:
-    """SQL that retires current objects of ``owner_kind`` missing from the ``deployed`` view."""
+def retire_statements(
+    catalog: str,
+    deployed: str,
+    owner_kind: str,
+    owners: list[str],
+) -> list[str]:
+    """SQL that retires current objects for ``owners`` missing from the ``deployed`` view."""
 
     if not re.fullmatch(r"[A-Za-z0-9_-]+", catalog or ""):
         raise ValueError("catalog is required")
+    if not owners:
+        raise ValueError("owners are required to scope retirement")
+    if any(not re.fullmatch(r"[A-Za-z0-9_-]+", owner or "") for owner in owners):
+        raise ValueError("owner is required")
+    owner_in = _sql_in(owners)
     registry = _table(catalog, "asset_registry")
     current = _table(catalog, "asset_registry_current")
     gone = (
         f"SELECT r.* FROM {registry} r "
         f"LEFT ANTI JOIN {deployed} d ON d.object_kind = r.object_kind AND d.full_name = r.full_name "
         f"WHERE r.is_current AND NOT coalesce(r.is_deleted, false) "
-        f"AND r.owner_kind = '{owner_kind}'"
+        f"AND r.owner_kind = '{owner_kind}' AND r.owner IN ({owner_in})"
     )
     marked = (
         f"SELECT g.* EXCEPT (recorded_at, source, valid_from, valid_to, is_current, is_deleted), "
@@ -289,6 +311,7 @@ def retire_statements(catalog: str, deployed: str, owner_kind: str) -> list[str]
     )
     leave_current = (
         f"DELETE FROM {current} c WHERE c.owner_kind = '{owner_kind}' "
+        f"AND c.owner IN ({owner_in}) "
         f"AND NOT EXISTS (SELECT 1 FROM {deployed} d "
         f"WHERE d.object_kind = c.object_kind AND d.full_name = c.full_name)"
     )
@@ -303,7 +326,8 @@ def _refuse_other_owners(spark, catalog: str, rows: list[dict]) -> list[dict]:
     raises instead of skipping the check: skipping it would insert the row.
     """
 
-    statement = owners_sql(catalog, [str(row["full_name"]) for row in rows])
+    _stage_owner_names(spark, [str(row["full_name"]) for row in rows])
+    statement = owners_sql(catalog, OWNER_NAMES_VIEW)
     current = {
         (str(row["object_kind"]), str(row["full_name"])): (
             str(row["owner_kind"]),
@@ -335,6 +359,9 @@ def _refuse_other_owners(spark, catalog: str, rows: list[dict]) -> list[dict]:
                     step_no=1,
                     step_name="ownership_check",
                     status="FAILED",
+                    content_hash=str(row["content_hash"]),
+                    holder_owner_kind=holder[0],
+                    holder_owner=holder[1],
                     failure_reason=(
                         f"{row['full_name']} is owned by {holder[0]} {holder[1]}; "
                         f"{row['owner_kind']} {row['owner']} cannot register it"
@@ -354,28 +381,94 @@ def _table(catalog: str, name: str) -> str:
     return f"{catalog}.framework_meta.{name}" if catalog else f"framework_meta.{name}"
 
 
-def _existing_step_keys(spark, catalog: str, payloads: list[dict]) -> set[tuple[str, int, str]]:
-    recorded = [str(payload.get("recorded_at") or "") for payload in payloads]
-    dates = [value[:10] for value in recorded if len(value) >= 10]
+def _existing_refusal_keys(spark, catalog: str, payloads: list[dict]) -> set[tuple[str, str, str]]:
     statement = step_keys_sql(
         catalog,
-        [str(payload["run_id"]) for payload in payloads],
-        owners=[str(payload.get("owner") or "") for payload in payloads],
-        event_dates=dates if len(dates) == len(payloads) else None,
+        [str(payload.get("content_hash") or "") for payload in payloads],
+        full_names=[str(payload["full_name"]) for payload in payloads],
     )
     return {
-        (str(row["run_id"]), int(row["step_no"]), str(row["status"]))
+        (str(row["object_kind"]), str(row["full_name"]), str(row["content_hash"]))
         for row in _rows(spark.sql(statement))
     }
 
 
-def _current_object_hashes(spark, catalog: str, rows: list[dict]) -> dict[tuple[str, str], str]:
+def _current_object_hashes(
+    spark, catalog: str, rows: list[dict]
+) -> dict[tuple[str, str], str | None]:
     # A failed lookup must not look like "nothing stored", or the batch is appended again.
-    statement = current_objects_sql(catalog, rows)
-    return {
-        (str(row["object_kind"]), str(row["full_name"])): str(row["content_hash"])
-        for row in _rows(spark.sql(statement))
-    }
+    # Keep SQL NULL as None — str(None) == "None" would wedge NULL hashes forever.
+    _stage_lookup_keys(spark, rows)
+    statement = current_objects_sql(catalog, LOOKUP_KEYS_VIEW)
+    hashes: dict[tuple[str, str], str | None] = {}
+    for row in _rows(spark.sql(statement)):
+        digest = row["content_hash"]
+        hashes[(str(row["object_kind"]), str(row["full_name"]))] = (
+            None if digest is None else str(digest)
+        )
+    return hashes
+
+
+def _stage_lookup_keys(spark, rows: list[dict], view: str = LOOKUP_KEYS_VIEW) -> None:
+    """Temp view of (object_kind, full_name) for JOIN lookups — no IN-list scaling wall."""
+
+    from lakeflow_framework.metadata import _object_keys
+    from lakeflow_framework.spark_types import require_writer, string_schema
+
+    _object_keys(rows)
+    keys = sorted({(str(row["object_kind"]), str(row["full_name"])) for row in rows})
+    payload = [{"object_kind": kind, "full_name": name} for kind, name in keys]
+    require_writer(spark).createDataFrame(
+        payload, string_schema(("object_kind", "full_name"))
+    ).createOrReplaceTempView(view)
+
+
+def _stage_owner_names(spark, full_names: list[str], view: str = OWNER_NAMES_VIEW) -> None:
+    """Temp view of full_name for ownership JOINs."""
+
+    from lakeflow_framework.spark_types import require_writer, string_schema
+
+    names = require_safe_names(full_names)
+    payload = [{"full_name": name} for name in sorted(set(names))]
+    require_writer(spark).createDataFrame(
+        payload, string_schema(("full_name",))
+    ).createOrReplaceTempView(view)
+
+
+def _deployed_owners(deployed: list[dict], owner_kind: str) -> list[str]:
+    owners = sorted(
+        {
+            str(row["owner"])
+            for row in deployed
+            if str(row.get("owner_kind") or "") == owner_kind and row.get("owner")
+        }
+    )
+    if not owners or any(not re.fullmatch(r"[A-Za-z0-9_-]+", owner) for owner in owners):
+        raise ValueError("owner is required")
+    return owners
+
+
+def _content_hash_changed(left: str, right: str) -> str:
+    """NULL-safe hash compare: ``<>`` is unknown when either side is NULL."""
+
+    return (
+        f"NOT ({left}.content_hash <=> {right}.content_hash) OR coalesce({left}.is_deleted, false)"
+    )
+
+
+def _reject_duplicate_object_keys(rows: list[dict]) -> None:
+    """Fail loudly when one deploy batch has two rows for the same object key."""
+
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        key = (str(row["object_kind"]), str(row["full_name"]))
+        if key in seen:
+            kind, name = key
+            raise ValueError(
+                f"duplicate definition in one deploy: {kind} {name} — "
+                "fix the colliding specs (often two source systems naming the same schema)"
+            )
+        seen.add(key)
 
 
 def _merge_current(
@@ -392,8 +485,11 @@ def _merge_current(
 ) -> None:
     """Replace the one current row for each key. History tables are not updated."""
 
-    if not rows or spark is None or not hasattr(spark, "createDataFrame"):
+    if not rows:
         return
+    from lakeflow_framework.spark_types import require_writer
+
+    require_writer(spark)
     staged = _stage(
         spark,
         "_framework_current",
@@ -409,8 +505,9 @@ def _merge_current(
 
 
 def _scd2_merge(spark, table: str, rows: list[dict]) -> int:
-    if spark is None or not hasattr(spark, "createDataFrame"):
-        return 0
+    from lakeflow_framework.spark_types import require_writer
+
+    require_writer(spark)
     staged = _stage(
         spark,
         "_framework_append",
@@ -462,19 +559,15 @@ def _stage(
 ) -> str:
     """Register ``rows`` as a string-typed view and return the SELECT that types them."""
 
-    from lakeflow_framework.spark_types import types_module
+    from lakeflow_framework.spark_types import require_writer, string_schema
 
     string_rows = [
         {column: None if row.get(column) is None else str(row.get(column)) for column in columns}
         for row in rows
     ]
-    t = types_module()
-    schema = (
-        t.StructType([t.StructField(column, t.StringType(), True) for column in columns])
-        if t is not None
-        else None
-    )
-    spark.createDataFrame(string_rows, schema).createOrReplaceTempView(view)
+    require_writer(spark).createDataFrame(
+        string_rows, string_schema(columns)
+    ).createOrReplaceTempView(view)
     select = ", ".join(
         [_cast(column, timestamp_columns, date_columns, int_columns) for column in columns]
         + [f"{expression} AS {column}" for column, expression in derived.items()]
@@ -489,15 +582,9 @@ def _merge_sql(
     columns: tuple[str, ...],
     newer_than: str | None = None,
 ) -> str:
-    on = " AND ".join(f"t.{key} = s.{key}" for key in keys)
-    matched = f" AND s.{newer_than} >= t.{newer_than}" if newer_than else ""
-    assignments = ", ".join(f"t.{column} = s.{column}" for column in columns)
-    values = ", ".join(f"s.{column}" for column in columns)
-    return (
-        f"MERGE INTO {table} t USING ({source}) s ON {on} "
-        f"WHEN MATCHED{matched} THEN UPDATE SET {assignments} "
-        f"WHEN NOT MATCHED THEN INSERT ({', '.join(columns)}) VALUES ({values})"
-    )
+    from lakeflow_framework.sqlnames import merge_sql
+
+    return merge_sql(table, source, keys, columns, newer_than=newer_than, dedupe_source=True)
 
 
 def _cast(
@@ -516,11 +603,9 @@ def _cast(
 
 
 def _rows(frame: Any) -> list[dict]:
-    collected = frame.collect() if hasattr(frame, "collect") else list(frame)
-    rows = []
-    for row in collected:
-        rows.append(row if isinstance(row, dict) else row.asDict())
-    return rows
+    from lakeflow_framework.sqlnames import spark_rows
+
+    return spark_rows(frame)
 
 
 def _event_time(column: str) -> str:

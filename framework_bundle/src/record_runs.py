@@ -1,4 +1,4 @@
-"""Record the framework's job runs from the Jobs API and pipeline updates from the event logs."""
+"""Record job runs (system.lakeflow, Jobs API fallback) and pipeline updates from event logs."""
 
 import sys
 
@@ -15,7 +15,7 @@ def main() -> None:
     log.info("catalog %s, part %s", catalog, part)
     spark = SparkSession.builder.getOrCreate()
     if part == "job_runs":
-        with step(log, "record job runs from the Jobs API"):
+        with step(log, "record job runs from system.lakeflow or Jobs API"):
             read = record_job_runs(spark, WorkspaceClient(), catalog)
         log.info("recorded %d job run(s)", read)
     elif part == "pipeline_updates":

@@ -139,27 +139,15 @@
         columns: ["object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "config", "recorded_at"]
       },
       {
-        kind: "table", name: "run_ledger",
-        writtenBy: "registry_sync", grain: "One ownership refusal (or legacy job step)",
-        purpose: "Insert-only event log of definitions refused because another owner already holds the name. Delivery jobs no longer write load steps here.",
-        columns: ["run_id", "object_kind", "full_name", "owner_kind", "owner", "step_no", "step_name", "status", "failure_reason", "recorded_at", "event_date"]
-      },
-      {
-        kind: "table", name: "run_current",
-        writtenBy: "registry_sync", grain: "One latest ledger step per owned object",
-        purpose: "Current refusal/step pointer for each object key, for quick status without scanning run_ledger.",
-        columns: ["run_id", "object_kind", "full_name", "owner_kind", "owner", "step_name", "status", "recorded_at", "event_date"]
-      },
-      {
-        kind: "table", name: "table_health",
-        writtenBy: "framework_optimize (daily)", grain: "One bronze table per optimize run",
-        purpose: "File count, size, and last load commit metrics from DESCRIBE DETAIL / HISTORY for bronze tables listed in v_bronze_tables.",
-        columns: ["table_name", "owner_kind", "owner", "num_files", "size_in_bytes", "last_version", "last_operation", "last_commit_at", "last_operation_metrics", "error", "recorded_at", "event_date"]
+        kind: "table", name: "ownership_refusals",
+        writtenBy: "registry_sync", grain: "One refused definition",
+        purpose: "Insert-only log of definitions refused because another owner already holds the name. Replaces retired run_ledger / run_current.",
+        columns: ["object_kind", "full_name", "refused_owner_kind", "refused_owner", "holder_owner_kind", "holder_owner", "failure_reason", "content_hash", "recorded_at"]
       },
       {
         kind: "table", name: "job_runs",
         writtenBy: "record_this_run (NRT) + framework_runs (hourly catch-up)", grain: "One Jobs API run of a framework job",
-        purpose: "Run outcomes for delivery and framework jobs tagged lakeflow_framework_workflow. Includes failure_reason. Merged on (job_id, run_id); no system.lakeflow grant required. Hot ~7 days; older rows move to job_runs_archive.",
+        purpose: "Append-only run events for delivery and framework jobs tagged lakeflow_framework_workflow. NRT via record_this_run; hourly catch-up prefers system.lakeflow (Jobs API fallback). v_job_runs keeps latest recorded_at per (job_id, run_id). Hot ~7 days; older rows move to job_runs_archive.",
         columns: ["job_name", "deployed_name", "job_id", "run_id", "started_at", "ended_at", "status", "result_state", "termination_code", "failure_reason", "run_seconds", "run_page_url", "recorded_at"]
       },
       {
@@ -177,14 +165,14 @@
       {
         kind: "table", name: "load_ledger",
         writtenBy: "each layer job · record_load_metrics (run_if ALL_DONE)", grain: "One append per job, layer, update, and dataflow",
-        purpose: "Sole recon SoR: append-only counts for bronze, silver, gold, and product, plus FAILED stubs when the event log has no flow_progress. No MERGE, no table scan. Hot ~7 days; older rows move to load_ledger_archive.",
-        columns: ["job_name", "layer", "pipeline_id", "update_id", "dataflow", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_quarantine", "rows_processed", "target_status", "expectations", "failure_reason", "recorded_at"]
+        purpose: "Sole recon SoR: append-only counts for bronze, silver, gold, and product — one row per registered dataflow per update, FAILED when that dataflow has no flow_progress or the event log is missing. AUTO CDC upserts/deletes feed rows_written. job_run_id equi-joins v_load_failures. No MERGE. Hot ~7 days; older rows move to load_ledger_archive.",
+        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_id", "dataflow", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "rows_quarantine", "rows_processed", "target_status", "expectations", "failure_reason", "recorded_at"]
       },
       {
         kind: "table", name: "load_ledger_archive",
         writtenBy: "framework_optimize · archive_hot", grain: "Same as load_ledger after move",
         purpose: "Forever archive of load_ledger rows older than 7 days. Queried via v_loads_90d with hot.",
-        columns: ["job_name", "layer", "pipeline_id", "update_id", "dataflow", "rows_read", "rows_written", "failure_reason", "recorded_at", "archived_at"]
+        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_id", "dataflow", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "failure_reason", "recorded_at", "archived_at"]
       },
       {
         kind: "table", name: "job_runs_archive",
@@ -279,14 +267,14 @@
       {
         kind: "view", name: "v_bronze_tables",
         writtenBy: "framework_meta.sql", grain: "Distinct bronze table names",
-        purpose: "Input list for the daily table_health step.",
+        purpose: "Distinct bronze tables and owners from asset_registry_current (discovery / dashboards).",
         columns: ["table_name", "owner_kind", "owner"]
       },
       {
         kind: "view", name: "v_ownership_refusals",
-        writtenBy: "framework_meta.sql", grain: "One FAILED ownership_check",
+        writtenBy: "framework_meta.sql", grain: "One ownership_refusals row",
         purpose: "Definitions registry_sync refused because another owner holds the name.",
-        columns: ["object_kind", "full_name", "refused_owner", "failure_reason", "recorded_at"]
+        columns: ["object_kind", "full_name", "refused_owner", "holder_owner", "failure_reason", "recorded_at"]
       },
       {
         kind: "view", name: "v_ownership_conflicts",
@@ -327,14 +315,14 @@
       {
         kind: "view", name: "v_loads",
         writtenBy: "framework_meta.sql", grain: "Latest ledger row per job, layer, update, dataflow",
-        purpose: "Sole recon SoR read API for per-load row counts across bronze, silver, gold, and product (including FAILED stubs). Deduplicates retries of record_load_metrics.",
-        columns: ["job_name", "layer", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_quarantine", "rows_processed", "target_status", "failure_reason", "started_at"]
+        purpose: "Sole recon SoR read API for per-load row counts across bronze, silver, gold, and product (including FAILED rows when a registered dataflow had no progress). Deduplicates retries of record_load_metrics.",
+        columns: ["job_name", "layer", "job_run_id", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "rows_quarantine", "rows_processed", "target_status", "failure_reason", "started_at"]
       },
       {
         kind: "view", name: "v_loads_90d",
         writtenBy: "framework_meta.sql", grain: "Latest load across hot + archive",
         purpose: "Dashboard window: unions 7-day hot load_ledger with forever load_ledger_archive, then latest per key.",
-        columns: ["job_name", "layer", "target_table", "rows_read", "rows_written", "failure_reason", "recorded_at"]
+        columns: ["job_name", "layer", "job_run_id", "target_table", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "failure_reason", "recorded_at"]
       },
       {
         kind: "view", name: "v_load_failures",

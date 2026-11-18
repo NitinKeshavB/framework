@@ -1,20 +1,25 @@
-"""Job runs from the Jobs API and pipeline updates from the event logs, kept in framework_meta.
+"""Job runs and pipeline updates kept in framework_meta.
 
-Neither needs grants on the system tables. The Jobs API lists the runs of the jobs the caller
-can see, so the identity that runs framework_runs needs CAN_VIEW on the delivery jobs, which
-the deploying identity has. Pipeline updates come from the <job>_event_log tables the
-ingestion pipelines publish.
+``job_runs`` and ``job_task_runs`` are append-only event tables (same pattern as
+``load_ledger``). ``record_this_run`` and hourly catch-up INSERT; retries may insert again.
+``v_job_runs`` / ``v_job_task_runs`` keep the latest ``recorded_at`` per key — no MERGE, so
+1000 concurrent NRT writers do not contend on Delta commits to the same keys.
 
-Each pass reads from a little before the latest start already recorded, so a run that was
-still going last time is read again and its row updated. Rows are merged, never duplicated.
+Hourly catch-up prefers one INSERT SELECT over ``system.lakeflow.job_run_timeline`` /
+``job_task_run_timeline`` (needs SELECT on ``system.lakeflow``). Without the grant it falls
+back to the Jobs API walk. system.lakeflow freshness is typically up to about an hour;
+NRT remains ``record_this_run``.
+
+Pipeline updates come from the ``<job>_event_log`` tables under ``framework_events``.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -73,18 +78,29 @@ PIPELINE_UPDATE_COLUMNS = (
 )
 _TIMESTAMPS = {"started_at", "ended_at", "recorded_at"}
 _SECONDS = {"setup_seconds", "queue_seconds", "execution_seconds", "run_seconds"}
-_RUNNING = {"PENDING", "QUEUED", "RUNNING", "TERMINATING", "BLOCKED", "WAITING_FOR_RETRY"}
+_RUNNING = {
+    "PENDING",
+    "QUEUED",
+    "RUNNING",
+    "TERMINATING",
+    "BLOCKED",
+    "WAITING",
+    "WAITING_FOR_RETRY",
+}
 _SKIPPED_RESULTS = {"EXCLUDED", "UPSTREAM_CANCELED", "UPSTREAM_FAILED"}
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+$")
 _CATALOG = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def run_status(life_cycle_state: str | None, result_state: str | None) -> str:
-    """RUNNING, SUCCEEDED, SKIPPED, or FAILED, from a Jobs API run or task state."""
+    """RUNNING, SUCCEEDED, SKIPPED, or FAILED, from a Jobs API run or task state.
+
+    ``SUCCESS_WITH_FAILURES`` (job finished with a failed task) maps to FAILED.
+    """
 
     if life_cycle_state in _RUNNING:
         return "RUNNING"
-    if result_state == "SUCCESS" or result_state == "SUCCESS_WITH_FAILURES":
+    if result_state == "SUCCESS":
         return "SUCCEEDED"
     if life_cycle_state == "SKIPPED" or result_state in _SKIPPED_RESULTS:
         return "SKIPPED"
@@ -156,29 +172,26 @@ def record_this_run(
     run_id: str,
     now: datetime | None = None,
 ) -> int:
-    """Merge one Jobs API run (this delivery job) into job_runs and job_task_runs for NRT status."""
+    """Append one Jobs API run (this delivery job) into job_runs and job_task_runs for NRT.
+
+    Insert only — no MERGE. ``v_job_runs`` / ``v_job_task_runs`` keep the latest row per key.
+    """
 
     if not _IDENTIFIER.fullmatch(job_name or ""):
         raise ValueError("job name is required")
     if not str(run_id or "").isdigit():
         raise ValueError("run_id is required")
     meta = _meta(catalog)
-    recorded = (now or datetime.now(timezone.utc)).replace(microsecond=0)
+    recorded = (now or datetime.now(UTC)).replace(microsecond=0)
     run = client.jobs.get_run(int(run_id)).as_dict()
     settings = (client.jobs.get(int(run.get("job_id"))).as_dict().get("settings")) or {}
     deployed = _text(settings.get("name")) or job_name
     workspace_id = _text(client.get_workspace_id())
     row, tasks = job_run_rows(run, job_name, deployed, workspace_id, recorded)
-    _merge(spark, f"{meta}.job_runs", [row], JOB_RUN_COLUMNS, ("job_id", "run_id"))
-    _merge(
-        spark,
-        f"{meta}.job_task_runs",
-        tasks,
-        TASK_RUN_COLUMNS,
-        ("job_run_id", "task_run_id"),
-    )
+    _append(spark, f"{meta}.job_runs", [row], JOB_RUN_COLUMNS)
+    _append(spark, f"{meta}.job_task_runs", tasks, TASK_RUN_COLUMNS)
     log.info(
-        "this run: merged run %s of %s status=%s reason=%s (%d task(s))",
+        "this run: appended run %s of %s status=%s reason=%s (%d task(s))",
         run_id,
         job_name,
         row.get("status"),
@@ -201,13 +214,15 @@ def framework_jobs(jobs: Iterable[Mapping[str, Any]], workflows: set[str]) -> di
 
 
 def record_job_runs(spark, client, catalog: str, now: datetime | None = None) -> int:
-    """Merge the runs of every registered workflow's job into job_runs and job_task_runs.
+    """Append registered workflow runs into job_runs and job_task_runs (catch-up).
 
-    ``client`` is a ``databricks.sdk.WorkspaceClient``. Returns the number of job runs read.
+    Prefers ``system.lakeflow`` (one INSERT SELECT). Falls back to the Jobs API walk when that
+    schema is unavailable. ``client`` is a ``databricks.sdk.WorkspaceClient`` used only on the
+    API path. Returns the number of job-run rows appended.
     """
 
     meta = _meta(catalog)
-    recorded = (now or datetime.now(timezone.utc)).replace(microsecond=0)
+    recorded = (now or datetime.now(UTC)).replace(microsecond=0)
     workflows = {
         str(row["job_name"])
         for row in _rows(spark.sql(f"SELECT job_name FROM {meta}.v_workflows"))
@@ -217,13 +232,214 @@ def record_job_runs(spark, client, catalog: str, now: datetime | None = None) ->
         log.info("job runs: v_workflows lists no workflow; nothing to read")
         return 0
     log.info("job runs: %d registered workflow(s)", len(workflows))
+    since = _read_from(spark, f"{meta}.job_runs", recorded)
+    if system_lakeflow_available(spark):
+        log.info(
+            "job runs: appending from system.lakeflow since %s (NRT remains record_this_run)",
+            since.isoformat(),
+        )
+        return record_job_runs_from_system(spark, catalog, since, recorded)
+    log.warning("job runs: system.lakeflow unavailable; falling back to Jobs API walk")
+    return record_job_runs_from_api(spark, client, catalog, workflows, since, recorded)
+
+
+def system_lakeflow_available(spark) -> bool:
+    """True when this identity can SELECT system.lakeflow.job_run_timeline."""
+
+    try:
+        spark.sql("SELECT 1 FROM system.lakeflow.job_run_timeline LIMIT 1").collect()
+        return True
+    except Exception as exc:
+        log.info("job runs: system.lakeflow probe failed: %s", exc)
+        return False
+
+
+def job_runs_from_system_sql(meta: str, since: datetime, recorded: datetime) -> str:
+    """One MERGE source: registered workflows' job runs from system.lakeflow timelines."""
+
+    cutoff = since.strftime("%Y-%m-%d %H:%M:%S")
+    stamped = recorded.strftime("%Y-%m-%d %H:%M:%S")
+    tag = WORKFLOW_TAG
+    return f"""
+WITH workflows AS (
+  SELECT job_name FROM {meta}.v_workflows
+),
+jobs AS (
+  SELECT workspace_id, job_id, name AS deployed_name, tags['{tag}'] AS job_name
+  FROM (
+    SELECT
+      workspace_id, job_id, name, tags, delete_time, change_time,
+      ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) AS rn
+    FROM system.lakeflow.jobs
+  )
+  WHERE rn = 1 AND delete_time IS NULL
+    AND tags['{tag}'] IN (SELECT job_name FROM workflows)
+),
+runs AS (
+  SELECT
+    j.job_name,
+    j.deployed_name,
+    t.workspace_id,
+    t.job_id,
+    t.run_id,
+    min(t.period_start_time) AS started_at,
+    max_by(t.period_end_time, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS ended_at,
+    max_by(t.result_state, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS result_state,
+    max_by(t.termination_code, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS termination_code,
+    max_by(t.trigger_type, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS trigger_type,
+    max_by(t.setup_duration_seconds, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS setup_seconds,
+    max_by(t.queue_duration_seconds, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS queue_seconds,
+    max_by(t.execution_duration_seconds, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS execution_seconds,
+    max_by(t.run_duration_seconds, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS run_seconds
+  FROM system.lakeflow.job_run_timeline t
+  INNER JOIN jobs j
+    ON t.workspace_id = j.workspace_id AND t.job_id = j.job_id
+  WHERE t.run_type = 'JOB_RUN'
+    AND t.period_start_time >= TIMESTAMP '{cutoff}'
+  GROUP BY j.job_name, j.deployed_name, t.workspace_id, t.job_id, t.run_id
+)
+SELECT
+  job_name,
+  deployed_name,
+  workspace_id,
+  job_id,
+  run_id,
+  started_at,
+  CASE WHEN result_state IS NULL THEN CAST(NULL AS TIMESTAMP) ELSE ended_at END AS ended_at,
+  CASE
+    WHEN result_state IS NULL THEN 'RUNNING'
+    WHEN result_state = 'SUCCEEDED' THEN 'SUCCEEDED'
+    WHEN result_state IN ('SKIPPED', 'BLOCKED') THEN 'SKIPPED'
+    ELSE 'FAILED'
+  END AS status,
+  CASE WHEN result_state IS NULL THEN 'RUNNING' ELSE 'TERMINATED' END AS life_cycle_state,
+  result_state,
+  termination_code,
+  CAST(NULL AS STRING) AS failure_reason,
+  trigger_type,
+  CAST(setup_seconds AS DOUBLE) AS setup_seconds,
+  CAST(queue_seconds AS DOUBLE) AS queue_seconds,
+  CAST(execution_seconds AS DOUBLE) AS execution_seconds,
+  CAST(run_seconds AS DOUBLE) AS run_seconds,
+  CAST(NULL AS STRING) AS run_page_url,
+  TIMESTAMP '{stamped}' AS recorded_at
+FROM runs
+"""
+
+
+def job_task_runs_from_system_sql(meta: str, since: datetime, recorded: datetime) -> str:
+    """Task runs for the same registered workflows and window as job_runs_from_system_sql."""
+
+    cutoff = since.strftime("%Y-%m-%d %H:%M:%S")
+    stamped = recorded.strftime("%Y-%m-%d %H:%M:%S")
+    tag = WORKFLOW_TAG
+    return f"""
+WITH workflows AS (
+  SELECT job_name FROM {meta}.v_workflows
+),
+jobs AS (
+  SELECT workspace_id, job_id, tags['{tag}'] AS job_name
+  FROM (
+    SELECT
+      workspace_id, job_id, tags, delete_time, change_time,
+      ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) AS rn
+    FROM system.lakeflow.jobs
+  )
+  WHERE rn = 1 AND delete_time IS NULL
+    AND tags['{tag}'] IN (SELECT job_name FROM workflows)
+),
+tasks AS (
+  SELECT
+    j.job_name,
+    t.workspace_id,
+    t.job_id,
+    t.job_run_id,
+    t.run_id AS task_run_id,
+    t.task_key,
+    min(t.period_start_time) AS started_at,
+    max_by(t.period_end_time, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS ended_at,
+    max_by(t.result_state, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS result_state,
+    max_by(t.termination_code, CASE WHEN t.result_state IS NOT NULL THEN 1 ELSE 0 END)
+      AS termination_code
+  FROM system.lakeflow.job_task_run_timeline t
+  INNER JOIN jobs j
+    ON t.workspace_id = j.workspace_id AND t.job_id = j.job_id
+  WHERE t.period_start_time >= TIMESTAMP '{cutoff}'
+  GROUP BY j.job_name, t.workspace_id, t.job_id, t.job_run_id, t.run_id, t.task_key
+)
+SELECT
+  job_name,
+  workspace_id,
+  job_id,
+  job_run_id,
+  task_run_id,
+  task_key,
+  started_at,
+  CASE WHEN result_state IS NULL THEN CAST(NULL AS TIMESTAMP) ELSE ended_at END AS ended_at,
+  CASE
+    WHEN result_state IS NULL THEN 'RUNNING'
+    WHEN result_state = 'SUCCEEDED' THEN 'SUCCEEDED'
+    WHEN result_state IN ('SKIPPED', 'BLOCKED') THEN 'SKIPPED'
+    ELSE 'FAILED'
+  END AS status,
+  CASE WHEN result_state IS NULL THEN 'RUNNING' ELSE 'TERMINATED' END AS life_cycle_state,
+  result_state,
+  termination_code,
+  CAST(NULL AS STRING) AS failure_reason,
+  TIMESTAMP '{stamped}' AS recorded_at
+FROM tasks
+"""
+
+
+def record_job_runs_from_system(spark, catalog: str, since: datetime, recorded: datetime) -> int:
+    """Append job and task runs from system.lakeflow. Returns job_runs rows inserted."""
+
+    meta = _meta(catalog)
+    runs_view, tasks_view = "_framework_system_job_runs", "_framework_system_job_task_runs"
+    spark.sql(
+        f"CREATE OR REPLACE TEMP VIEW {runs_view} AS {job_runs_from_system_sql(meta, since, recorded)}"
+    )
+    spark.sql(
+        f"CREATE OR REPLACE TEMP VIEW {tasks_view} AS "
+        f"{job_task_runs_from_system_sql(meta, since, recorded)}"
+    )
+    cols = ", ".join(JOB_RUN_COLUMNS)
+    spark.sql(f"INSERT INTO {meta}.job_runs SELECT {cols} FROM {runs_view}")
+    task_cols = ", ".join(TASK_RUN_COLUMNS)
+    spark.sql(f"INSERT INTO {meta}.job_task_runs SELECT {task_cols} FROM {tasks_view}")
+    count = _rows(spark.sql(f"SELECT count(*) AS n FROM {runs_view}"))
+    appended = int(count[0]["n"]) if count else 0
+    log.info("job runs: system.lakeflow appended %d run(s)", appended)
+    return appended
+
+
+def record_job_runs_from_api(
+    spark,
+    client,
+    catalog: str,
+    workflows: set[str],
+    since: datetime,
+    recorded: datetime,
+) -> int:
+    """Jobs API walk: list jobs, list_runs per job, get_run for still-RUNNING rows. Appends."""
+
+    meta = _meta(catalog)
     jobs = framework_jobs((job.as_dict() for job in client.jobs.list()), workflows)
     found = {name for name, _deployed in jobs.values()}
     for missing in sorted(workflows - found):
         log.warning(
             "job runs: no job tagged %s=%s is visible to this identity", WORKFLOW_TAG, missing
         )
-    since = _read_from(spark, f"{meta}.job_runs", recorded)
     log.info("job runs: reading runs that started since %s", since.isoformat())
     workspace_id = _text(client.get_workspace_id())
     runs: dict[str, dict] = {}
@@ -239,9 +455,17 @@ def record_job_runs(spark, client, catalog: str, now: datetime | None = None) ->
             tasks += task_rows
             count += 1
         log.info("job runs: %s (job %s, %s): %d run(s)", job_name, job_id, deployed, count)
-    # A run that started before the reread window and was still going last pass.
+    # Latest status per run — append table may hold older RUNNING rows after a later SUCCEEDED.
     for item in _rows(
-        spark.sql(f"SELECT job_id, run_id FROM {meta}.job_runs WHERE status = 'RUNNING'")
+        spark.sql(
+            f"""
+            SELECT job_id, run_id FROM (
+              SELECT job_id, run_id, status,
+                row_number() OVER (PARTITION BY job_id, run_id ORDER BY recorded_at DESC) AS rn
+              FROM {meta}.job_runs
+            ) WHERE rn = 1 AND status = 'RUNNING'
+            """
+        )
     ):
         run_id = _text(item["run_id"])
         job = jobs.get(_text(item["job_id"]))
@@ -252,19 +476,13 @@ def record_job_runs(spark, client, catalog: str, now: datetime | None = None) ->
         row, task_rows = job_run_rows(run, job[0], job[1], workspace_id, recorded)
         runs[run_id] = row
         tasks += task_rows
-    _merge(spark, f"{meta}.job_runs", list(runs.values()), JOB_RUN_COLUMNS, ("job_id", "run_id"))
-    _merge(
-        spark,
-        f"{meta}.job_task_runs",
-        tasks,
-        TASK_RUN_COLUMNS,
-        ("job_run_id", "task_run_id"),
-    )
+    _append(spark, f"{meta}.job_runs", list(runs.values()), JOB_RUN_COLUMNS)
+    _append(spark, f"{meta}.job_task_runs", tasks, TASK_RUN_COLUMNS)
     statuses = sorted({str(row["status"]) for row in runs.values()})
     for status in statuses:
         count = sum(1 for row in runs.values() if str(row["status"]) == status)
         log.info("job runs: %d %s", count, status)
-    log.info("job runs: merged %d run(s) and %d task run(s)", len(runs), len(tasks))
+    log.info("job runs: appended %d run(s) and %d task run(s)", len(runs), len(tasks))
     return len(runs)
 
 
@@ -278,67 +496,85 @@ def event_log_jobs(table_names: Iterable[str]) -> dict[str, str]:
     return logs
 
 
-def pipeline_updates_sql(meta: str, logs: Mapping[str, str], since: datetime) -> str:
-    """One row per pipeline update in every event log, from its update_progress events.
+def pipeline_updates_sql(events_table: str, job_name: str, since: datetime) -> str:
+    """One row per pipeline update in a single event log (one scan, no UNION ALL fan-in).
 
     An update with any event since ``since`` is read whole, so its start is not cut off.
+    Call once per log — Catalyst plans stay small at hundreds of pipelines.
     """
 
-    if not logs:
-        raise ValueError("no event logs")
+    if not _IDENTIFIER.match(job_name or ""):
+        raise ValueError("job name is required")
     cutoff = since.strftime("%Y-%m-%d %H:%M:%S")
-    reads = [
-        f"SELECT '{job}' AS job_name, origin.pipeline_id AS pipeline_id, "
-        f"origin.pipeline_name AS pipeline_name, origin.update_id AS update_id, "
-        f"timestamp AS event_at, details:update_progress.state::STRING AS state "
-        f"FROM {meta}.{log} "
-        f"WHERE event_type = 'update_progress' AND origin.update_id IN ("
-        f"SELECT origin.update_id FROM {meta}.{log} "
-        f"WHERE event_type = 'update_progress' AND timestamp >= TIMESTAMP '{cutoff}')"
-        for log, job in logs.items()
-        if _IDENTIFIER.match(job)
-    ]
-    events = " UNION ALL ".join(reads)
-    return (
-        "SELECT job_name, pipeline_id, max(pipeline_name) AS pipeline_name, update_id, "
-        "min(event_at) AS started_at, "
-        "CASE WHEN max_by(state, event_at) IN ('COMPLETED', 'FAILED', 'CANCELED') "
-        "THEN max(event_at) END AS ended_at, "
-        "max_by(state, event_at) AS state, "
-        "CASE max_by(state, event_at) WHEN 'COMPLETED' THEN 'SUCCEEDED' "
-        "WHEN 'FAILED' THEN 'FAILED' WHEN 'CANCELED' THEN 'CANCELED' ELSE 'RUNNING' END "
-        "AS status, "
-        "current_timestamp() AS recorded_at "
-        f"FROM ({events}) events "
-        "WHERE update_id IS NOT NULL "
-        "GROUP BY job_name, pipeline_id, update_id"
-    )
+    return f"""
+WITH marked AS (
+  SELECT
+    CAST('{job_name}' AS STRING) AS job_name,
+    origin.pipeline_id AS pipeline_id,
+    origin.pipeline_name AS pipeline_name,
+    origin.update_id AS update_id,
+    timestamp AS event_at,
+    details:update_progress.state::STRING AS state,
+    max(timestamp) OVER (PARTITION BY origin.update_id) AS latest_at
+  FROM {events_table}
+  WHERE event_type = 'update_progress' AND origin.update_id IS NOT NULL
+)
+SELECT
+  job_name,
+  pipeline_id,
+  max(pipeline_name) AS pipeline_name,
+  update_id,
+  min(event_at) AS started_at,
+  CASE WHEN max_by(state, event_at) IN ('COMPLETED', 'FAILED', 'CANCELED')
+    THEN max(event_at) END AS ended_at,
+  max_by(state, event_at) AS state,
+  CASE max_by(state, event_at) WHEN 'COMPLETED' THEN 'SUCCEEDED'
+    WHEN 'FAILED' THEN 'FAILED' WHEN 'CANCELED' THEN 'CANCELED' ELSE 'RUNNING' END AS status,
+  current_timestamp() AS recorded_at
+FROM marked
+WHERE latest_at >= TIMESTAMP '{cutoff}'
+GROUP BY job_name, pipeline_id, update_id
+"""
 
 
 def record_pipeline_updates(spark, catalog: str, now: datetime | None = None) -> int:
-    """Merge every pipeline update in the event logs into pipeline_updates. Returns the logs read."""
+    """Merge pipeline updates from each event log into pipeline_updates.
+
+    Event logs live in ``framework_events`` (not ``framework_meta``). Each log is merged on
+    its own so the plan never grows with UNION ALL across hundreds of pipelines.
+    """
+
+    from lakeflow_framework.metadata import EVENTS_SCHEMA
 
     meta = _meta(catalog)
-    recorded = (now or datetime.now(timezone.utc)).replace(microsecond=0)
-    names = [row["tableName"] for row in _rows(spark.sql(f"SHOW TABLES IN {meta}"))]
+    events = f"{catalog}.{EVENTS_SCHEMA}"
+    recorded = (now or datetime.now(UTC)).replace(microsecond=0)
+    names = [
+        str(row.get("tableName") or row.get("table_name") or "")
+        for row in _rows(spark.sql(f"SHOW TABLES IN {events}"))
+    ]
+    names = [name for name in names if name]
     logs = event_log_jobs(names)
     if not logs:
-        log.info("pipeline updates: no <job>_event_log table in %s yet", meta)
+        log.info("pipeline updates: no <job>_event_log table in %s yet", events)
         return 0
     log.info("pipeline updates: event logs %s", ", ".join(sorted(logs)))
     since = _read_from(spark, f"{meta}.pipeline_updates", recorded)
     log.info("pipeline updates: reading updates since %s", since.isoformat())
-    source = pipeline_updates_sql(meta, logs, since)
-    spark.sql(
-        _merge_sql(
-            f"{meta}.pipeline_updates",
-            source,
-            ("pipeline_id", "update_id"),
-            PIPELINE_UPDATE_COLUMNS,
+    merged = 0
+    for table_name, job in sorted(logs.items()):
+        source = pipeline_updates_sql(f"{events}.{table_name}", job, since)
+        spark.sql(
+            _merge_sql(
+                f"{meta}.pipeline_updates",
+                source,
+                ("pipeline_id", "update_id"),
+                PIPELINE_UPDATE_COLUMNS,
+            )
         )
-    )
-    log.info("pipeline updates: merged the updates from %d event log(s)", len(logs))
-    return len(logs)
+        merged += 1
+    log.info("pipeline updates: merged the updates from %d event log(s)", merged)
+    return merged
 
 
 def _read_from(spark, table: str, now: datetime) -> datetime:
@@ -347,15 +583,18 @@ def _read_from(spark, table: str, now: datetime) -> datetime:
     if latest is None:
         return now - FIRST_LOOKBACK
     if latest.tzinfo is None:
-        latest = latest.replace(tzinfo=timezone.utc)
+        latest = latest.replace(tzinfo=UTC)
     return latest - REREAD
 
 
-def _merge(spark, table: str, rows: list[dict], columns: tuple, keys: tuple) -> None:
+def _append(spark, table: str, rows: list[dict], columns: tuple) -> None:
+    """Insert rows; duplicates are fine — the matching v_* view keeps the latest recorded_at."""
+
     if not rows:
         return
-    from lakeflow_framework.spark_types import types_module
+    from lakeflow_framework.spark_types import require_writer, types_module
 
+    writer = require_writer(spark)
     t = types_module()
 
     def kind(column: str):
@@ -372,28 +611,17 @@ def _merge(spark, table: str, rows: list[dict], columns: tuple, keys: tuple) -> 
         if t is not None
         else None
     )
-    view = "_framework_" + table.rsplit(".", 1)[-1]
-    spark.createDataFrame(
-        [[row[c] for c in columns] for row in rows], schema
-    ).createOrReplaceTempView(view)
-    # A run listed twice in one pass would fail the MERGE, so each key is kept once.
-    source = (
-        f"SELECT * FROM {view} QUALIFY row_number() OVER "
-        f"(PARTITION BY {', '.join(keys)} ORDER BY recorded_at DESC) = 1"
-    )
-    spark.sql(_merge_sql(table, source, keys, columns))
+    writer.createDataFrame([[row[c] for c in columns] for row in rows], schema).write.mode(
+        "append"
+    ).saveAsTable(table)
 
 
 def _merge_sql(table: str, source: str, keys: tuple, columns: tuple) -> str:
-    on = " AND ".join(f"t.{key} = s.{key}" for key in keys)
-    assignments = ", ".join(f"t.{column} = s.{column}" for column in columns)
-    names = ", ".join(columns)
-    values = ", ".join(f"s.{column}" for column in columns)
-    return (
-        f"MERGE INTO {table} t USING ({source}) s ON {on} "
-        f"WHEN MATCHED THEN UPDATE SET {assignments} "
-        f"WHEN NOT MATCHED THEN INSERT ({names}) VALUES ({values})"
-    )
+    """MERGE helper kept for pipeline_updates (single writer, still upserted)."""
+
+    from lakeflow_framework.sqlnames import merge_sql
+
+    return merge_sql(table, source, keys, columns, dedupe_source=True)
 
 
 def _state(run: Mapping[str, Any]) -> tuple[str | None, str | None, str | None]:
@@ -434,7 +662,7 @@ def _meta(catalog: str) -> str:
 def _instant(millis: Any) -> datetime | None:
     if not millis:
         return None
-    return datetime.fromtimestamp(int(millis) / 1000, tz=timezone.utc)
+    return datetime.fromtimestamp(int(millis) / 1000, tz=UTC)
 
 
 def _millis(instant: datetime) -> int:
@@ -452,5 +680,6 @@ def _text(value: Any) -> str | None:
 
 
 def _rows(frame: Any) -> list[dict[str, Any]]:
-    collected = frame.collect() if hasattr(frame, "collect") else list(frame)
-    return [row if isinstance(row, dict) else row.asDict() for row in collected]
+    from lakeflow_framework.sqlnames import spark_rows
+
+    return spark_rows(frame)

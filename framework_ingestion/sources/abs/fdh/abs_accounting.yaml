@@ -1,8 +1,10 @@
+# yaml-language-server: $schema=../../../../.schemas/table-spec.v1.json
 # ABS GL and accounting extract: CSV from an abs raw volume to bronze.
 # Not written here, because ../source.yaml and the folder already say it: domain, layer, the raw
 # schema (abs_raw), delivery and job (abs_daily), requested_by and team (fdh). Set one here only
 # to override it.
 
+spec_version: 1
 pipeline_id: abs_accounting          # must start with the source system name: abs_
 data_domain: gl_accounting           # identifier: letters, digits, underscore
 
