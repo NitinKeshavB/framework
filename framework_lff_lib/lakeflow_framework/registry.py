@@ -194,9 +194,14 @@ def retire_definitions(
         raise ValueError("a deploy with no definitions cannot retire anything")
     if spark is None or not hasattr(spark, "createDataFrame"):
         return
-    from pyspark.sql.types import StringType, StructField, StructType
+    from lakeflow_framework.spark_types import types_module
 
-    schema = StructType([StructField(key, StringType(), False) for key in OBJECT_KEYS])
+    t = types_module()
+    schema = (
+        t.StructType([t.StructField(key, t.StringType(), False) for key in OBJECT_KEYS])
+        if t is not None
+        else None
+    )
     rows = [dict(zip(OBJECT_KEYS, key)) for key in keys]
     spark.createDataFrame(rows, schema).createOrReplaceTempView("_framework_deployed")
     gone = _rows(
@@ -457,13 +462,18 @@ def _stage(
 ) -> str:
     """Register ``rows`` as a string-typed view and return the SELECT that types them."""
 
-    from pyspark.sql.types import StringType, StructField, StructType
+    from lakeflow_framework.spark_types import types_module
 
     string_rows = [
         {column: None if row.get(column) is None else str(row.get(column)) for column in columns}
         for row in rows
     ]
-    schema = StructType([StructField(column, StringType(), True) for column in columns])
+    t = types_module()
+    schema = (
+        t.StructType([t.StructField(column, t.StringType(), True) for column in columns])
+        if t is not None
+        else None
+    )
     spark.createDataFrame(string_rows, schema).createOrReplaceTempView(view)
     select = ", ".join(
         [_cast(column, timestamp_columns, date_columns, int_columns) for column in columns]

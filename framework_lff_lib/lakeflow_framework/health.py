@@ -120,27 +120,25 @@ def record_table_health(spark, catalog: str) -> int:
 
 
 def _schema():
-    from pyspark.sql.types import (
-        DateType,
-        LongType,
-        MapType,
-        StringType,
-        StructField,
-        StructType,
-        TimestampType,
-    )
+    from lakeflow_framework.spark_types import types_module
 
+    t = types_module()
+    if t is None:
+        return None
     types = {
-        "num_files": LongType(),
-        "size_in_bytes": LongType(),
-        "last_version": LongType(),
-        "last_commit_at": TimestampType(),
-        "last_operation_metrics": MapType(StringType(), StringType()),
-        "recorded_at": TimestampType(),
-        "event_date": DateType(),
+        "num_files": t.LongType(),
+        "size_in_bytes": t.LongType(),
+        "last_version": t.LongType(),
+        "last_commit_at": t.TimestampType(),
+        "last_operation_metrics": t.MapType(t.StringType(), t.StringType()),
+        "recorded_at": t.TimestampType(),
+        "event_date": t.DateType(),
     }
-    return StructType(
-        [StructField(column, types.get(column, StringType()), True) for column in HEALTH_COLUMNS]
+    return t.StructType(
+        [
+            t.StructField(column, types.get(column, t.StringType()), True)
+            for column in HEALTH_COLUMNS
+        ]
     )
 
 

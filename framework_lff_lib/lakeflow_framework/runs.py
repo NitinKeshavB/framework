@@ -354,16 +354,24 @@ def _read_from(spark, table: str, now: datetime) -> datetime:
 def _merge(spark, table: str, rows: list[dict], columns: tuple, keys: tuple) -> None:
     if not rows:
         return
-    from pyspark.sql.types import DoubleType, StringType, StructField, StructType, TimestampType
+    from lakeflow_framework.spark_types import types_module
+
+    t = types_module()
 
     def kind(column: str):
+        if t is None:
+            return None
         if column in _TIMESTAMPS:
-            return TimestampType()
+            return t.TimestampType()
         if column in _SECONDS:
-            return DoubleType()
-        return StringType()
+            return t.DoubleType()
+        return t.StringType()
 
-    schema = StructType([StructField(column, kind(column), True) for column in columns])
+    schema = (
+        t.StructType([t.StructField(column, kind(column), True) for column in columns])
+        if t is not None
+        else None
+    )
     view = "_framework_" + table.rsplit(".", 1)[-1]
     spark.createDataFrame(
         [[row[c] for c in columns] for row in rows], schema
