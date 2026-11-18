@@ -25,8 +25,9 @@ def test_ddl_text_ships_as_package_data():
     assert "CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.run_ledger" not in text
 
 
-def test_jobs_default_to_standard_performance_and_pinned_wheel_version():
-    assert PERFORMANCE_TARGET == "STANDARD"
+def test_jobs_default_to_performance_target_and_pinned_wheel_version():
+    # TEMPORARY until go-live: PERFORMANCE_OPTIMIZED. Back to "STANDARD" at go-live.
+    assert PERFORMANCE_TARGET == "PERFORMANCE_OPTIMIZED"
     assert PACKAGE_VERSION == "0.1.0"
 
 

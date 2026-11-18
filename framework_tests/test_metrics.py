@@ -64,7 +64,8 @@ def test_ops_bundle_wires_ddl_system_views_runs_and_archive():
     assert views["spark_python_task"]["parameters"][1].endswith("sql/system_views.sql")
     bundle = yaml.safe_load((BUNDLE / "databricks.yml").read_text("utf-8"))
     assert bundle["variables"]["system_views"]["default"] == "false"
-    assert bundle["targets"]["prod"]["variables"]["catalog"] == "aal_prod_fdh"
+    # TEMPORARY: prod target uses the dev catalog until go-live; back to aal_prod_fdh then.
+    assert bundle["targets"]["prod"]["variables"]["catalog"] == "aal_dev_fdh"
     runs = {task["task_key"]: task for task in jobs["framework_runs"]["tasks"]}
     assert set(runs) == {"job_runs", "pipeline_updates"}
     for part, task in runs.items():
