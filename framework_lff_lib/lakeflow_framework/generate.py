@@ -247,7 +247,7 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
                 "task_key": "batch_load",
                 "environment_key": "framework_env",
                 "spark_python_task": {
-                    "python_file": "../src/run_batch.py",
+                    "python_file": "../../src/run_batch.py",
                     "parameters": ["--catalog", "${var.catalog}", *batch_paths],
                 },
             }
@@ -265,7 +265,7 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
             "run_if": "ALL_DONE",
             "environment_key": "framework_env",
             "spark_python_task": {
-                "python_file": "../src/record_load_metrics.py",
+                "python_file": "../../src/record_load_metrics.py",
                 "parameters": ["${var.catalog}", name, "bronze", "{{job.run_id}}"],
             },
         }
@@ -278,7 +278,7 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
             "run_if": "ALL_DONE",
             "environment_key": "framework_env",
             "spark_python_task": {
-                "python_file": "../src/record_this_run.py",
+                "python_file": "../../src/record_this_run.py",
                 "parameters": ["${var.catalog}", name, "{{job.run_id}}"],
             },
         }

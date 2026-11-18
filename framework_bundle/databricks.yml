@@ -44,3 +44,5 @@ targets:
     permissions:
       - group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
         level: CAN_MANAGE
+      - user_name: adm_ye9z286@allianzms.onmicrosoft.com
+        level: CAN_MANAGE

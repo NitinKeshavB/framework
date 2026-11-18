@@ -12,6 +12,13 @@ include:
   - resources/*.yml
   - .build/resources/*.yml
 
+# .build/ is gitignored, and bundle sync skips gitignored files. The generated pipeline entrypoints
+# and delivery manifests are read from the workspace at run time, so upload them explicitly.
+sync:
+  include:
+    - .build/pipelines/*.py
+    - .build/manifests/*.json
+
 # Same artifact as the framework bundle. Prefer a UC-volume wheel once published once per
 # wave (see ROADMAP); until then each bundle rebuilds from framework_lff_lib.
 artifacts:
@@ -45,4 +52,6 @@ targets:
     # Prefer groups over personal user_name entries.
     permissions:
       - group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer
+        level: CAN_MANAGE
+      - user_name: adm_ye9z286@allianzms.onmicrosoft.com
         level: CAN_MANAGE

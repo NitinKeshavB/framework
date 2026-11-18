@@ -179,6 +179,26 @@ def bundle_configs(spark: Any) -> dict[str, PipelineConfig] | None:
     return configured
 
 
+def _with_catalog(value: Any, catalog: str) -> Any:
+    """Swap the build-time placeholder catalog for the environment's in a manifest document.
+
+    The manifest is generated once, before the target is known, so volume paths carry
+    ``/Volumes/<PLACEHOLDER_CATALOG>/...``. Overriding only the top-level ``catalog`` key would
+    leave the raw read pointed at the placeholder catalog.
+    """
+
+    from lakeflow_framework.sources import PLACEHOLDER_CATALOG
+
+    prefix = f"/Volumes/{PLACEHOLDER_CATALOG}/"
+    if isinstance(value, str):
+        return f"/Volumes/{catalog}/{value[len(prefix) :]}" if value.startswith(prefix) else value
+    if isinstance(value, dict):
+        return {key: _with_catalog(item, catalog) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_with_catalog(item, catalog) for item in value]
+    return value
+
+
 def _configs_from_manifest(path: Path, catalog: str | None) -> dict[str, PipelineConfig]:
     import json
 
@@ -195,7 +215,7 @@ def _configs_from_manifest(path: Path, catalog: str | None) -> dict[str, Pipelin
             log.error("%s: malformed pipeline entry; skipping", path)
             continue
         if catalog:
-            document = {**document, "catalog": catalog}
+            document = {**_with_catalog(document, catalog), "catalog": catalog}
         try:
             configured[pipeline_id] = config_from_document(document)
         except ConfigValidationError as exc:
