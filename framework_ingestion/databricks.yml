@@ -39,7 +39,7 @@ targets:
       host: https://adb-1864378597730899.19.azuredatabricks.net/
       root_path: /Workspace/Shared/aztech_ingestion
     variables:
-      catalog: aal_prod_fdh
+      catalog: aal_dev_fdh
     presets:
       name_prefix: '[fdh] '
     # Prefer groups over personal user_name entries.

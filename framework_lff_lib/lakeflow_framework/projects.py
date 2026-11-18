@@ -170,7 +170,7 @@ targets:
       host: https://adb-<prod-workspace-id>.azuredatabricks.net
       root_path: /Workspace/Shared/aztech_{project}
     variables:
-      catalog: aal_prod_fdh
+      catalog: aal_dev_fdh
 """
 
 
