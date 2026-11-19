@@ -29,7 +29,13 @@ class Frame:
 
 class Spark:
     def __init__(
-        self, *, missing=(UPDATE_ID,), batches=("batch-1",), recorded=(), registered=True, later=False
+        self,
+        *,
+        missing=(UPDATE_ID,),
+        batches=("batch-1",),
+        recorded=(),
+        registered=True,
+        later=False,
     ):
         self.missing, self.batches, self.recorded, self.registered = (
             missing,
@@ -93,7 +99,11 @@ def test_an_update_with_no_ledger_row_is_replayed_and_written() -> None:
     spark = Spark()
     assert catch_up_loads(spark, "aal_dev_fdh") == 1
     (row,) = _ledger(spark)
-    assert (row["job_name"], row["dataflow"], row["update_id"]) == ("abs_daily", "abs_accounting", "u-1")
+    assert (row["job_name"], row["dataflow"], row["update_id"]) == (
+        "abs_daily",
+        "abs_accounting",
+        "u-1",
+    )
     # The same numbers the hook would have written for these events.
     assert (row["rows_read"], row["rows_written"], row["rows_quarantine"]) == (100, 90, 10)
     assert row["target_status"] == "COMPLETED" and row["failure_reason"] is None
@@ -136,4 +146,6 @@ def test_a_job_with_nothing_registered_and_an_unsafe_id_are_skipped() -> None:
     assert catch_up_loads(Spark(registered=False), "aal_dev_fdh") == 0
     spark = Spark(missing=("x'; DROP TABLE y; --",))
     assert catch_up_loads(spark, "aal_dev_fdh") == 0
-    assert not any("DROP TABLE" in statement and "to_json" in statement for statement in spark.statements)
+    assert not any(
+        "DROP TABLE" in statement and "to_json" in statement for statement in spark.statements
+    )

@@ -64,6 +64,12 @@ _RULE_KEYWORDS = frozenset(
         "try_cast",
     }
 )
+# A rule cannot end on one of these: something has to follow.
+_RULE_OPEN_ENDS = frozenset(
+    {"and", "or", "not", "is", "in", "between", "like", "rlike", "regexp", "case", "when", "then",
+     "else", "as", "cast", "try_cast"}
+)  # fmt: skip
+_RULE_OPERATORS = frozenset({"=", "<", ">", "<=", ">=", "<>", "!=", "+", "-", "*", "/", "%", ","})
 _RULE_FUNCTIONS = frozenset(
     {
         "abs",
@@ -151,6 +157,8 @@ def assert_safe_rule_expression(
         return
     allowed = {column.lower() for column in columns} | _RULE_KEYWORDS | _RULE_FUNCTIONS
     position = 0
+    depth = 0
+    last = ""
     while position < len(expression):
         match = _RULE_TOKEN.match(expression, position)
         if match is None:
@@ -160,7 +168,17 @@ def assert_safe_rule_expression(
             return
         token = match.group(0)
         position = match.end()
-        if token.isspace() or token[:1] in "'\"`0.=<>+-*/%(),." or token[:1].isdigit():
+        if token.isspace():
+            continue
+        last = token.lower()
+        if last == "(":
+            depth += 1
+        elif last == ")":
+            depth -= 1
+            if depth < 0:
+                errors.append(f"{label}: rule '{name}' has a ')' with no '(' before it")
+                return
+        if token[:1] in "'\"`0.=<>+-*/%(),." or token[:1].isdigit():
             continue
         if token.lower() not in allowed:
             errors.append(
@@ -168,6 +186,10 @@ def assert_safe_rule_expression(
                 f"literals, and approved functions (unknown {token!r})"
             )
             return
+    if depth:
+        errors.append(f"{label}: rule '{name}' has a '(' that is never closed")
+    elif last in _RULE_OPEN_ENDS or last in _RULE_OPERATORS:
+        errors.append(f"{label}: rule '{name}' ends in the middle of a condition (after {last!r})")
 
 
 def compile_rules(config: PipelineConfig) -> list[CompiledRule]:

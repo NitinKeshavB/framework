@@ -62,9 +62,7 @@ def _event_logs(spark: Any, events: str) -> list[str]:
     return sorted(name for name in names if name.endswith(EVENT_LOG_SUFFIX))
 
 
-def _catch_up_job(
-    spark: Any, catalog: str, meta: str, event_log: str, job: str, days: int
-) -> int:
+def _catch_up_job(spark: Any, catalog: str, meta: str, event_log: str, job: str, days: int) -> int:
     dataflows = _dataflows(spark, meta, job)
     if not dataflows:
         return 0

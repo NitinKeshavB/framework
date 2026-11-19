@@ -127,6 +127,20 @@ function generate:check {
     "$PYTHON" -m lakeflow_framework.cli generate "$THIS_DIR/framework_ingestion" --check
 }
 
+# run every quality rule of every spec on a SQL warehouse, before deploying. generate only reads a
+# rule as text; this catches a regex that does not compile, a wrong argument count, and the like.
+# With a catalog it also counts the rows each rule would send to quarantine in that catalog's tables.
+#   ./run.sh check:rules <databricks-profile> <warehouse-id> [catalog]
+function check:rules {
+    local profile="${1:?usage: ./run.sh check:rules <databricks-profile> <warehouse-id> [catalog]}"
+    local warehouse="${2:?usage: ./run.sh check:rules <databricks-profile> <warehouse-id> [catalog]}"
+    local catalog_args=()
+    [ -n "${3:-}" ] && catalog_args=(--catalog "$3")
+    _require-package
+    "$PYTHON" -m lakeflow_framework.cli check-rules "$THIS_DIR/framework_ingestion" \
+        --profile "$profile" --warehouse "$warehouse" "${catalog_args[@]}"
+}
+
 # validate a bundle: ./run.sh bundle:validate <bundle> <target> [databricks-profile]
 # <bundle> is a folder with a databricks.yml: framework_bundle, framework_ingestion, or
 # framework_curation/<domain>/<project>

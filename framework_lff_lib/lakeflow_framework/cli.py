@@ -43,6 +43,16 @@ def main(argv: list[str] | None = None) -> int:
         "--check", action="store_true", help="change nothing; fail if generated files are stale"
     )
 
+    check_rules = commands.add_parser(
+        "check-rules", help="run every quality rule on a SQL warehouse before deploying"
+    )
+    check_rules.add_argument("bundle", type=Path, help="ingestion bundle folder holding sources/")
+    check_rules.add_argument("--warehouse", required=True, help="SQL warehouse id to run on")
+    check_rules.add_argument("--profile", help="Databricks CLI profile")
+    check_rules.add_argument(
+        "--catalog", help="also count the rows each rule would quarantine in this catalog's tables"
+    )
+
     projects = commands.add_parser("projects")
     projects.add_argument("action", choices=["generate", "new"])
     projects.add_argument("root", type=Path, help="the curation folder, framework_curation")
@@ -126,6 +136,25 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print(f"updated {', '.join(stale)}" if stale else "generated files are up to date")
             return 0
+        if args.command == "check-rules":
+            from lakeflow_framework.rule_check import check_rules, databricks_cli, format_results
+            from lakeflow_framework.sources import load_sources
+
+            run = databricks_cli(args.profile, args.warehouse)
+            failed = checked = 0
+            for system in load_sources(args.bundle, catalog=args.catalog):
+                for table in system.tables:
+                    config = table.config
+                    if not config.rules:
+                        continue
+                    bronze = config.table_name("bronze") if args.catalog else None
+                    results = check_rules(run, config, table=bronze)
+                    print(f"{system.name}/{table.path.name}: {len(results)} rule(s)")
+                    print("\n".join(format_results(results)))
+                    checked += len(results)
+                    failed += sum(1 for result in results if result.error)
+            print(f"{checked} rule(s) checked, {failed} with an error")
+            return 1 if failed else 0
         if args.command == "apply-metadata":
             from pyspark.sql import SparkSession
 

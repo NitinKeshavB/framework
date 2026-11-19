@@ -93,6 +93,21 @@ raw_to_bronze:
 
 `delete_when` is a SQL condition over the table's columns and only works with `scd1`. A file load with no `delete_when` never removes a row.
 
+## Quality rules and quarantine
+
+`raw_to_bronze.rules` holds SQL conditions every good row must meet. A row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantine` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.
+
+```yaml
+raw_to_bronze:
+  rules:
+    - { name: ride_id_present, expression: "ride_id IS NOT NULL AND length(trim(ride_id)) > 0" }
+    - { name: ride_id_format,  expression: "ride_id rlike '^[0-9A-Fa-f]{16}$'" }      # regex, anchored
+    - { name: bike_type_known, expression: "rideable_type IN ('classic_bike', 'electric_bike')" }
+    - { name: ended_after_start, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
+```
+
+`rlike` matches anywhere in the value, so anchor a pattern with `^` and `$`, and write `[0-9]` instead of `\d`: a single backslash is dropped silently. `./run.sh generate` reads a rule as text. It catches an unknown column, an unapproved function, an unclosed bracket or a half-written condition, but not a regex that does not compile or a function with the wrong arguments, which would fail the whole update at load time. Run **`./run.sh check:rules <profile> <warehouse-id> [catalog]`** before a deploy that changes a rule: it evaluates every rule on a warehouse, and with a catalog also counts the rows each would quarantine. **[QUALITY_RULES.md](QUALITY_RULES.md)** has the regex guide, a copyable pattern list, every kind of check you can add (presence, length, allowed values, numbers, dates, across columns, conditional), the approved functions, the checks that are on by default, what a rule cannot do, how to test a rule against existing data before deploying, and where the results show up. `abs_gl.yaml` has a full example with two rules per column.
+
 ## Audit columns
 
 Every bronze and quarantine table carries the same audit columns. They need no setting and are not part of the data, so they are left out of the row hash and never open an SCD2 version.
