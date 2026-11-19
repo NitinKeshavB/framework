@@ -203,32 +203,13 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     generate(bundle)
     source = (bundle / BUILD_DIR / "pipelines" / "billing_daily.py").read_text("utf-8")
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
-    # Refresh, then metrics even on failure, then NRT job status.
-    assert [task["task_key"] for task in _job(bundle)["tasks"]] == [
-        "refresh_pipeline",
-        "record_load_metrics",
-        "record_this_run",
-    ]
+    # Only the refresh: the pipeline records its own counts, status, and errors (an event hook),
+    # and framework_runs records the job runs.
+    assert [task["task_key"] for task in _job(bundle)["tasks"]] == ["refresh_pipeline"]
     job = _job(bundle)
     assert "run_as" not in job
     assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
-    assert job["environments"]
-    metrics = _tasks(bundle)["record_load_metrics"]
-    assert metrics["depends_on"] == [{"task_key": "refresh_pipeline"}]
-    assert metrics["run_if"] == "ALL_DONE"
-    assert metrics["spark_python_task"]["parameters"] == [
-        "${var.catalog}",
-        "billing_daily",
-        "bronze",
-        "{{job.run_id}}",
-    ]
-    this_run = _tasks(bundle)["record_this_run"]
-    assert this_run["run_if"] == "ALL_DONE"
-    assert this_run["spark_python_task"]["parameters"] == [
-        "${var.catalog}",
-        "billing_daily",
-        "{{job.run_id}}",
-    ]
+    assert "environments" not in job  # nothing in the job runs Python
     settings = _settings(bundle)
     assert "lff.manifest" in settings
     assert settings["lff.manifest"].endswith(f"{BUILD_DIR}/manifests/billing_daily.json")
@@ -407,7 +388,8 @@ def test_a_finished_scaffold_generates(tmp_path: Path) -> None:
     for path in folder.rglob("*.yaml"):
         text = path.read_text("utf-8").replace("TODO_column_name", "event_id")
         text = text.replace("TODO_volume", "landing")  # the table names its own volume
-        path.write_text(text.replace("TODO describe the column", "Event identifier"), "utf-8")
+        text = text.replace("TODO describe the column", "Event identifier")
+        path.write_text(text.replace("TODO describe the table", "Order events"), "utf-8")
     assert f"{BUILD_DIR}/resources/orders_hourly.job.yml" in generate(tmp_path)
 
 

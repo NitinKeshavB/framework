@@ -91,8 +91,8 @@ Query `<catalog>.framework_meta`:
 | `v_source_systems`, `v_schemas` | Each source system as `source.yaml` declares it, and the schemas it uses with their tags. |
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
-| `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` (NRT via `record_this_run`; hourly `framework_runs` is catch-up only) |
-| `v_loads`, `v_load_failures` | Per-load recon and failures (NRT via `record_load_metrics` on every delivery job) |
+| `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` (written by the hourly `framework_runs` job, which also records runs that never reached the pipeline) |
+| `v_loads`, `v_load_failures` | Per-load recon and failures, written by the pipeline itself once per update (an event hook): rows read, written, upserted, deleted, quarantined, status, and the error. `batch_id` joins a row to its load |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 | `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
 | `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations (NRT + hourly catch-up) |

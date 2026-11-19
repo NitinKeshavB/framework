@@ -28,7 +28,7 @@ def test_ddl_text_ships_as_package_data():
 def test_jobs_default_to_performance_target_and_pinned_wheel_version():
     # TEMPORARY until go-live: PERFORMANCE_OPTIMIZED. Back to "STANDARD" at go-live.
     assert PERFORMANCE_TARGET == "PERFORMANCE_OPTIMIZED"
-    assert PACKAGE_VERSION == "0.1.0"
+    assert PACKAGE_VERSION == "0.1.8"
 
 
 def test_sql_string_doubles_quotes_not_backslashes():

@@ -10,6 +10,44 @@ from lakeflow_framework.logs import job_logging, statement_summary, step
 from lakeflow_framework.registry import apply_ddl
 
 
+@pytest.fixture(autouse=True)
+def _restore_framework_logger():
+    """job_logging() changes the package logger for the whole process. Undo it after each test,
+    or caplog (a root-logger handler) stops seeing the package's records."""
+
+    package = logging.getLogger("lakeflow_framework")
+    handlers, level, propagate = list(package.handlers), package.level, package.propagate
+    yield
+    package.handlers[:] = handlers
+    package.setLevel(level)
+    package.propagate = propagate
+
+
+def test_apply_ddl_skips_a_column_that_is_already_there_but_not_other_errors() -> None:
+    class Spark:
+        def __init__(self, failure: str):
+            self.failure, self.ran = failure, []
+
+        def sql(self, statement):
+            if statement.startswith("SELECT 1 FROM"):
+                return []
+            self.ran.append(statement)
+            if statement.startswith("ALTER"):
+                raise RuntimeError(self.failure)
+            return []
+
+    text = "ALTER TABLE t ADD COLUMN batch_id STRING AFTER recorded_at;\nCREATE TABLE b (x INT)"
+    again = Spark("[FIELD_ALREADY_EXISTS] Cannot add column, because `batch_id` already exists")
+    assert apply_ddl(again, "framework_dev", text) == 2
+    # The failed ALTER is skipped and the statement after it still runs.
+    assert [s for s in again.ran if not s.startswith("INSERT")] == [
+        "ALTER TABLE t ADD COLUMN batch_id STRING AFTER recorded_at",
+        "CREATE TABLE b (x INT)",
+    ]
+    with pytest.raises(RuntimeError, match="permission denied"):
+        apply_ddl(Spark("permission denied"), "framework_dev", text)
+
+
 def test_job_logging_adds_one_handler_however_often_it_is_called(capsys) -> None:
     log = job_logging("example")
     job_logging("example")

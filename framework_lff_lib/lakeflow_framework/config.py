@@ -24,6 +24,39 @@ FROZEN_METHODS = ("autoloader", "copy_into", "ctas")
 FILE_EVENT_METHODS = ("autoloader", "volume_files")
 # Liquid clustering takes up to four keys, and none of these types.
 MAX_CLUSTER_KEYS = 4
+# How bronze takes its rows. The audit columns a table carries depend on this.
+LOAD_TYPES = ("insert_only", "scd1", "scd2", "full_refresh")
+MAX_DESCRIPTION_CHARS = 1024
+
+# Audit columns the pipeline adds to bronze and quarantine. They are not data, so none of them
+# goes into the row hash.
+SRC_FILE_PATH = "_src_file_path"
+SRC_FILE_NAME = "_src_file_name"
+SRC_ROW_HASH = "_src_row_hash"
+BATCH_ID = "_batch_id"
+INGEST_TIMESTAMP = "_ingest_timestamp"
+IS_DELETED = "_is_deleted"
+RESCUED_DATA = "_rescued_data"
+LINEAGE_COLUMNS = frozenset(
+    {
+        SRC_FILE_PATH,
+        SRC_FILE_NAME,
+        SRC_ROW_HASH,
+        BATCH_ID,
+        INGEST_TIMESTAMP,
+        IS_DELETED,
+        RESCUED_DATA,
+    }
+)
+AUDIT_COLUMN_DESCRIPTIONS = {
+    SRC_FILE_PATH: "Full path of the source file this row was read from",
+    SRC_FILE_NAME: "Name of the source file this row was read from",
+    SRC_ROW_HASH: "SHA-256 of the row's data columns, to tell whether a row's content changed",
+    BATCH_ID: "Identifier of the pipeline run that wrote this row; joins load_ledger.batch_id",
+    INGEST_TIMESTAMP: "When the pipeline wrote this row; silver reads rows newer than its last run",
+    IS_DELETED: "True when the source no longer has this row. The row is kept, not removed",
+    RESCUED_DATA: "Values that did not fit the declared columns, as JSON",
+}
 # Pipeline configuration keys. Prefer one compiled manifest (lff.manifest); lff.specs remains
 # as a comma-joined fallback for older deploys. Catalog is the environment catalog.
 SPECS_SETTING = "lff.specs"
@@ -168,6 +201,10 @@ class PipelineConfig:
     json_multiline: bool = False
     file_events: bool = False
     cluster_by: list[str] = field(default_factory=list)
+    load_type: str = "insert_only"
+    delete_when: str | None = None
+    description: str = ""
+    quarantine_description: str = ""
     job_name: str | None = None
     domain: str = ""
     data_domain: str = ""
@@ -203,7 +240,31 @@ class PipelineConfig:
 
     @property
     def uses_auto_cdc(self) -> bool:
-        return self.dedup or (self.load_method == "database_table" and self.source_mode == "merge")
+        return (
+            self.dedup
+            or self.load_type in {"scd1", "scd2"}
+            or (self.load_method == "database_table" and self.source_mode == "merge")
+            or self.soft_deletes_rows
+        )
+
+    @property
+    def soft_deletes_rows(self) -> bool:
+        """A database snapshot with keys keeps a key that left the source, closed, not deleted.
+
+        Without keys there is nothing to follow a row by, so the table is replaced each run.
+        """
+
+        return (
+            self.load_method == "database_table"
+            and self.load_type == "full_refresh"
+            and bool(self.primary_keys)
+        )
+
+    @property
+    def scd_type(self) -> int:
+        """1 keeps the latest row per key. 2 keeps every version, and closes a removed key."""
+
+        return 2 if self.load_type == "scd2" or self.soft_deletes_rows else 1
 
     @property
     def sequence_type(self) -> str | None:
@@ -310,6 +371,10 @@ class PipelineConfig:
         _put(document["raw_to_bronze"], "watermark_column", self.watermark_column)
         if self.cluster_by:
             document["raw_to_bronze"]["bronze"]["cluster_by"] = list(self.cluster_by)
+        document["raw_to_bronze"]["load_type"] = self.load_type
+        _put(document["raw_to_bronze"], "delete_when", self.delete_when)
+        _put(document, "description", self.description or None)
+        _put(document["quarantine"], "description", self.quarantine_description or None)
         return document
 
     def content_hash(self) -> str:
@@ -723,6 +788,11 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
     )
 
     dedup = bool(raw_to_bronze.get("dedup", False))
+    load_type = _load_type(
+        raw_to_bronze.get("load_type"), dedup, is_database, source_mode, label, errors
+    )
+    # scd1 and scd2 file loads are the dedup path: they upsert on primary_keys by watermark_column.
+    dedup = dedup or (not is_database and load_type in {"scd1", "scd2"})
     primary_keys = _name_list(raw_to_bronze.get("primary_keys"), "primary_keys", label, errors)
     watermark = raw_to_bronze.get("watermark_column")
     if watermark is not None and not IDENTIFIER.match(str(watermark)):
@@ -749,7 +819,7 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         | {column.name for column in fixed_columns}
         | set(primary_keys)
         | ({str(watermark)} if watermark else set())
-        | {"_source_file", "_ingested_at", "_rescued_data"}
+        | LINEAGE_COLUMNS
     )
     rules = _rules(
         raw_to_bronze.get("rules"),
@@ -758,6 +828,13 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         columns=rule_columns,
     )
     cluster_by = _cluster_by(bronze_target.get("cluster_by"), columns, label, errors)
+    delete_when = _delete_when(
+        raw_to_bronze.get("delete_when"), load_type, rule_columns, label, errors
+    )
+    description = _description(document.get("description"), "description", label, errors)
+    quarantine_description = _description(
+        quarantine.get("description"), "quarantine.description", label, errors
+    )
 
     if (
         errors
@@ -814,6 +891,10 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         json_multiline=file_options.json_multiline if file_options else False,
         file_events=file_options.file_events if file_options else False,
         cluster_by=cluster_by,
+        load_type=load_type,
+        delete_when=delete_when,
+        description=description,
+        quarantine_description=quarantine_description,
         job_name=_optional_text(document.get("job_name")),
         domain=domain,
         data_domain=data_domain,
@@ -1315,6 +1396,68 @@ def _columns(value: Any, defaults: TableTags | None, label: str, errors: list[st
         classification, pii = _column_tags(item, name, defaults, label, errors)
         columns.append(Column(name, type_name, description, classification, pii))
     return columns
+
+
+def _load_type(
+    value: Any, dedup: bool, is_database: bool, source_mode: str, label: str, errors: list[str]
+) -> str:
+    """How bronze takes its rows. Derived from the older ``dedup`` and ``source.mode`` settings
+    when ``raw_to_bronze.load_type`` is not given, so existing specs keep their meaning."""
+
+    if is_database:
+        derived = "full_refresh" if source_mode == "snapshot" else "scd1"
+    else:
+        derived = "scd1" if dedup else "insert_only"
+    if value is None:
+        return derived
+    name = str(value)
+    if name not in LOAD_TYPES:
+        errors.append(f"{label}: raw_to_bronze.load_type must be one of {', '.join(LOAD_TYPES)}")
+    elif is_database and name != derived:
+        errors.append(
+            f"{label}: a database table's load_type follows source.mode "
+            f"(snapshot: full_refresh, merge: scd1); this one is {derived}"
+        )
+    elif not is_database and name == "full_refresh":
+        errors.append(f"{label}: full_refresh is only for database tables")
+    elif not is_database and dedup and name == "insert_only":
+        errors.append(f"{label}: load_type insert_only conflicts with dedup: true")
+    else:
+        return name
+    return derived
+
+
+def _delete_when(
+    value: Any, load_type: str, known: set[str], label: str, errors: list[str]
+) -> str | None:
+    """SQL condition marking a source row as deleted. The row stays and is flagged, not removed."""
+
+    from lakeflow_framework.quality import assert_safe_rule_expression
+
+    expression = _optional_text(value)
+    if expression is None:
+        return None
+    if load_type != "scd1":
+        errors.append(f"{label}: delete_when is only for load_type scd1")
+        return None
+    before = len(errors)
+    assert_safe_rule_expression(expression, known, label=label, name="delete_when", errors=errors)
+    return None if len(errors) > before else expression
+
+
+def _description(value: Any, key: str, label: str, errors: list[str]) -> str:
+    """Free text that describes a table. Stored in the registry and used as the table comment."""
+
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        errors.append(f"{label}: {key} must be text")
+        return ""
+    text = value.strip()
+    if len(text) > MAX_DESCRIPTION_CHARS:
+        errors.append(f"{label}: {key} is longer than {MAX_DESCRIPTION_CHARS} characters")
+        return ""
+    return text
 
 
 def _cluster_by(value: Any, columns: list[Column], label: str, errors: list[str]) -> list[str]:

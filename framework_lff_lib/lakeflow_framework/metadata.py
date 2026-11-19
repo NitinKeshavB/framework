@@ -9,7 +9,18 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from lakeflow_framework.config import PipelineConfig
+from lakeflow_framework.config import (
+    AUDIT_COLUMN_DESCRIPTIONS,
+    BATCH_ID,
+    INGEST_TIMESTAMP,
+    IS_DELETED,
+    RESCUED_DATA,
+    SRC_FILE_NAME,
+    SRC_FILE_PATH,
+    SRC_ROW_HASH,
+    PipelineConfig,
+)
+from lakeflow_framework.load import RESCUE_FORMATS
 from lakeflow_framework.quality import compile_rules
 
 
@@ -225,14 +236,7 @@ def _column_rows(
                 for column in config.fixed_columns
             ]
         seen_names = {name for name, *_rest in fields}
-        extras: list[tuple[str, str, str, str, list[str]]] = []
-        if layer == "raw":
-            extras += [
-                ("_source_file", "string", "Source file path", tags.classification, []),
-                ("_ingested_at", "timestamp", "Time the row was read", tags.classification, []),
-            ]
-        elif not config.has_raw:
-            extras += _lineage_fields(config, tags.classification)
+        extras = audit_columns(config, layer, tags.classification)
         if layer == "quarantine":
             extras.append(
                 (
@@ -272,15 +276,34 @@ def _column_rows(
     return rows
 
 
-def _lineage_fields(
-    config: PipelineConfig, classification: str
+def audit_columns(
+    config: PipelineConfig, layer: str, classification: str
 ) -> list[tuple[str, str, str, str, list[str]]]:
-    """Columns the pipeline adds when there is no raw table to carry them."""
+    """The audit columns a table carries, as (name, type, description, classification, pii).
 
-    ingested = ("_ingested_at", "timestamp", "Time the row was read", classification, [])
-    if config.load_method == "volume_files":
-        return [("_source_file", "string", "Source file path", classification, []), ingested]
-    return [ingested]
+    The same set on every bronze and quarantine table of a load type, so a reader can rely on it.
+    The raw table of a frozen method carries only what the file read gives it.
+    """
+
+    def column(name: str, type_name: str) -> tuple[str, str, str, str, list[str]]:
+        return (name, type_name, AUDIT_COLUMN_DESCRIPTIONS[name], classification, [])
+
+    from_files = config.load_method != "database_table"
+    found: list[tuple[str, str, str, str, list[str]]] = []
+    if from_files:
+        found += [column(SRC_FILE_PATH, "string"), column(SRC_FILE_NAME, "string")]
+    if layer == "raw":
+        return [*found, column(SRC_ROW_HASH, "string"), column(INGEST_TIMESTAMP, "timestamp")]
+    found += [
+        column(SRC_ROW_HASH, "string"),
+        column(BATCH_ID, "string"),
+        column(INGEST_TIMESTAMP, "timestamp"),
+    ]
+    if config.delete_when:
+        found.append(column(IS_DELETED, "boolean"))
+    if from_files and config.file_format in RESCUE_FORMATS:
+        found.append(column(RESCUED_DATA, "string"))
+    return found
 
 
 def _digest(payload: str) -> str:
@@ -317,6 +340,11 @@ def _table_record(config: PipelineConfig, layer: str) -> dict[str, Any]:
         "pipeline_id": config.pipeline_id,
         "job_name": config.job_name,
         "load_method": config.load_method,
+        "load_type": config.load_type,
+        "description": {
+            "bronze": config.description,
+            "quarantine": config.quarantine_description,
+        }.get(layer, ""),
     }
 
 

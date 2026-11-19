@@ -132,6 +132,7 @@ _TABLE_TEMPLATE = """\
 pipeline_id: {source}_{table}
 domain: {domain}
 data_domain: {table}
+description: TODO describe the table
 team: {requested_by}
 technical_owner: {owner}
 layer: bronze
@@ -171,6 +172,7 @@ raw_to_bronze:
 _VOLUME_TEMPLATE = """\
 pipeline_id: {source}_{table}
 data_domain: {table}
+description: TODO describe the table
 {delivery_line}
 data:
   classification: internal
@@ -199,11 +201,13 @@ raw_to_bronze:
 _DATABASE_TEMPLATE = """\
 pipeline_id: {source}_{table}
 data_domain: {table}
+description: TODO describe the table
 {delivery_line}
 data:
   classification: internal
 
-# The table in the source database. snapshot replaces bronze each run.
+# The table in the source database. snapshot mirrors the source each run. With primary_keys under
+# raw_to_bronze, a row the source no longer has is kept and closed, not deleted (soft delete).
 # merge keeps bronze in step with the source and needs primary_keys.
 source:
   table: TODO_schema.{table}

@@ -115,8 +115,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "generate":
             from lakeflow_framework.ingestion import generate as generate_files
+            from lakeflow_framework.sources import description_warnings, load_sources
 
             stale = generate_files(args.bundle, check=args.check)
+            for warning in description_warnings(load_sources(args.bundle)):
+                print(f"warning: {warning}", file=sys.stderr)
             if args.check and stale:
                 print("out of date: " + ", ".join(stale), file=sys.stderr)
                 print(f"run `lakeflow-framework generate {args.bundle}`", file=sys.stderr)

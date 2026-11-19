@@ -24,6 +24,11 @@
       "type": "string",
       "description": "Optional profile path relative to the ingestion bundle (for example profiles/db_merge_confidential)."
     },
+    "description": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "What this table holds. Stored in framework_meta (v_tables.description) and used as the table comment."
+    },
     "domain": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
     "data_domain": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
     "team": { "type": "string" },
@@ -92,6 +97,15 @@
         "dedup": { "type": "boolean" },
         "primary_keys": { "type": "array", "items": { "type": "string" } },
         "watermark_column": { "type": "string" },
+        "load_type": {
+          "type": "string",
+          "enum": ["insert_only", "scd1", "scd2", "full_refresh"],
+          "description": "How rows are taken. insert_only appends. scd1 upserts on primary_keys by watermark_column. scd2 keeps every version. full_refresh (database tables) mirrors the source and keeps a removed key, closed. Omitted: scd1 when dedup is true, else insert_only for files."
+        },
+        "delete_when": {
+          "type": "string",
+          "description": "scd1 only. A SQL condition over this table's columns. A row it holds for is kept and flagged with _is_deleted = true, never removed."
+        },
         "columns": {
           "type": "array",
           "items": {
@@ -126,7 +140,8 @@
       "type": "object",
       "properties": {
         "schema": { "type": "string" },
-        "table": { "type": "string" }
+        "table": { "type": "string" },
+        "description": { "type": "string", "maxLength": 1024 }
       }
     },
     "tables": {

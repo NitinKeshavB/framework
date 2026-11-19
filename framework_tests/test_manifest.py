@@ -14,7 +14,11 @@ DOCUMENT = {
     "layer": "bronze",
     "notify": {"on_failure": ["owner@example.com"], "on_success": []},
     "pipeline_id": "abs_accounting",
-    "quarantine": {"classification": "internal", "schema": "abs_bronze", "table": "finance_abs_qrntn"},
+    "quarantine": {
+        "classification": "internal",
+        "schema": "abs_bronze",
+        "table": "finance_abs_qrntn",
+    },
     "raw_to_bronze": {
         "bronze": {"classification": "internal", "schema": "abs_bronze", "table": "finance_abs"},
         "columns": [],

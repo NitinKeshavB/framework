@@ -48,7 +48,7 @@ ENVIRONMENT_VERSION = "4"
 # TEMPORARY (pre-go-live): PERFORMANCE_OPTIMIZED for fast cold starts while iterating.
 # Switch back to "STANDARD" (cheaper) at go-live.
 PERFORMANCE_TARGET = "PERFORMANCE_OPTIMIZED"
-PACKAGE_VERSION = "0.1.0"  # keep in sync with framework_lff_lib/pyproject.toml [project].version
+PACKAGE_VERSION = "0.1.8"  # keep in sync with framework_lff_lib/pyproject.toml [project].version
 # Each pipeline publishes its event log to framework_meta as <job name><suffix>.
 EVENT_LOG_SUFFIX = "_event_log"
 WORKFLOW_TAG = "lakeflow_framework_workflow"
@@ -79,6 +79,28 @@ class SourceSystem:
     # STANDARD or PERFORMANCE_OPTIMIZED (current default, see PERFORMANCE_TARGET). Override in
     # source.yaml; prefer STANDARD for scheduled unattended loads once live.
     performance_target: str = PERFORMANCE_TARGET
+
+
+def description_warnings(systems: list[SourceSystem]) -> list[str]:
+    """What is not described yet, as warnings. Descriptions are kept in framework_meta
+    (``v_tables`` and ``v_columns``); a missing one never stops a deploy."""
+
+    warnings: list[str] = []
+    for system in systems:
+        for table in system.tables:
+            config = table.config
+            where = f"{system.name}/{table.path.name}"
+            if not config.description:
+                warnings.append(f"{where}: the table has no description")
+            if not config.columns:
+                warnings.append(
+                    f"{where}: no columns are declared, so none are described in framework_meta"
+                )
+                continue
+            bare = [column.name for column in config.columns if not column.description]
+            if bare:
+                warnings.append(f"{where}: no description for column(s) {', '.join(bare)}")
+    return warnings
 
 
 def load_sources(

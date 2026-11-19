@@ -15,22 +15,30 @@ registered dataflows with no event-log progress.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from lakeflow_framework.config import (
+    BATCH_ID,
     CATALOG_SETTING,
     IDENTIFIER,
+    INGEST_TIMESTAMP,
+    IS_DELETED,
     MANIFEST_SETTING,
     MAX_CLUSTER_KEYS,
     SPECS_SETTING,
+    SRC_FILE_NAME,
+    SRC_FILE_PATH,
     ConfigValidationError,
     PipelineConfig,
     config_from_document,
     validate_configs,
 )
-from lakeflow_framework.load import _projection, get_strategy, projection_exprs
+from lakeflow_framework.load import ROW_HASH_EXPR, _projection, get_strategy, projection_exprs
+from lakeflow_framework.pipeline_metrics import Dataflow, UpdateRecorder
+from lakeflow_framework.pipeline_metrics import install as install_recorder
 from lakeflow_framework.quality import (
     DQ_COLUMN,
     FAILED,
@@ -39,6 +47,7 @@ from lakeflow_framework.quality import (
     expectations,
     failed_rules_sql,
 )
+from lakeflow_framework.sqlnames import sql_string
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +107,8 @@ def build_pipelines(
     from the bundle. Without it, the registry is queried once for the whole list.
 
     One table that fails to load or register is skipped so the rest of the delivery still runs.
-    ``record_load_metrics`` marks that dataflow FAILED when the event log has no progress for it.
+    The delivery's load recorder (``pipeline_metrics``) is installed as an event hook, and it
+    records that table as FAILED with the error that stopped it, in the same update's rows.
     """
 
     if not pipeline_ids:
@@ -108,22 +118,34 @@ def build_pipelines(
         spark = _cluster_session()
     graphs: list[Graph] = []
     if metadata is None:
-        configured = bundle_configs(spark)
+        problems: dict[str, str] = {}
+        delivery: dict[str, str] = {}
+        configured = bundle_configs(spark, problems=problems, delivery=delivery)
         if configured is not None:
             for pipeline_id in pipeline_ids:
                 config = configured.get(pipeline_id)
                 if config is None:
+                    problems.setdefault(
+                        pipeline_id,
+                        f"spec is missing or invalid in {MANIFEST_SETTING}/{SPECS_SETTING}",
+                    )
                     log.error(
-                        "%s: not loadable from %s/%s (missing or invalid); skipping so other "
-                        "tables in this delivery still load",
+                        "%s: not loadable from %s/%s (%s); skipping so other tables in this "
+                        "delivery still load",
                         pipeline_id,
                         MANIFEST_SETTING,
                         SPECS_SETTING,
+                        problems[pipeline_id],
                     )
                     continue
-                graph = _try_build(pipeline_id, spark=spark, pipelines=pipelines, config=config)
+                graph = _try_build(
+                    pipeline_id, spark=spark, pipelines=pipelines, config=config, problems=problems
+                )
                 if graph is not None:
                     graphs.append(graph)
+            # Installed before the check below, so a delivery in which every table failed to
+            # register still records why.
+            _install_recorder(pipelines, spark, list(pipeline_ids), configured, problems, delivery)
             return _require_some(graphs, pipeline_ids)
     reader = metadata
     if reader is None:
@@ -149,11 +171,19 @@ def build_pipelines(
     return _require_some(graphs, pipeline_ids)
 
 
-def bundle_configs(spark: Any) -> dict[str, PipelineConfig] | None:
+def bundle_configs(
+    spark: Any,
+    *,
+    problems: dict[str, str] | None = None,
+    delivery: dict[str, str] | None = None,
+) -> dict[str, PipelineConfig] | None:
     """Configs from ``lff.manifest`` (preferred) or legacy ``lff.specs``, or None if unset.
 
     Manifest: one JSON read/parse for the whole delivery. Specs: each path validated alone so
     one bad file does not block the others.
+
+    ``problems`` receives, by pipeline id, why a spec could not be loaded. ``delivery`` receives
+    the job name the manifest was generated for, under ``job_name``.
     """
 
     conf = getattr(spark, "conf", None)
@@ -162,7 +192,9 @@ def bundle_configs(spark: Any) -> dict[str, PipelineConfig] | None:
     catalog = conf.get(CATALOG_SETTING, None) or None
     manifest = conf.get(MANIFEST_SETTING, None)
     if manifest:
-        return _configs_from_manifest(Path(str(manifest).strip()), catalog)
+        return _configs_from_manifest(
+            Path(str(manifest).strip()), catalog, problems=problems, delivery=delivery
+        )
     specs = conf.get(SPECS_SETTING, None)
     if not specs:
         return None
@@ -174,8 +206,12 @@ def bundle_configs(spark: Any) -> dict[str, PipelineConfig] | None:
                 configured[config.pipeline_id] = config
         except ConfigValidationError as exc:
             log.error("%s: invalid spec; skipping: %s", path, "; ".join(exc.errors))
+            if problems is not None:
+                problems.setdefault(path.stem, f"invalid spec {path.name}: {'; '.join(exc.errors)}")
         except Exception as exc:
             log.exception("%s: could not read spec; skipping: %s", path, exc)
+            if problems is not None:
+                problems.setdefault(path.stem, f"could not read spec {path.name}: {exc}")
     return configured
 
 
@@ -199,7 +235,13 @@ def _with_catalog(value: Any, catalog: str) -> Any:
     return value
 
 
-def _configs_from_manifest(path: Path, catalog: str | None) -> dict[str, PipelineConfig]:
+def _configs_from_manifest(
+    path: Path,
+    catalog: str | None,
+    *,
+    problems: dict[str, str] | None = None,
+    delivery: dict[str, str] | None = None,
+) -> dict[str, PipelineConfig]:
     import json
 
     configured: dict[str, PipelineConfig] = {}
@@ -207,7 +249,11 @@ def _configs_from_manifest(path: Path, catalog: str | None) -> dict[str, Pipelin
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         log.exception("%s: could not read delivery manifest; skipping all tables: %s", path, exc)
+        if problems is not None:
+            problems["*"] = f"could not read delivery manifest {path.name}: {exc}"
         return configured
+    if delivery is not None and payload.get("delivery"):
+        delivery["job_name"] = str(payload["delivery"])
     for item in payload.get("pipelines") or []:
         pipeline_id = str(item.get("pipeline_id") or "")
         document = item.get("config")
@@ -225,8 +271,12 @@ def _configs_from_manifest(path: Path, catalog: str | None) -> dict[str, Pipelin
                 pipeline_id,
                 "; ".join(exc.errors),
             )
+            if problems is not None:
+                problems[pipeline_id] = f"invalid spec: {'; '.join(exc.errors)}"
         except Exception as exc:
             log.exception("%s (%s): could not load; skipping: %s", path, pipeline_id, exc)
+            if problems is not None:
+                problems[pipeline_id] = f"could not load spec: {exc}"
     return configured
 
 
@@ -236,6 +286,7 @@ def _try_build(
     spark: Any,
     pipelines: Any,
     config: PipelineConfig | dict[str, Any],
+    problems: dict[str, str] | None = None,
 ) -> Graph | None:
     try:
         return build_pipeline(pipeline_id, spark=spark, pipelines=pipelines, config=config)
@@ -245,7 +296,70 @@ def _try_build(
             pipeline_id,
             exc,
         )
+        if problems is not None:
+            problems[pipeline_id] = f"failed to register: {type(exc).__name__}: {exc}"
         return None
+
+
+def _install_recorder(
+    pipelines: Any,
+    spark: Any,
+    pipeline_ids: list[str],
+    configured: dict[str, PipelineConfig],
+    problems: dict[str, str],
+    delivery: dict[str, str],
+) -> None:
+    """Record this delivery's load counts, status, and errors once per update (event hook).
+
+    Needs a running pipeline: off a cluster there is no ``pipelines`` module to hook.
+    """
+
+    if pipelines is None or spark is None:
+        return
+    known = next(iter(configured.values()), None)
+    job_name = (known.job_name if known else None) or delivery.get("job_name")
+    catalog = known.catalog if known else _conf(spark, CATALOG_SETTING)
+    if not job_name or not catalog:
+        log.error("load metrics: no job name or catalog for this delivery; not recording")
+        return
+    dataflows: list[Dataflow] = []
+    for pipeline_id in pipeline_ids:
+        config = configured.get(pipeline_id)
+        error = problems.get(pipeline_id) or problems.get("*")
+        if config is None:
+            dataflows.append(
+                Dataflow(
+                    pipeline_id=pipeline_id,
+                    owner_kind="source_system",
+                    owner=pipeline_id.split("_", 1)[0],
+                    staged=f"{pipeline_id}_staged",
+                    target="",
+                    quarantine="",
+                    build_error=error or "spec could not be loaded",
+                )
+            )
+            continue
+        dataflows.append(
+            Dataflow(
+                pipeline_id=pipeline_id,
+                owner_kind=config.owner_kind,
+                owner=config.owner,
+                staged=f"{pipeline_id}_staged",
+                target=config.table_name("bronze"),
+                quarantine=config.table_name("quarantine"),
+                append=not config.uses_auto_cdc,
+                build_error=error,
+            )
+        )
+    recorder = UpdateRecorder(
+        job_name, (known.layer if known else "bronze"), dataflows, batch_id=batch_id()
+    )
+    install_recorder(pipelines, spark, recorder, catalog)
+
+
+def _conf(spark: Any, key: str) -> str | None:
+    conf = getattr(spark, "conf", None)
+    return (conf.get(key, None) or None) if conf is not None else None
 
 
 def _require_some(graphs: list[Graph], pipeline_ids: list[str]) -> list[Graph]:
@@ -341,8 +455,11 @@ def assemble(config: PipelineConfig) -> Graph:
             "source": valid_name,
             "keys": list(config.primary_keys),
             "sequence_by": config.watermark_column,
-            "stored_as_scd_type": 1,
+            "stored_as_scd_type": config.scd_type,
         }
+        if config.scd_type == 2:
+            # A new version opens when the data changes, not when the pipeline stamps a new load.
+            auto_cdc["track_history_except_column_list"] = list(UNTRACKED_COLUMNS)
     else:
         datasets.append(
             Dataset(
@@ -417,13 +534,37 @@ def _typed_sequence(frame: Any, config: PipelineConfig) -> Any:
     )
 
 
+# Change history bronze and quarantine keep, so a silver run that was down for days can still
+# read exactly what changed. Delta removes change files older than the retention.
+CHANGE_FEED_RETENTION = "interval 30 days"
+# Columns the pipeline stamps on every load. An SCD2 table must not open a version because of them.
+UNTRACKED_COLUMNS = (SRC_FILE_PATH, SRC_FILE_NAME, BATCH_ID, INGEST_TIMESTAMP)
+_BATCH_ID: str | None = None
+
+
+def batch_id() -> str:
+    """The id of this pipeline run, written to every row as ``_batch_id``.
+
+    Pipeline code cannot read its own update id, so one id is made when the run's code loads.
+    That happens once per update, so every micro-batch of the run shares it. The recorder, in
+    the same process, writes it to ``load_ledger.batch_id`` beside the real update id.
+    """
+
+    global _BATCH_ID
+    if _BATCH_ID is None:
+        _BATCH_ID = str(uuid.uuid4())
+    return _BATCH_ID
+
+
 def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
     """Comment, properties, and clustering for a table the pipeline publishes."""
 
     tags = config.tags.get(layer) or config.tags.get("bronze")
     classification = tags.classification if tags else ""
+    described = {"bronze": config.description, "quarantine": config.quarantine_description}
     options: dict[str, Any] = {
-        "comment": (
+        "comment": described.get(layer)
+        or (
             f"{layer.capitalize()} for {config.pipeline_id} from source system "
             f"{config.source_system} ({config.data_domain}). Technical owner "
             f"{config.technical_owner}. Classification {classification}."
@@ -437,14 +578,38 @@ def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
     if layer == "staged":
         options["private"] = True
         return options
+    if layer in {"bronze", "quarantine"}:
+        options["table_properties"].update(
+            {
+                "delta.enableChangeDataFeed": "true",
+                "delta.deletedFileRetentionDuration": CHANGE_FEED_RETENTION,
+                "delta.logRetentionDuration": CHANGE_FEED_RETENTION,
+            }
+        )
+    # Cluster on the load time so a reader that wants only what is newer skips the older files.
     keys = list(config.cluster_by) if layer == "bronze" else []
-    if not keys and layer == "bronze" and config.uses_auto_cdc:
-        keys = list(config.primary_keys)[:MAX_CLUSTER_KEYS]
+    if layer == "bronze" and not keys and config.uses_auto_cdc:
+        keys = list(config.primary_keys)[: MAX_CLUSTER_KEYS - 1]
+    if layer in {"bronze", "quarantine"} and INGEST_TIMESTAMP not in keys:
+        keys = [INGEST_TIMESTAMP, *keys][:MAX_CLUSTER_KEYS]
     if keys:
         options["cluster_by"] = keys
     else:
         options["cluster_by_auto"] = True
     return options
+
+
+def _audit_exprs(config: PipelineConfig) -> list[str]:
+    """Select expressions for the audit columns added when a row is staged.
+
+    The row hash, file path, file name, and load time come from the read itself, where ``*`` is
+    exactly what the source gave (see ``_read_source`` and ``load.projection_exprs``).
+    """
+
+    exprs = [f"{sql_string(batch_id())} AS {BATCH_ID}"]
+    if config.delete_when:
+        exprs.append(f"coalesce(CAST(({config.delete_when}) AS BOOLEAN), false) AS {IS_DELETED}")
+    return exprs
 
 
 def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) -> None:
@@ -466,10 +631,15 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
     def _read_source() -> Any:
         if config.load_method == "volume_files":
             frame = _read_files()
-            extra = ["_metadata.file_path AS _source_file", "current_timestamp() AS _ingested_at"]
+            extra = [
+                ROW_HASH_EXPR,
+                f"_metadata.file_path AS {SRC_FILE_PATH}",
+                f"_metadata.file_name AS {SRC_FILE_NAME}",
+                f"current_timestamp() AS {INGEST_TIMESTAMP}",
+            ]
         elif config.load_method == "database_table":
             frame = spark.read.table(config.source_reference())
-            extra = ["current_timestamp() AS _ingested_at"]
+            extra = [ROW_HASH_EXPR, f"current_timestamp() AS {INGEST_TIMESTAMP}"]
         elif raw is not None:
             return _reader().table(raw.name)
         else:
@@ -483,7 +653,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
             raise TypeError(
                 "pipeline frames must support .selectExpr; inject a DataFrame-like test double"
             )
-        return frame.selectExpr("*", failed_rules)
+        return frame.selectExpr("*", *_audit_exprs(config), failed_rules)
 
     registered = _staged
     if graph.expectations:
@@ -500,12 +670,15 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
     if bronze.relation == "auto_cdc":
         pipelines.create_streaming_table(name=bronze.name, **_table_options(config, "bronze"))
         if config.load_method == "database_table":
-            pipelines.create_auto_cdc_from_snapshot_flow(
-                target=bronze.name,
-                source=valid.name,
-                keys=list(config.primary_keys),
-                stored_as_scd_type=1,
-            )
+            snapshot: dict[str, Any] = {
+                "target": bronze.name,
+                "source": valid.name,
+                "keys": list(config.primary_keys),
+                "stored_as_scd_type": config.scd_type,
+            }
+            if config.scd_type == 2:
+                snapshot["track_history_except_column_list"] = list(UNTRACKED_COLUMNS)
+            pipelines.create_auto_cdc_from_snapshot_flow(**snapshot)
         else:
             pipelines.create_auto_cdc_flow(**graph.auto_cdc)
     else:

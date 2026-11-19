@@ -6,7 +6,7 @@ Domain-owned ingestion into bronze. Projects do not own anything here. Any team 
 
 | Bundle | Holds | Owner |
 | --- | --- | --- |
-| `framework_bundle` | The registry (`framework_meta`), load metrics, run views, and `OPTIMIZE` | Platform team |
+| `framework_bundle` | The registry (`framework_meta`), the run and load views, hourly job-run recording, and `OPTIMIZE` | Platform team |
 | `framework_ingestion` (this one) | Source to bronze | Domain, per source system |
 | `framework_curation/<domain>/<project>` | Silver, gold, and data products | One project each |
 
@@ -27,7 +27,7 @@ Rows that fail a quality rule go to a quarantine table beside bronze.
 
 **Files:** the framework loads from the raw volume. It does not copy files from SFTP or SharePoint into the volume. Another process has to do that for now; see "Getting files into the raw volume" below.
 
-**Databases:** the database is exposed through Lakehouse Federation as `foreign_catalog`. Every table in a delivery loads in the same run. `snapshot` replaces bronze with the source table each run. `merge` keeps bronze in step with the source on `primary_keys`.
+**Databases:** the database is exposed through Lakehouse Federation as `foreign_catalog`. Every table in a delivery loads in the same run. `snapshot` mirrors the source table each run: with `primary_keys` a row the source dropped is kept, closed, and without keys bronze is replaced. `merge` keeps bronze in step with the source on `primary_keys` (`scd1`).
 
 ## Layout
 
@@ -72,9 +72,102 @@ source:                                 source:
 
 The spec's `raw_to_bronze` section holds the bronze table, keys, columns, and quality rules. Its `quarantine` section holds the reject table. Specs do not name a catalog. Each job passes the environment's catalog.
 
+## How a table loads: load type
+
+`raw_to_bronze.load_type` says how bronze takes its rows. Leave it out and it is worked out from the older settings, so existing specs keep their meaning.
+
+| `load_type` | What bronze holds | Needs | Notes |
+| --- | --- | --- | --- |
+| `insert_only` | Every row, appended. The default for files | Nothing | A file read twice is not read twice: Auto Loader remembers it |
+| `scd1` | The latest row per key (an upsert) | `primary_keys` and `watermark_column`; `dedup: true` means the same | `delete_when` keeps a deleted row and flags it (below) |
+| `scd2` | Every version of a row: `__START_AT`, `__END_AT`, and the current row has `__END_AT` empty | `primary_keys` and `watermark_column` | A new version opens only when the data changes, never because a load stamped it again |
+| `full_refresh` | A database table, which follows `source.mode` | The foreign table | With `primary_keys`, a row the source dropped stays, closed (its last version has `__END_AT` set), instead of being deleted. Without keys the table is replaced each run |
+
+```yaml
+raw_to_bronze:
+  load_type: scd1
+  primary_keys: [invoice_id]
+  watermark_column: updated_at
+  delete_when: "status = 'DELETED'"      # that row is kept and flagged _is_deleted = true
+```
+
+`delete_when` is a SQL condition over the table's columns and only works with `scd1`. A file load with no `delete_when` never removes a row.
+
+## Audit columns
+
+Every bronze and quarantine table carries the same audit columns. They need no setting and are not part of the data, so they are left out of the row hash and never open an SCD2 version.
+
+| Column | Holds |
+| --- | --- |
+| `_src_file_path`, `_src_file_name` | The file the row came from (file sources) |
+| `_src_row_hash` | SHA-256 of everything the source gave the row, including `_rescued_data`. An empty string and a null differ. Compare two loads of a row to see if its content changed |
+| `_batch_id` | One id for the whole pipeline run. `load_ledger.batch_id` holds the same value beside the real update id, so a row joins to its load |
+| `_ingest_timestamp` | When the pipeline wrote the row |
+| `_rescued_data` | Values that did not fit the declared columns (CSV, delimited, JSON, text) |
+| `_is_deleted` | Only with `delete_when` |
+
+Both tables also keep a Delta change feed for 30 days and are clustered on `_ingest_timestamp`, so a reader that wants only newer rows skips the older files. A pipeline cannot read its own update id, which is why `_batch_id` is its own id rather than the update id.
+
+## Silver reads only what is new
+
+```python
+from lakeflow_framework.silver_reader import read_new
+
+changes = read_new(
+    spark, "cat.billing_bronze.invoices", "cat.silver.invoices_clean", keys=["invoice_id"]
+)
+changes.frame  # the new rows, plus _change_type
+# ... merge changes.frame into the silver table ...
+changes.commit()  # only now: record how far silver has read
+```
+
+`mode="auto"` (the default) uses the change feed when the table has it, and otherwise the load time.
+
+| | Change feed | Load time (no feed) |
+| --- | --- | --- |
+| Finds | Exactly the commits silver has not read | Rows with `_ingest_timestamp` after the last read |
+| `_change_type` | `insert`, `update`, `delete` | `upsert` (new or changed), `delete` for a row flagged `_is_deleted` |
+| Sees a removed row | Yes | No, only a flagged one |
+| Sees an SCD2 closure | Yes | No, so SCD2 tables must use the feed |
+| First read | The whole table, as `insert` | The whole table |
+
+Progress is one row per silver and bronze table pair in `framework_meta.silver_progress`. The read is pinned to one table version, so rows committed meanwhile are picked up next time and none are skipped. `commit()` comes after silver has used the rows, so a run that stops before it reads the same rows again: **a silver merge must be idempotent.** With `keys`, the feed leaves out an update that only restamped a row without changing its content.
+
+If bronze is rebuilt (a full refresh, a replace, a restore), the change feed cannot be followed across it. The reader stops and says so. Delete that pair's row in `silver_progress`, rebuild the silver table, and the next read starts again from the table as it is.
+
+## Describe your tables and columns
+
+`description:` on a spec describes the bronze table and `quarantine.description` the reject table. A `description:` on each declared column describes that column. They are stored in `framework_meta.v_tables.description` and `v_columns.description`, and the table description is also the table comment in Unity Catalog. The audit columns have standard descriptions. Descriptions of columns are only kept for columns the spec declares under `columns:`; a table that declares none lets Auto Loader infer its types, so only its audit columns are registered.
+
+`./run.sh generate` prints a warning for every table with no description, every declared column with none, and every table that declares no columns. It never stops a deploy. `./run.sh new-table` writes `TODO` placeholders, and `generate` refuses a file until they are replaced.
+
+## How a load is recorded
+
+The pipeline records its own load, once per update, in `framework_meta.load_ledger` (read it through `v_loads` and `v_load_failures`). There is one row per table per run:
+
+| Column | Meaning |
+| --- | --- |
+| `rows_read` | Rows taken from the source files or table |
+| `rows_written`, `rows_upserted`, `rows_deleted` | What happened in the bronze table |
+| `rows_quarantine` | Rows that failed a rule |
+| `target_status`, `quarantine_status` | `COMPLETED`, `FAILED`, or `CANCELED` |
+| `failure_reason` | The error the run reported, or why the table could not register |
+| `batch_id`, `update_id` | The `_batch_id` on the rows, and the Databricks update |
+
+Counts are always numbers. A run with no new files records zeros. In a failed run, the counts of a step that did not finish are zero, and the error text is kept. A table whose spec cannot register is recorded `FAILED` with that error, and the other tables in the delivery still load.
+
+The job has one task, the pipeline refresh. Job runs themselves are recorded hourly by `framework_runs` (it also catches runs that never reached the pipeline). The pipeline cannot see which job run started it, so `job_run_id` is empty in the ledger; `v_load_failures` joins to the run by time.
+
+```sql
+SELECT dataflow, target_table, rows_read, rows_written, rows_quarantine, target_status, failure_reason
+FROM <catalog>.framework_meta.v_loads WHERE job_name = 'abs_daily' ORDER BY started_at DESC;
+```
+
 ## One delivery, one pipeline, one job
 
-A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline; the pipeline reads one compiled `lff.manifest` JSON for the delivery (legacy `lff.specs` still works). Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_meta.<job>_event_log`, which feeds `record_load_metrics` → `load_ledger` / `v_loads`. The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
+A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline; the pipeline reads one compiled `lff.manifest` JSON for the delivery (legacy `lff.specs` still works). Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_events.<job>_event_log`, and records its own counts, status, and errors in `load_ledger` / `v_loads` once per update (an event hook; the job has no recording task). The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
+
+A delivery on a file-arrival trigger watches one volume, so its tables must read the same volume. A delivery on a schedule has no such limit: its tables may read different volumes. Several tables can share one spec file with a `tables:` list (shared settings at the top, each entry overrides them), so give each entry its own `bronze.table` or they will collide on one target. Tables in one delivery load together, and one table that fails to register is skipped and recorded while the others still load.
 
 ## Add a table to a source system
 
@@ -97,6 +190,8 @@ That is all. The generator validates every source and spec, then rewrites the ma
 ./run.sh bundle:validate framework_ingestion dev <profile>
 ./run.sh bundle:deploy framework_ingestion dev <profile>
 ```
+
+Run it in the project's virtual environment (`source venv/bin/activate`): the bundle builds the wheel with `python -m pip wheel`, so `python` must be on the path. Every change to the library needs a new `PACKAGE_VERSION` (and the same in `pyproject.toml`), or serverless can reuse the wheel it cached. `.build/` is gitignored, and a bundle upload skips ignored files, so `databricks.yml` lists `.build/pipelines/*.py` and `.build/manifests/*.json` under `sync.include`. Without that the pipeline file never reaches the workspace.
 
 Deploy uploads the bundle, then runs `registry_sync`; the deploy fails if it fails. That job writes every source system, schema, job, and spec into `framework_meta` under the target catalog as SCD Type 2 versions, retires anything removed from the bundle, then sets the schema, table, and column tags and the column comments in Unity Catalog. A schema or table whose pipeline has not run yet is tagged on the next deploy. This bundle must be the only one that registers source systems in its catalog, because a deploy retires every source system object it does not define. The framework bundle must already be deployed, because that deploy creates the registry.
 
@@ -124,7 +219,9 @@ This bundle reads from the raw volume. It does not copy files from SFTP or Share
 
 ## Known gaps
 
-- Nothing here has run on a workspace. Untested there: the file-arrival trigger on a volume, `${workspace.file_path}` spec paths on serverless, the `pyspark.pipelines` calls in `build_pipeline` (including `create_auto_cdc_from_snapshot_flow` for `merge`), reading a streaming view by name, and the serverless environment version.
+- Run on a real workspace: file loads from a volume with Auto Loader on a schedule, the manifest and pipeline upload, the per-update ledger (a load, and a run with no new files), the audit columns, the change feed on `insert_only` bronze, the silver reader in both modes, and registry descriptions.
+- Not yet run on a workspace: the file-arrival trigger, a database source (no foreign catalog yet, so database soft deletes are tested only with unit tests and a stand-in table), `scd1`, `scd2` and `delete_when` on files, and the ledger row for a run that fails.
+- Rebuilding a bronze table (a full refresh) resets its change feed, so every silver table that reads it must rebuild too (see "Silver reads only what is new").
 - `fixed_width` and `yaml` files are not supported from a raw volume yet.
 - A delivery's tables share one pipeline, so one bad spec can fail the others. Splitting a busy delivery is not built.
 - The sample specs are for illustration. `framework_examples/consumer` registers `billing_invoices` too, so do not deploy both to the same catalog.

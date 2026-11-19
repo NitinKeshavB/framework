@@ -62,7 +62,16 @@ def apply_ddl(spark, catalog: str, text: str | None = None, force: bool = False)
         started = time.monotonic()
         try:
             spark.sql(statement)
-        except Exception:
+        except Exception as exc:
+            if _column_already_added(statement, exc):
+                # ADD COLUMN has no IF NOT EXISTS here, and a changed file runs every statement again.
+                log.info(
+                    "statement %d/%d: the column is already there: %s",
+                    number,
+                    len(statements),
+                    statement_summary(statement),
+                )
+                continue
             log.error(
                 "statement %d/%d failed: %s", number, len(statements), statement_summary(statement)
             )
@@ -79,6 +88,17 @@ def apply_ddl(spark, catalog: str, text: str | None = None, force: bool = False)
         f"VALUES ('{digest}', current_timestamp())"
     )
     return len(statements)
+
+
+def _column_already_added(statement: str, error: Exception) -> bool:
+    """True for an ``ALTER TABLE … ADD COLUMN`` that failed because the column exists."""
+
+    head = " ".join(statement.split()).upper()
+    return (
+        head.startswith("ALTER TABLE")
+        and " ADD COLUMN " in head
+        and "FIELD_ALREADY_EXISTS" in str(error).upper()
+    )
 
 
 def ddl_hash(statements: list[str]) -> str:

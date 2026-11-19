@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -200,6 +201,206 @@ def test_volume_spec_reads_the_raw_volume_and_has_no_raw_table(tmp_path: Path) -
     }
 
 
+SCD1 = "  load_type: scd1\n  primary_keys: [thing_id]\n  watermark_column: thing_id"
+
+
+def _build(tmp_path: Path, spec: str):
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", spec)
+    spark = _Spark()
+    pipelines = _Pipelines(spark)
+    build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config)
+    return config, spark, pipelines
+
+
+def _staged_select(spark) -> tuple[str, ...]:
+    (select,) = [s for s in spark.readStream.selects if s and s[-1].endswith("AS _dq_failed_rules")]
+    return select
+
+
+def test_every_file_row_is_stamped_with_the_audit_columns(tmp_path: Path) -> None:
+    from lakeflow_framework.pipeline import batch_id
+
+    _config_, spark, _pipelines = _build(tmp_path, _volume_spec())
+    read = next(s for s in spark.readStream.selects if "current_timestamp()" in " ".join(s))
+    # The hash is computed where * is only what the source gave, before the audit columns exist.
+    assert read == (
+        "*",
+        "sha2(to_json(struct(*)), 256) AS _src_row_hash",
+        "_metadata.file_path AS _src_file_path",
+        "_metadata.file_name AS _src_file_name",
+        "current_timestamp() AS _ingest_timestamp",
+    )
+    staged = _staged_select(spark)
+    assert staged[0] == "*" and staged[1] == f"'{batch_id()}' AS _batch_id" and len(staged) == 3
+
+
+def test_the_batch_id_is_one_value_for_the_whole_run() -> None:
+    import uuid
+
+    from lakeflow_framework.pipeline import batch_id
+
+    assert batch_id() == batch_id()
+    assert str(uuid.UUID(batch_id())) == batch_id()
+
+
+def test_load_type_is_derived_from_the_older_settings_and_checked(tmp_path: Path) -> None:
+    assert _config(tmp_path, FILE_SOURCE, "a.yaml", _volume_spec()).load_type == "insert_only"
+    dedup = _volume_spec(
+        extra="  dedup: true\n  primary_keys: [thing_id]\n  watermark_column: thing_id"
+    )
+    assert _config(tmp_path, FILE_SOURCE, "b.yaml", dedup).load_type == "scd1"
+    scd2 = _config(
+        tmp_path, FILE_SOURCE, "c.yaml", _volume_spec(extra=SCD1.replace("scd1", "scd2"))
+    )
+    assert scd2.load_type == "scd2" and scd2.dedup and scd2.scd_type == 2
+
+    for bad, message in (
+        ("  load_type: nope", "load_type must be one of"),
+        ("  load_type: full_refresh", "only for database tables"),
+        ("  load_type: scd1", "dedup requires primary_keys"),
+        ("  load_type: insert_only\n  dedup: true", "conflicts with dedup"),
+    ):
+        with pytest.raises(ConfigValidationError, match=message):
+            _config(tmp_path, FILE_SOURCE, "d.yaml", _volume_spec(extra=bad))
+    config = _config(tmp_path, FILE_SOURCE, "e.yaml", _volume_spec(extra=SCD1))
+    assert config_from_document(config.canonical()).load_type == "scd1"
+
+
+def test_scd2_opens_a_version_only_when_the_data_changes(tmp_path: Path) -> None:
+    config, _spark, pipelines = _build(tmp_path, _volume_spec(extra=SCD1.replace("scd1", "scd2")))
+    assert pipelines.cdc[0]["stored_as_scd_type"] == 2
+    # The load stamps must not look like a change: a replayed file would open a version each time.
+    assert pipelines.cdc[0]["track_history_except_column_list"] == [
+        "_src_file_path",
+        "_src_file_name",
+        "_batch_id",
+        "_ingest_timestamp",
+    ]
+    assert config.uses_auto_cdc
+
+
+def test_delete_when_keeps_the_row_and_flags_it(tmp_path: Path) -> None:
+    spec = _volume_spec(extra=SCD1 + "\n  delete_when: thing_id = 'x'")
+    config, spark, pipelines = _build(tmp_path, spec)
+    assert (
+        _staged_select(spark)[2]
+        == "coalesce(CAST((thing_id = 'x') AS BOOLEAN), false) AS _is_deleted"
+    )
+    assert "apply_as_deletes" not in pipelines.cdc[0]  # flagged, never removed
+    registered = {
+        row["full_name"].rsplit(".", 1)[1]
+        for row in object_rows(config)
+        if row["object_kind"] == "column" and row["parent_full_name"].endswith("things")
+    }
+    assert "_is_deleted" in registered
+    with pytest.raises(ConfigValidationError, match="only for load_type scd1"):
+        _config(
+            tmp_path, FILE_SOURCE, "f.yaml", _volume_spec(extra="  delete_when: thing_id = 'x'")
+        )
+
+
+def test_bronze_and_quarantine_keep_a_change_feed_and_cluster_on_load_time(tmp_path: Path) -> None:
+    _config_, _spark, pipelines = _build(tmp_path, _volume_spec())
+    for table in (
+        "framework_dev.files_bronze.things",
+        "framework_dev.files_quarantine.things_qrntn",
+    ):
+        options = pipelines.options[table]
+        properties = options["table_properties"]
+        assert properties["delta.enableChangeDataFeed"] == "true"
+        assert properties["delta.deletedFileRetentionDuration"] == "interval 30 days"
+        assert options["cluster_by"] == ["_ingest_timestamp"]
+    staged = pipelines.options["files_things_staged"]
+    assert "delta.enableChangeDataFeed" not in staged["table_properties"]
+
+    _c, _s, keyed = _build(tmp_path, _volume_spec(extra=SCD1))
+    assert keyed.options["framework_dev.files_bronze.things"]["cluster_by"] == [
+        "_ingest_timestamp",
+        "thing_id",
+    ]
+
+
+def test_table_descriptions_are_captured_and_become_the_table_comment(tmp_path: Path) -> None:
+    spec = _volume_spec().replace("_quarantine}", "_quarantine, description: Rows that failed}")
+    config, _spark, pipelines = _build(tmp_path, spec + "description: Things from the files\n")
+    assert config.description == "Things from the files"
+    assert config.quarantine_description == "Rows that failed"
+    assert (
+        pipelines.options["framework_dev.files_bronze.things"]["comment"] == "Things from the files"
+    )
+    assert (
+        pipelines.options["framework_dev.files_quarantine.things_qrntn"]["comment"]
+        == "Rows that failed"
+    )
+    again = config_from_document(config.canonical())
+    assert (again.description, again.quarantine_description) == (
+        "Things from the files",
+        "Rows that failed",
+    )
+    records = {
+        row["full_name"]: json.loads(row["config_json"])
+        for row in object_rows(config)
+        if row["object_kind"] in {"streaming_table", "table", "materialized_view"}
+    }
+    assert records["framework_dev.files_bronze.things"]["description"] == "Things from the files"
+    assert records["framework_dev.files_quarantine.things_qrntn"]["load_type"] == "insert_only"
+    assert (
+        config.content_hash()
+        != _config(tmp_path, FILE_SOURCE, "g.yaml", _volume_spec()).content_hash()
+    )
+    # Without one, the generated text is the comment, as before.
+    _c, _s, plain = _build(tmp_path, _volume_spec())
+    assert (
+        "from source system files" in plain.options["framework_dev.files_bronze.things"]["comment"]
+    )
+    with pytest.raises(ConfigValidationError, match="description is longer than 1024"):
+        _config(
+            tmp_path, FILE_SOURCE, "h.yaml", _volume_spec() + "description: " + "x" * 1025 + "\n"
+        )
+    with pytest.raises(ConfigValidationError, match="description must be text"):
+        _config(tmp_path, FILE_SOURCE, "i.yaml", _volume_spec() + "description: [a]\n")
+
+
+def test_a_missing_description_is_a_warning_and_never_an_error(tmp_path: Path) -> None:
+    from lakeflow_framework.sources import SourceSystem, SourceTable, description_warnings
+
+    def system(config) -> SourceSystem:
+        table = SourceTable(config, Path("sources/files/things.yaml"), "daily", "reporting")
+        return SourceSystem("files", "finance", "o@x.com", "sftp_files", {"daily": {}}, [table])
+
+    bare = _config(tmp_path, FILE_SOURCE, "a.yaml", _volume_spec())
+    assert description_warnings([system(bare)]) == [
+        "files/things.yaml: the table has no description",
+        "files/things.yaml: no description for column(s) thing_id",
+    ]
+    spec = _volume_spec().replace("type: string}", "type: string, description: The id}")
+    described = _config(tmp_path, FILE_SOURCE, "b.yaml", spec + "description: Things\n")
+    assert description_warnings([system(described)]) == []
+
+
+def test_audit_columns_are_registered_with_their_descriptions(tmp_path: Path) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    rows = {
+        (row["parent_full_name"].rsplit(".", 1)[1], row["full_name"].rsplit(".", 1)[1]): json.loads(
+            row["config_json"]
+        )
+        for row in object_rows(config)
+        if row["object_kind"] == "column"
+    }
+    for table in ("things", "things_qrntn"):
+        for name in (
+            "_src_file_path",
+            "_src_file_name",
+            "_src_row_hash",
+            "_batch_id",
+            "_ingest_timestamp",
+        ):
+            assert rows[(table, name)]["description"], (table, name)
+    assert rows[("things", "_ingest_timestamp")]["data_type"] == "timestamp"
+    assert ("things", "_is_deleted") not in rows
+    assert rows[("things", "thing_id")]["description"] == ""  # a declared column, none written yet
+
+
 def test_database_spec_reads_the_foreign_catalog(tmp_path: Path) -> None:
     config = _config(tmp_path, DATABASE_SOURCE, "db_things.yaml", _database_spec())
     assert config.load_method == "database_table"
@@ -233,10 +434,47 @@ def test_merge_mode_stages_once_then_uses_snapshot_cdc_on_the_keys(tmp_path: Pat
     assert not pipelines.cdc
     assert pipelines.kinds["db_things_staged"] == "materialized_view"
     assert pipelines.options["db_things_staged"]["private"] is True
-    assert pipelines.options["framework_dev.db_bronze.things"]["cluster_by"] == ["thing_id"]
+    assert pipelines.options["framework_dev.db_bronze.things"]["cluster_by"] == [
+        "_ingest_timestamp",
+        "thing_id",
+    ]
     foreign = [read for read in spark.reads if read[2] == "db_federated.dbo.things"]
     assert foreign == [("db_things_staged", "table", "db_federated.dbo.things")]
     assert ("framework_dev.db_quarantine.things_qrntn", "table", "db_things_staged") in spark.reads
+
+
+def test_a_snapshot_with_keys_keeps_a_removed_row_closed_instead_of_deleting_it(
+    tmp_path: Path,
+) -> None:
+    spec = _database_spec(mode="snapshot").replace(
+        "  columns:", "  primary_keys: [thing_id]\n  columns:"
+    )
+    config = _config(tmp_path, DATABASE_SOURCE, "db_things.yaml", spec)
+    assert config.load_type == "full_refresh" and config.soft_deletes_rows and config.scd_type == 2
+    spark = _Spark()
+    pipelines = _Pipelines(spark)
+    build_pipeline("db_things", spark=spark, pipelines=pipelines, config=config)
+    # Type 2 closes a key the source dropped (proven on a real pipeline); type 1 would delete it.
+    (flow,) = pipelines.snapshot_cdc
+    assert flow["stored_as_scd_type"] == 2 and flow["keys"] == ["thing_id"]
+    assert flow["track_history_except_column_list"] == [
+        "_src_file_path",
+        "_src_file_name",
+        "_batch_id",
+        "_ingest_timestamp",
+    ]
+    assert pipelines.kinds["framework_dev.db_bronze.things"] == "streaming_table"
+    # Without keys there is nothing to follow a row by, so it is still replaced each run.
+    keyless = _config(tmp_path, DATABASE_SOURCE, "db_other.yaml", _database_spec(mode="snapshot"))
+    assert keyless.load_type == "full_refresh" and not keyless.soft_deletes_rows
+    assert keyless.scd_type == 1 and not keyless.uses_auto_cdc
+    with pytest.raises(ConfigValidationError, match="follows source.mode"):
+        _config(
+            tmp_path,
+            DATABASE_SOURCE,
+            "db_bad.yaml",
+            _database_spec(mode="snapshot").replace("  columns:", "  load_type: scd2\n  columns:"),
+        )
 
 
 def test_snapshot_mode_replaces_bronze_with_a_materialized_view(tmp_path: Path) -> None:
@@ -283,7 +521,7 @@ def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path
     assert spark.readStream.options["cloudFiles.schemaHints"] == "`thing_id` string"
     assert spark.readStream.options["cloudFiles.useNotifications"] == "false"
     assert "cloudFiles.useManagedFileEvents" not in spark.readStream.options
-    assert pipelines.options[bronze]["cluster_by_auto"] is True
+    assert pipelines.options[bronze]["cluster_by"] == ["_ingest_timestamp"]
     assert pipelines.options[bronze]["table_properties"]["quality"] == "bronze"
     assert "files_things" in pipelines.options[bronze]["comment"]
 
@@ -299,7 +537,10 @@ def test_file_events_and_cluster_keys_come_from_the_spec(tmp_path: Path) -> None
     build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config)
     assert spark.readStream.options["cloudFiles.useManagedFileEvents"] == "true"
     assert "cloudFiles.useNotifications" not in spark.readStream.options
-    assert pipelines.options["framework_dev.files_bronze.things"]["cluster_by"] == ["thing_id"]
+    assert pipelines.options["framework_dev.files_bronze.things"]["cluster_by"] == [
+        "_ingest_timestamp",
+        "thing_id",
+    ]
     assert config_from_document(config.canonical()).cluster_by == ["thing_id"]
 
     too_many = spec.replace("cluster_by: [thing_id]", "cluster_by: [a, b, c, d, e]")

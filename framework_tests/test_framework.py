@@ -502,7 +502,7 @@ def test_one_line_pipeline_file_uses_the_running_session(monkeypatch: pytest.Mon
     assert pipelines.names
     assert pipelines.cdc[0]["keys"] == ["invoice_id"]
     assert spark.readStream.loads == 1
-    assert any("_source_file" in expr for exprs in spark.readStream.exprs for expr in exprs)
+    assert any("_src_file_path" in expr for exprs in spark.readStream.exprs for expr in exprs)
 
 
 def test_one_line_pipeline_file_off_cluster_says_why(monkeypatch):
@@ -535,7 +535,10 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     ]
     assert keys and all(len(key.split(",")) <= 4 for key in keys)
     assert "'delta.autoOptimize.autoCompact' = 'false'" not in text
-    assert not any(statement.upper().startswith("ALTER") for statement in statements)
+    # Every statement can run again. The one ALTER kind kept, ADD COLUMN, has no IF NOT EXISTS,
+    # so apply_ddl skips it when the column is already there.
+    alters = [statement for statement in statements if statement.upper().startswith("ALTER")]
+    assert alters and all(" ADD COLUMN " in statement.upper() for statement in alters)
     assert "VIEW framework_dev.framework_meta.v_ownership_refusals" in text
     assert "ownership_refusals" in text
     assert "run_ledger" not in text and "run_current" not in text
@@ -583,7 +586,11 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "valid_to" in text
     assert "is_current" in text
     # Fresh schema: CREATE tables/views plus idempotent INSERT seeds for enum refs.
-    assert {statement.split()[0].upper() for statement in statements} <= {"CREATE", "INSERT"}
+    assert {statement.split()[0].upper() for statement in statements} <= {
+        "CREATE",
+        "INSERT",
+        "ALTER",  # only ADD COLUMN, which apply_ddl skips when the column exists
+    }
     assert _column_list(text, "asset_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
     assert _column_list(text, "ownership_refusals") == list(LEDGER_COLUMNS)
 
@@ -611,17 +618,28 @@ def test_column_metadata_versions_type_comment_and_tags():
         if row["object_kind"] == "column"
         and row["parent_full_name"] == "framework_dev.billing_bronze.invoices"
     ]
-    assert [row["full_name"] for row in rows] == [
+    names = [row["full_name"] for row in rows]
+    # The declared columns come first, then the audit columns every bronze table carries.
+    assert names[:3] == [
         "framework_dev.billing_bronze.invoices.invoice_id",
         "framework_dev.billing_bronze.invoices.amount",
         "framework_dev.billing_bronze.invoices.updated_at",
     ]
+    assert {name.rsplit(".", 1)[1] for name in names[3:]} >= {
+        "_src_file_path",
+        "_src_file_name",
+        "_src_row_hash",
+        "_batch_id",
+        "_ingest_timestamp",
+    }
+    audit = next(row for row in rows if row["full_name"].endswith("._batch_id"))
+    assert "pipeline run" in json.loads(audit["config_json"])["description"]
     raw_names = {
         row["full_name"]
         for row in object_rows(config)
         if row["parent_full_name"] == "framework_dev.billing_raw.invoices"
     }
-    assert "framework_dev.billing_raw.invoices._source_file" in raw_names
+    assert "framework_dev.billing_raw.invoices._src_file_path" in raw_names
     assert "framework_dev.billing_raw.invoices.amount" in raw_names
     quarantine_names = {
         row["full_name"]
@@ -675,7 +693,14 @@ def test_column_metadata_versions_type_comment_and_tags():
         row["full_name"]
         for row in ledger_rows
         if row["parent_full_name"] == "framework_dev.ledger_bronze.entries"
-    ] == []
+    ] == [
+        # No declared columns, so only the audit columns are registered for bronze.
+        "framework_dev.ledger_bronze.entries._src_file_path",
+        "framework_dev.ledger_bronze.entries._src_file_name",
+        "framework_dev.ledger_bronze.entries._src_row_hash",
+        "framework_dev.ledger_bronze.entries._batch_id",
+        "framework_dev.ledger_bronze.entries._ingest_timestamp",
+    ]
     assert [
         row["full_name"]
         for row in ledger_rows
@@ -683,8 +708,10 @@ def test_column_metadata_versions_type_comment_and_tags():
     ] == [
         "framework_dev.ledger_raw.entries.account_id",
         "framework_dev.ledger_raw.entries.amount",
-        "framework_dev.ledger_raw.entries._source_file",
-        "framework_dev.ledger_raw.entries._ingested_at",
+        "framework_dev.ledger_raw.entries._src_file_path",
+        "framework_dev.ledger_raw.entries._src_file_name",
+        "framework_dev.ledger_raw.entries._src_row_hash",
+        "framework_dev.ledger_raw.entries._ingest_timestamp",
     ]
 
 

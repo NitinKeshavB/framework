@@ -60,7 +60,7 @@ Each rule is also a warn expectation on the staging table, `NOT array_contains(_
 | Files, `volume_files` | Auto Loader on the raw volume path, once, into a private staging streaming table. No checkpoint or `schemaLocation` is set; the pipeline owns that state. | Streaming table of failing rows | Streaming table of passing rows, or Auto CDC on the keys when `dedup: true` |
 | Database, `snapshot` | The foreign-catalog table, in batch, once, into a private staging materialized view | Materialized view of failing rows | Materialized view of passing rows |
 | Database, `merge` | The same | Materialized view of failing rows | Streaming table updated by `create_auto_cdc_from_snapshot_flow` on `primary_keys` |
-| Cloud files, `autoloader` | Auto Loader once into a raw streaming table. The projection, including `_source_file` and `_ingested_at`, is applied on that read. | Streaming table, read from the raw table | Streaming table read from the valid view, or Auto CDC from that view when `dedup: true` |
+| Cloud files, `autoloader` | Auto Loader once into a raw streaming table. The projection, including `_src_file_path`, `_src_file_name`, `_src_row_hash` and `_ingest_timestamp`, is applied on that read. | Streaming table, read from the raw table | Streaming table read from the valid view, or Auto CDC from that view when `dedup: true` |
 | Cloud files, `copy_into` | `COPY INTO` a raw table (`force = false`) before the pipeline | Streaming table | Streaming table |
 | Cloud files, `ctas` | `CREATE OR REPLACE TABLE` raw | Materialized view | Materialized view |
 
@@ -131,7 +131,7 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
 | `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. NRT via `record_this_run`; hourly `framework_runs` is catch-up only. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
-| `v_loads`, `v_load_failures` | Per-load recon (NRT via `record_load_metrics`) and failure reasons for repair. |
+| `v_loads`, `v_load_failures` | Per-load recon, written by the pipeline's event hook once per update, and failure reasons for repair. |
 | `v_bronze_tables` | Every bronze table and its owner. |
 | `v_metadata_drift` | Each declared schema, table, or column tag, or column comment, that Unity Catalog (`<catalog>.information_schema`) lacks or holds differently. `securable` says which. Empty once `registry_sync` has run after the schemas and tables exist. |
 
@@ -153,9 +153,9 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | Table or view | Built by | What it holds |
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
-| `load_ledger`, `v_loads`, `v_loads_90d` | Each job, `record_load_metrics` (`ALL_DONE`) | Central recon SoR: one row per registered dataflow (FAILED when event log has no progress for it). `v_loads_90d` unions 7-day hot with forever archive for dashboards |
+| `load_ledger`, `v_loads`, `v_loads_90d` | The pipeline's event hook (`pipeline_metrics`), once per update | Central recon SoR: one row per registered dataflow, counts always numbers, FAILED with the error when a table fails or cannot register. `v_loads_90d` unions 7-day hot with forever archive for dashboards |
 | `v_load_failures` | Views over loads + job/task runs | What failed and why (`failure_reason`, task, run page) for repair |
-| `job_runs`, `v_job_runs`, `v_job_status` | Delivery job `record_this_run` (NRT) + hourly catch-up | Append-only run events; `v_job_runs` keeps latest per `(job_id, run_id)` |
+| `job_runs`, `v_job_runs`, `v_job_status` | The hourly `framework_runs` job | Append-only run events; `v_job_runs` keeps latest per `(job_id, run_id)` |
 | `job_task_runs`, `v_job_task_runs` | NRT + hourly catch-up | Append-only task events; view keeps latest per `(job_run_id, task_run_id)` |
 | `pipeline_updates`, `v_pipeline_updates` | Hourly `framework_runs` from `update_progress` in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
 | `v_job_costs`, `v_pipeline_costs` | `framework_system_views`, only when `system_views` is `true` | DBUs and list cost per job run and per pipeline update, from `system.billing.usage` and `list_prices` |

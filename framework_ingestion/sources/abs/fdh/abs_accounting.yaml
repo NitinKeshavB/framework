@@ -7,6 +7,7 @@
 spec_version: 1
 pipeline_id: abs_accounting          # must start with the source system name: abs_
 data_domain: gl_accounting           # identifier: letters, digits, underscore
+description: Finance and accounting extract from the abs finance_source_extract volume.
 
 # Who owns and hears about this table. Without these the source owner (sonia.rajeev@...) is used.
 technical_owner: nitinkeshav.bolla@allianz.com.au

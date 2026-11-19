@@ -360,6 +360,12 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
+-- batch_id is the _batch_id the pipeline stamped on every bronze row of that run, so a row
+-- joins to its load. It sits right after recorded_at in both tables because the archive move
+-- copies by position (h.*, then archived_at). A repeat is skipped by apply_ddl.
+ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN batch_id STRING AFTER recorded_at;
+ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN batch_id STRING AFTER recorded_at;
+
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_metric_archive (
   job_name STRING NOT NULL,
   layer STRING NOT NULL,
@@ -448,6 +454,17 @@ TBLPROPERTIES (
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
   sql_hash STRING NOT NULL,
   applied_at TIMESTAMP NOT NULL
+);
+
+-- Where each silver table has read up to in a bronze table that has no change feed. One row per
+-- pair, so it stays small however long the pipelines run. The silver reader keeps it.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.silver_progress (
+  silver_table STRING NOT NULL,
+  bronze_table STRING NOT NULL,
+  last_ingest_timestamp TIMESTAMP,
+  last_commit_version BIGINT,
+  processed_at TIMESTAMP NOT NULL,
+  CONSTRAINT silver_progress_pk PRIMARY KEY (silver_table, bronze_table)
 );
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_asset_registry_current AS
@@ -586,7 +603,9 @@ SELECT
   config:layer::STRING AS layer,
   config:pipeline_id::STRING AS pipeline_id,
   config:job_name::STRING AS job_name,
-  config:load_method::STRING AS load_method
+  config:load_method::STRING AS load_method,
+  config:load_type::STRING AS load_type,
+  config:description::STRING AS description
 FROM ${catalog}.framework_meta.v_asset_registry_current
 WHERE object_kind IN ('table', 'streaming_table', 'materialized_view');
 
@@ -978,7 +997,8 @@ SELECT
   quarantine_status,
   expectations,
   failure_reason,
-  recorded_at
+  recorded_at,
+  batch_id
 FROM ${catalog}.framework_meta.load_ledger
 QUALIFY row_number() OVER (
   PARTITION BY job_name, layer, update_id, dataflow
@@ -1008,7 +1028,7 @@ WITH combined AS (
     dataflow, owner_kind, owner,
     target_table, quarantine_table, started_at, ended_at, duration_seconds,
     rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
-    target_status, quarantine_status, expectations, failure_reason, recorded_at,
+    target_status, quarantine_status, expectations, failure_reason, recorded_at, batch_id,
     CAST(NULL AS TIMESTAMP) AS archived_at
   FROM ${catalog}.framework_meta.v_loads
   WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
@@ -1018,7 +1038,8 @@ WITH combined AS (
     dataflow, owner_kind, owner,
     target_table, quarantine_table, started_at, ended_at, duration_seconds,
     rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
-    target_status, quarantine_status, expectations, failure_reason, recorded_at, archived_at
+    target_status, quarantine_status, expectations, failure_reason, recorded_at, batch_id,
+    archived_at
   FROM ${catalog}.framework_meta.load_ledger_archive
   WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
 )
@@ -1048,6 +1069,7 @@ SELECT
   l.rows_quarantine,
   l.started_at AS load_started_at,
   l.recorded_at AS load_recorded_at,
+  l.batch_id,
   coalesce(l.job_run_id, j.run_id) AS job_run_id,
   j.status AS job_status,
   j.result_state AS job_result_state,

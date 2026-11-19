@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from lakeflow_framework.config import FORMATS, PipelineConfig
+from lakeflow_framework.config import (
+    FORMATS,
+    INGEST_TIMESTAMP,
+    SRC_FILE_NAME,
+    SRC_FILE_PATH,
+    SRC_ROW_HASH,
+    PipelineConfig,
+)
 
 # A trigger with no cap will list an entire backlog in one micro-batch.
 DEFAULT_MAX_FILES_PER_TRIGGER = 1000
@@ -170,20 +177,35 @@ def _read_files(config: PipelineConfig) -> str:
     return f"read_files({_sql_string(config.path)}, {', '.join(options)})"
 
 
+# SHA-256 of every column the source gave a row, as the first thing done to it. ``*`` in the same
+# SELECT is only what the source produced, never the audit columns beside it, so no column list
+# is needed. ``to_json`` leaves nulls out and keeps names, so an empty string differs from a null.
+ROW_HASH_EXPR = f"sha2(to_json(struct(*)), 256) AS {SRC_ROW_HASH}"
+
+
 def projection_exprs(config: PipelineConfig, source: str) -> list[str]:
     """Select list for one file read. Lineage columns are part of the raw table, not a second pass."""
 
-    metadata = ["_metadata.file_path AS _source_file", "current_timestamp() AS _ingested_at"]
+    metadata = [
+        f"_metadata.file_path AS {SRC_FILE_PATH}",
+        f"_metadata.file_name AS {SRC_FILE_NAME}",
+        f"current_timestamp() AS {INGEST_TIMESTAMP}",
+    ]
     if config.file_format == "fixed_width":
         fields = [
             f"substring(value, {column.start}, {column.length}) AS {column.name}"
             for column in config.fixed_columns
         ]
-        return fields + metadata
+        # The fields are computed here, so the hash is of the line they were cut from.
+        return [*fields, f"sha2(value, 256) AS {SRC_ROW_HASH}", *metadata]
     if config.file_format == "yaml":
         column = "value" if source == "file" else "content"
-        return [f"CAST({column} AS STRING) AS content", *metadata]
-    return ["*", *metadata]
+        return [
+            f"CAST({column} AS STRING) AS content",
+            f"sha2(CAST({column} AS STRING), 256) AS {SRC_ROW_HASH}",
+            *metadata,
+        ]
+    return ["*", ROW_HASH_EXPR, *metadata]
 
 
 def _projection(config: PipelineConfig, source: str) -> str:

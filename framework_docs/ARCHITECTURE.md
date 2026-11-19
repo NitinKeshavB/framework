@@ -307,7 +307,7 @@ What each table the pipeline writes holds, beyond the spec's `columns`:
 
 | Table | Extra columns | Rows |
 | --- | --- | --- |
-| `<pipeline_id>_staged` | `_source_file` and `_ingested_at` (volume files), `_ingested_at` (database), `_rescued_data` (Auto Loader on CSV, delimited, JSON, text), `_dq_failed_rules` | Every source row |
+| `<pipeline_id>_staged` | `_src_file_path`, `_src_file_name` (files), `_src_row_hash`, `_ingest_timestamp`, `_rescued_data` (Auto Loader on CSV, delimited, JSON, text), `_dq_failed_rules`; `_batch_id` is added when the row is staged | Every source row |
 | bronze | The same lineage columns, without `_dq_failed_rules` | Rows with no failed rule; with Auto CDC, the latest row per key by the watermark |
 | quarantine | The same lineage columns and `failed_rules` | Rows with at least one failed rule |
 
