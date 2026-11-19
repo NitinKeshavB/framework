@@ -36,7 +36,7 @@ Start with one silver and one gold example and review the shape before building.
 
 **Done (A).** `job_runs` / `job_task_runs` are append-only; views dedupe by `recorded_at`. Removes MERGE conflicts under 1000 concurrent NRT writers. Keep this regardless of B/C.
 
-**Next (B) — one writer, delete bookkeeping tasks.** Drop `record_load_metrics` and `record_this_run` from every delivery job. Run one continuous (or 1–5 min micro-batch) consumer that reads consolidated pipeline events + `system.lakeflow` and appends `load_ledger` / `job_runs` as a single writer. Removes ~2000 serverless cold starts and ~3000 commits per wave. Build toward this once pipeline_events consolidation from §3.3 is in place.
+**Done (B, a different way) — no bookkeeping tasks.** `record_load_metrics` and `record_this_run` are gone from every delivery job. Each pipeline records its own loads with an event hook (`pipeline_metrics`), once per update, into `load_ledger`, `file_ledger` and `load_metric`; the hourly `framework_runs` writes job runs and pipeline updates, and the ledger row of any update whose hook was cut off. That removes the cold start and commits of two tasks per run. A single consolidated consumer is no longer needed for recon.
 
 **Optional (C) — Zerobus if per-job push stays.** If B is deferred and jobs must still report, push a few records via Zerobus Ingest instead of a Delta commit per job (~150 ms durable, ~5 s queryable). At-least-once → duplicates OK (views already dedupe). Pre-create UC managed Delta targets; grant MODIFY+SELECT **directly on the table** to the SP (schema inheritance is not enough). Check region availability first.
 
@@ -47,7 +47,8 @@ Start with one silver and one gold example and review the shape before building.
 ## Still open from the framework review
 
 - **Production settings.** Every bundle's `prod` target still uses the `aal_dev_fdh` catalog. Set the prod catalog before a production deploy. Set each source's `run_as` (service principal) in `source.yaml` and grant that SP only its raw volume / foreign catalog / bronze schema.
-- **system.lakeflow grant.** Hourly `framework_runs` prefers `system.lakeflow`; grant the job identity `SELECT` on it (or keep the Jobs API fallback). Freshness is typically up to ~1 hour — NRT stays on `record_this_run`.
+- **system.lakeflow grant.** Hourly `framework_runs` prefers `system.lakeflow`; grant the job identity `SELECT` on it (or keep the Jobs API fallback). Freshness of job runs is typically up to ~1 hour; load recon does not depend on it.
+- **File handling not built yet.** Backfill by file name or date does not cover tables that keep history by key (`scd1`, `scd2`) or database loads (use `full_refresh` for those). A zip file is not unpacked. A "fail when more than N% of rows are bad" limit does not exist. The per-file counts of an update whose hook was cut off are not recovered (the totals are). A job has no "succeeded with warning" status, so a backfill's warning is in its task output and the ledger.
 - **Large database tables.** An `incremental_column` would let a `database` load read only rows newer than the last load instead of the whole table. Not decided.
 - **Archiving loaded files.** Auto Loader's `cleanSource` could move or delete files after they load. Not decided; the raw volume currently keeps every file.
 

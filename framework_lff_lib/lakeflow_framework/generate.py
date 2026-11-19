@@ -204,7 +204,7 @@ def _pipeline_resource(name: str, tables: list[SourceTable], *, run_as: str = ""
         "serverless": True,
         "channel": "current",
         "continuous": False,
-        # record_load_metrics / framework_runs find the log by this name.
+        # framework_runs finds the log by this name (the pipeline's own hook reads its events live).
         "event_log": {
             "catalog": "${var.catalog}",
             "schema": "framework_events",
@@ -214,6 +214,10 @@ def _pipeline_resource(name: str, tables: list[SourceTable], *, run_as: str = ""
         "configuration": {
             MANIFEST_SETTING: f"${{workspace.file_path}}/{BUILD_DIR}/manifests/{name}.json",
             CATALOG_SETTING: "${var.catalog}",
+            # A production pipeline restarts a failed update by itself. A file blocked by a fail
+            # rule fails the update on purpose, and the restart finds the file already read and
+            # nothing new, so it would finish and the run would look like a success.
+            "pipelines.numUpdateRetryAttempts": "0",
         },
         "libraries": [{"file": {"path": f"../pipelines/{name}.py"}}],
         # A pipeline does not accept whl libraries, and the CLI does not rewrite a

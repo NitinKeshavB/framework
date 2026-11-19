@@ -95,6 +95,13 @@ class _Frame:
         self.reader.selects = getattr(self.reader, "selects", []) + [parts]
         return self
 
+    def select(self, *parts):
+        return self
+
+    def join(self, other, on=None, how=None):
+        self.reader.joins = getattr(self.reader, "joins", []) + [(on, how)]
+        return self
+
     @property
     def columns(self):
         return list(self.payload.get("columns") or [])
@@ -130,6 +137,16 @@ class _Spark:
     def __init__(self):
         self.reads, self.building = [], None
         self.readStream, self.read = _Reader(self), _Reader(self)
+        self.statements: list[str] = []
+
+    def createDataFrame(self, data, schema=None):  # noqa: N802 (Spark's name)
+        self.reads.append((self.building, "rows", None))
+        return _Frame(self.read)
+
+    def sql(self, statement):
+        self.statements.append(statement)
+        self.reads.append((self.building, "sql", None))
+        return _Frame(self.read)
 
 
 class _Pipelines:
@@ -191,13 +208,14 @@ def test_volume_spec_reads_the_raw_volume_and_has_no_raw_table(tmp_path: Path) -
     assert [dataset.kind for dataset in graph.datasets] == [
         "staged",
         "valid",
+        "files",
         "bronze",
         "quarantine",
     ]
     assert graph.datasets[0].detail["source"] == config.path
-    assert graph.datasets[3].detail == {
+    assert graph.datasets[4].detail == {
         "source": "files_things_staged",
-        "where": "size(_dq_failed_rules) > 0",
+        "where": "_dq_result IN ('fail', 'quarantine')",
     }
 
 
@@ -505,6 +523,7 @@ def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path
     assert pipelines.kinds == {
         staged: "table",
         "files_things_valid": "view",
+        "files_things_files": "materialized_view",
         bronze: "table",
         quarantine: "table",
     }
@@ -512,6 +531,7 @@ def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path
     assert spark.reads == [
         (staged, "files", config.path),
         ("files_things_valid", "table", staged),
+        ("files_things_files", "sql", None),
         (bronze, "table", "files_things_valid"),
         (quarantine, "table", staged),
     ]

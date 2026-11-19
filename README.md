@@ -13,7 +13,7 @@ source system ──delivery──▶ bronze ──▶ silver / gold / product
 | Folder | Role | Owner |
 | --- | --- | --- |
 | `framework_lff_lib` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
-| `framework_bundle` | The deployed framework: the wheel, frozen `framework_meta` DDL, hourly `framework_runs` catch-up, and daily `OPTIMIZE` / archive | Platform team |
+| `framework_bundle` | The deployed framework: the wheel, frozen `framework_meta` DDL, hourly `framework_runs`, daily `OPTIMIZE` / archive, and the `framework_backfill` job (reload files of any table, or refresh it) | Platform team |
 | `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
 | `framework_curation` | One bundle per project for silver, gold, and data products, with ownership checks and maps | One project each |
 | `framework_examples/ingestion` | Specs for each ingestion kind: a raw volume, SharePoint, a database, and cloud files | None |
@@ -73,7 +73,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 2. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry and applies the specs' tags and column comments in Unity Catalog. It is the only writer of definitions.
 3. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
 
-`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job refreshes its pipeline (then records load metrics and NRT run status): the pipeline reads its delivery from `lff.manifest`, and a run does not write the registry.
+`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job refreshes its pipeline, which records its own load metrics: the pipeline reads its delivery from `lff.manifest`, and a run does not write the registry.
 
 ## See what is running
 
@@ -92,10 +92,11 @@ Query `<catalog>.framework_meta`:
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
 | `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` (written by the hourly `framework_runs` job, which also records runs that never reached the pipeline) |
-| `v_loads`, `v_load_failures` | Per-load recon and failures, written by the pipeline itself once per update (an event hook): rows read, written, upserted, deleted, quarantined, status, and the error. `batch_id` joins a row to its load |
+| `v_loads`, `v_load_failures` | Per-load recon and failures, written by the pipeline itself once per update (an event hook): rows read, written, upserted, deleted, quarantined, dropped and blocked, files read and failed, status, and the error. Counts are never NULL. `batch_id` joins a row to its load. A job can succeed while its load is `FAILED` (a file did not come, or came empty) |
+| `file_ledger` | One row per file per load: status (`PROCESSED`, `WARNING`, `FAILED`), its counts, the rules that blocked it, and why it failed. `load_kind` says whether a regular load or a backfill wrote it |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 | `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
-| `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations (NRT + hourly catch-up) |
+| `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations (recorded hourly) |
 | `v_job_costs`, `v_pipeline_costs` | DBUs and list cost per run and update. Only when `system_views` is `true` |
 | `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
 | `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source. Only when `system_views` is `true` |
@@ -121,6 +122,9 @@ source venv/bin/activate        # or set PYTHON to a venv's python
 ./run.sh install                # editable install with the dev tools
 ./run.sh test:quick             # package tests; no Spark
 ./run.sh lint                   # pre-commit: Ruff, mypy, hygiene, generate checks
+./run.sh check:rules <profile> <warehouse-id> [catalog]   # run every quality rule on a warehouse before deploying
+./run.sh backfill <target> <profile> table=<id> mode=files|dates|failed|full_refresh [files=a.csv,b.csv] [date_from=.. date_to=..] [dry_run=false] [confirm=true]
+                                # reload files of one table, or refresh it, through its own rules; a dry run unless dry_run=false
 ./run.sh generate:check         # also a local pre-commit hook when ingestion paths change
 ./run.sh projects:check         # also a local pre-commit hook when curation/example paths change
 ./run.sh clean                  # remove wheels, build output, and caches
@@ -132,6 +136,6 @@ source venv/bin/activate        # or set PYTHON to a venv's python
 - [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, `project.yaml`
 - [framework_docs/END_TO_END.md](framework_docs/END_TO_END.md) for the run path, quality rules, and the registry
 - [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the flows, the data model of every table the framework writes, the module boundaries, and the design choices
-- [framework_docs/META_MODEL_REVIEW.md](framework_docs/META_MODEL_REVIEW.md) for the frozen `framework_meta` schema, NRT vs hourly `framework_runs`, and removed objects
+- [framework_docs/META_MODEL_REVIEW.md](framework_docs/META_MODEL_REVIEW.md) for the frozen `framework_meta` schema, who writes what and when, and removed objects
 - [framework_docs/MAINTAINERS.md](framework_docs/MAINTAINERS.md) for versioning, deploy, and what not to change
 - [framework_docs/ROADMAP.md](framework_docs/ROADMAP.md) for what is built, phase 1, and what is not verified

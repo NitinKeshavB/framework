@@ -117,10 +117,20 @@ class Column:
     pii: list[str] = field(default_factory=list)
 
 
+# What happens to a row that fails a rule (``raw_to_bronze.on_bad_rows`` for all of a table's
+# rules, ``on_fail`` on one rule to override it):
+#   quarantine  the row goes to the quarantine table; the good rows load (the default)
+#   drop        the row is discarded and kept nowhere
+#   warn        the row loads as usual; the failure is only counted in the metrics
+#   fail        the update fails, so no row of that run reaches bronze
+RULE_ACTIONS = ("quarantine", "drop", "warn", "fail")
+
+
 @dataclass
 class QualityRule:
     name: str
     expression: str
+    action: str = "quarantine"
 
 
 @dataclass
@@ -146,6 +156,7 @@ class FileSourceOptions:
     path_glob: str | None = None
     json_multiline: bool = False
     file_events: bool = False
+    expect_file: bool = False
     fixed_columns: list[FixedColumn] = field(default_factory=list)
 
 
@@ -191,6 +202,7 @@ class PipelineConfig:
     watermark_column: str | None = None
     columns: list[Column] = field(default_factory=list)
     rules: list[QualityRule] = field(default_factory=list)
+    on_bad_rows: str = "quarantine"  # the action of every rule that does not say its own
     fixed_columns: list[FixedColumn] = field(default_factory=list)
     delimiter: str | None = None
     header: bool = True
@@ -200,6 +212,10 @@ class PipelineConfig:
     path_glob: str | None = None
     json_multiline: bool = False
     file_events: bool = False
+    # Every run is expected to bring a file with rows. A run with no new file, or a file with no
+    # rows, is recorded FAILED in the ledger (the job still succeeds). On by default for a table
+    # in a scheduled delivery.
+    expect_file: bool = False
     cluster_by: list[str] = field(default_factory=list)
     load_type: str = "insert_only"
     delete_when: str | None = None
@@ -326,6 +342,7 @@ class PipelineConfig:
             _put(source, "path_glob", self.path_glob)
             _put(source, "multiline", True if self.json_multiline else None)
             _put(source, "file_events", True if self.file_events else None)
+            _put(source, "expect_file", True if self.expect_file else None)
             if self.fixed_columns:
                 source["fixed_columns"] = [
                     {"name": column.name, "start": column.start, "length": column.length}
@@ -359,7 +376,14 @@ class PipelineConfig:
                 "primary_keys": list(self.primary_keys),
                 "columns": [_column_document(column) for column in self.columns],
                 "rules": [
-                    {"name": rule.name, "expression": rule.expression} for rule in self.rules
+                    {
+                        "name": rule.name,
+                        "expression": rule.expression,
+                        # Only when it differs from the table's setting, so a spec that sets
+                        # neither keeps the same hash it had before the setting existed.
+                        **({"on_fail": rule.action} if rule.action != self.on_bad_rows else {}),
+                    }
+                    for rule in self.rules
                 ],
             },
             "quarantine": _table_document(
@@ -372,6 +396,8 @@ class PipelineConfig:
         if self.cluster_by:
             document["raw_to_bronze"]["bronze"]["cluster_by"] = list(self.cluster_by)
         document["raw_to_bronze"]["load_type"] = self.load_type
+        if self.on_bad_rows != "quarantine":
+            document["raw_to_bronze"]["on_bad_rows"] = self.on_bad_rows
         _put(document["raw_to_bronze"], "delete_when", self.delete_when)
         _put(document, "description", self.description or None)
         _put(document["quarantine"], "description", self.quarantine_description or None)
@@ -655,6 +681,12 @@ def compose_document(
         if problems:
             return spec, problems
         path = f"/Volumes/{catalog}/{schema}/{name}/" + (f"{raw_path}/" if raw_path else "")
+        # A scheduled delivery runs whether or not a file came, so it expects one each run unless
+        # the table says otherwise. A delivery fired by a file arriving always has one.
+        deliveries = source.get("deliveries") if isinstance(source.get("deliveries"), dict) else {}
+        detail = deliveries.get(str(spec.get("delivery") or "")) or {}
+        if isinstance(detail, dict) and detail.get("schedule") and "expect_file" not in authored:
+            authored["expect_file"] = True
         source_section = {"system": system, "path": path, **authored}
         document["source_to_raw"] = {"method": "volume_files", "source": source_section}
     elif kind == DATABASE_KIND:
@@ -821,11 +853,13 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         | ({str(watermark)} if watermark else set())
         | LINEAGE_COLUMNS
     )
+    on_bad_rows = _rule_action(raw_to_bronze.get("on_bad_rows"), "on_bad_rows", label, errors)
     rules = _rules(
         raw_to_bronze.get("rules"),
         label,
         errors,
         columns=rule_columns,
+        default_action=on_bad_rows,
     )
     cluster_by = _cluster_by(bronze_target.get("cluster_by"), columns, label, errors)
     delete_when = _delete_when(
@@ -890,7 +924,9 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         path_glob=file_options.path_glob if file_options else None,
         json_multiline=file_options.json_multiline if file_options else False,
         file_events=file_options.file_events if file_options else False,
+        expect_file=file_options.expect_file if file_options else False,
         cluster_by=cluster_by,
+        on_bad_rows=on_bad_rows,
         load_type=load_type,
         delete_when=delete_when,
         description=description,
@@ -924,6 +960,7 @@ _FILE_ONLY_KEYS = frozenset(
         "path_glob",
         "multiline",
         "file_events",
+        "expect_file",
         "max_files_per_trigger",
         "fixed_columns",
         "external_location",
@@ -1033,6 +1070,12 @@ def _parse_file_source(
         errors.append(f"{label}: file_events applies only to files read by Auto Loader")
         ok = False
 
+    expect_file = source.get("expect_file", False)
+    if not isinstance(expect_file, bool):
+        errors.append(f"{label}: expect_file must be true or false")
+        expect_file = False
+        ok = False
+
     max_files = source.get("max_files_per_trigger")
     max_files_value: int | None = None
     if max_files is not None:
@@ -1060,6 +1103,7 @@ def _parse_file_source(
         path_glob=_optional_text(source.get("path_glob")),
         json_multiline=multiline,
         file_events=file_events,
+        expect_file=expect_file,
         fixed_columns=fixed_columns,
     )
 
@@ -1508,8 +1552,25 @@ def _column_tags(
     return classification, pii
 
 
+def _rule_action(value: Any, key: str, label: str, errors: list[str]) -> str:
+    """What to do with a row that fails a rule: one of ``RULE_ACTIONS``. Omitted: quarantine."""
+
+    if value is None:
+        return "quarantine"
+    action = str(value)
+    if action not in RULE_ACTIONS:
+        errors.append(f"{label}: {key} must be one of {', '.join(RULE_ACTIONS)}; got '{action}'")
+        return "quarantine"
+    return action
+
+
 def _rules(
-    value: Any, label: str, errors: list[str], *, columns: set[str] | None = None
+    value: Any,
+    label: str,
+    errors: list[str],
+    *,
+    columns: set[str] | None = None,
+    default_action: str = "quarantine",
 ) -> list[QualityRule]:
     from lakeflow_framework.quality import assert_safe_rule_expression
 
@@ -1535,9 +1596,14 @@ def _rules(
         seen.add(name)
         before = len(errors)
         assert_safe_rule_expression(expression, known, label=label, name=name, errors=errors)
+        action = (
+            _rule_action(item["on_fail"], f"rule '{name}' on_fail", label, errors)
+            if item.get("on_fail") is not None
+            else default_action
+        )
         if len(errors) > before:
             continue
-        rules.append(QualityRule(name, expression))
+        rules.append(QualityRule(name, expression, action))
     return rules
 
 

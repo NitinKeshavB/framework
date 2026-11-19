@@ -17,6 +17,8 @@ from lakeflow_framework.load import RESCUE_FORMATS
 
 # Each rule is evaluated once, into this column. Pass, fail, and expectations all read it.
 DQ_COLUMN = "_dq_failed_rules"
+# What the row's failed rules mean for it: fail, quarantine, drop or pass. File sources only.
+DQ_RESULT = "_dq_result"
 PASSED = f"size({DQ_COLUMN}) = 0"
 FAILED = f"size({DQ_COLUMN}) > 0"
 
@@ -131,6 +133,7 @@ class CompiledRule:
     name: str
     expression: str
     origin: str
+    action: str = "quarantine"  # quarantine, drop, warn, or fail
 
     def holds(self) -> str:
         return f"COALESCE(({self.expression}), false)"
@@ -193,23 +196,29 @@ def assert_safe_rule_expression(
 
 
 def compile_rules(config: PipelineConfig) -> list[CompiledRule]:
-    rules = [CompiledRule(rule.name, rule.expression, "declared") for rule in config.rules]
+    """The declared rules, then the checks the framework adds. The added ones follow the table's
+    ``on_bad_rows``: a table set to fail also fails on a missing key or an unreadable value."""
+
+    action = config.on_bad_rows
+    rules = [
+        CompiledRule(rule.name, rule.expression, "declared", rule.action) for rule in config.rules
+    ]
     for key in config.primary_keys:
-        rules.append(CompiledRule(f"not_null_{key}", f"{key} IS NOT NULL", "key"))
+        rules.append(CompiledRule(f"not_null_{key}", f"{key} IS NOT NULL", "key", action))
     sequence = config.watermark_column
     if config.dedup and sequence and sequence not in config.primary_keys:
         # Auto CDC cannot order a row whose sequence value is null.
-        rules.append(CompiledRule(f"not_null_{sequence}", f"{sequence} IS NOT NULL", "key"))
+        rules.append(CompiledRule(f"not_null_{sequence}", f"{sequence} IS NOT NULL", "key", action))
     for column in config.columns:
         expression = (
             f"TRY_CAST({column.name} AS {column.type_name}) IS NOT NULL OR {column.name} IS NULL"
         )
-        rules.append(CompiledRule(f"cast_{column.name}", expression, "type"))
+        rules.append(CompiledRule(f"cast_{column.name}", expression, "type", action))
     if (
         config.load_method in {"autoloader", "volume_files"}
         and config.file_format in RESCUE_FORMATS
     ):
-        rules.append(CompiledRule("schema_conformance", "_rescued_data IS NULL", "schema"))
+        rules.append(CompiledRule("schema_conformance", "_rescued_data IS NULL", "schema", action))
     return rules
 
 
@@ -222,7 +231,86 @@ def failed_rules_sql(rules: list[CompiledRule]) -> str:
     return "transform(filter(array(" + structs + "), entry -> NOT entry.ok), entry -> entry.rule)"
 
 
-def expectations(rules: list[CompiledRule]) -> dict[str, str]:
-    """One warn expectation per rule, read from DQ_COLUMN so the rule is not evaluated again."""
+def expectations(rules: list[CompiledRule], *, files: bool = False) -> dict[str, str]:
+    """One warn expectation per rule that does not fail the update, for the counts in the UI and
+    the event log. Read from DQ_COLUMN so the rule is not evaluated again.
 
-    return {rule.name: f"NOT array_contains({DQ_COLUMN}, '{rule.name}')" for rule in rules}
+    A file source blocks the file instead of failing mid-flow, so its ``fail`` rules count here too.
+    """
+
+    return {
+        rule.name: f"NOT array_contains({DQ_COLUMN}, '{rule.name}')"
+        for rule in rules
+        if files or rule.action != "fail"
+    }
+
+
+def fail_expectations(rules: list[CompiledRule], *, files: bool = False) -> dict[str, str]:
+    """The rules that fail the whole update when any row breaks them (``expect_all_or_fail``).
+
+    Only for sources that are not files. A file source never uses this: a failed flow would leave
+    the file unread, so it would be picked up again. Its ``fail`` rules block the file instead (see
+    ``blocking_rules``) and a check after the load fails the update.
+    """
+
+    if files:
+        return {}
+    return {
+        rule.name: f"NOT array_contains({DQ_COLUMN}, '{rule.name}')"
+        for rule in rules
+        if rule.action == "fail"
+    }
+
+
+def blocking_rules(rules: list[CompiledRule]) -> list[str]:
+    """Names of the ``fail`` rules: one row breaking one of them blocks its whole file."""
+
+    return [rule.name for rule in rules if rule.action == "fail"]
+
+
+def result_sql(rules: list[CompiledRule]) -> str:
+    """What happens to a row, decided once when it is staged and stored with it: ``fail`` (its file
+    is blocked), ``quarantine``, ``drop`` or ``pass`` (a warn-only row passes).
+
+    Stored, not recomputed, so a rule changed later never reclassifies rows already read.
+    """
+
+    branches = []
+    for action in ("fail", "quarantine", "drop"):
+        names = [rule.name for rule in rules if rule.action == action]
+        if names:
+            branches.append(f"WHEN arrays_overlap({DQ_COLUMN}, {_names(names)}) THEN '{action}'")
+    return "CASE " + " ".join(branches) + " ELSE 'pass' END" if branches else "'pass'"
+
+
+def valid_where(rules: list[CompiledRule], *, files: bool = False) -> str:
+    """The rows that go to bronze: those that broke no quarantine or drop rule.
+
+    A row that broke only a warn rule is kept. For a file source a row of a blocked file is kept
+    out by the caller; for any other source a ``fail`` rule fails the update before this runs.
+    """
+
+    if files:
+        return f"{DQ_RESULT} = 'pass'"
+    if all(rule.action == "quarantine" for rule in rules):
+        return PASSED
+    blocking = [rule.name for rule in rules if rule.action in {"quarantine", "drop"}]
+    if not blocking:
+        return "true"
+    return f"NOT arrays_overlap({DQ_COLUMN}, {_names(blocking)})"
+
+
+def quarantine_where(rules: list[CompiledRule], *, files: bool = False) -> str:
+    """The rows that go to quarantine: those that broke a quarantine rule (and, for a file source,
+    a ``fail`` rule: the bad rows of a blocked file are kept for inspection)."""
+
+    if files:
+        return f"{DQ_RESULT} IN ('fail', 'quarantine')"
+    if all(rule.action == "quarantine" for rule in rules):
+        return FAILED
+    names = [rule.name for rule in rules if rule.action == "quarantine"]
+    return f"arrays_overlap({DQ_COLUMN}, {_names(names)})" if names else "false"
+
+
+def _names(names: list[str]) -> str:
+    return "array(" + ", ".join(f"'{name}'" for name in names) + ")"

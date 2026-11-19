@@ -79,7 +79,12 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
         )
 
     rules = [
-        {"name": rule.name, "expression": rule.expression, "origin": rule.origin}
+        {
+            "name": rule.name,
+            "expression": rule.expression,
+            "origin": rule.origin,
+            "action": rule.action,
+        }
         for rule in compile_rules(config)
     ]
     rows = [

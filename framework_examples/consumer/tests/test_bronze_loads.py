@@ -31,6 +31,7 @@ def test_billing_publishes_raw_to_bronze():
         "raw",
         "staged",
         "valid",
+        "files",
         "bronze",
         "quarantine",
     ]

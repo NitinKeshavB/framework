@@ -3,15 +3,15 @@
 This document freezes the metadata schema after removing unused dual-path objects.
 Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA … CASCADE`).
 
-## Hourly `framework_runs` vs NRT (not a 1-hour metrics lag)
+## Who writes what, and when
 
 | Writer | When | What | Lag |
 | --- | --- | --- | --- |
-| Delivery job `record_load_metrics` (`run_if: ALL_DONE`) | End of every delivery run | `load_ledger` → `v_loads` / `v_load_failures` | **Near real time** (same job) |
-| Delivery job `record_this_run` | After metrics, every run | `job_runs` (+ tasks when available) → `v_job_status` | **Near real time** |
-| Hourly `framework_runs` | Cron `0 15 * * * ?` | Catch-up MERGE into `job_runs` / `job_task_runs` / `pipeline_updates` from Jobs API + event logs | Up to ~1h **only for catch-up** (missed NRT, non-delivery jobs, pipeline_updates fill) |
+| The pipeline's event hook (`pipeline_metrics`) | Once per update, when every flow has finished | `load_ledger`, `file_ledger`, `load_metric` → `v_loads` / `v_load_failures` | **Near real time** (inside the pipeline; no task after it) |
+| `framework_backfill` | When someone runs it | The same three tables, `load_kind = 'backfill'` | Immediate |
+| Hourly `framework_runs` | Cron `0 15 * * * ?` | `job_runs` / `job_task_runs` / `pipeline_updates` from `system.lakeflow` or the Jobs API and event logs, and the `load_ledger` row of an update whose hook was cut off at shutdown | Up to ~1h |
 
-**Recon and job status for delivery jobs do not wait on the hourly job.** Query `v_loads` and `v_job_status` after the run. Keep `framework_runs` as safety net and for `pipeline_updates`.
+**Recon for delivery jobs does not wait on the hourly job.** Query `v_loads` after the run. Job run status (`v_job_status`) is as fresh as the last `framework_runs`. The recording tasks `record_load_metrics` and `record_this_run` no longer exist.
 
 ## Analysis: removed as unnecessary
 
@@ -46,15 +46,14 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 | Writer at run time | Pattern | Under 1000 parallel jobs |
 | --- | --- | --- |
-| `record_load_metrics` → `load_ledger` | Append-only INSERT | Designed for fan-out. Concurrent Delta appends scale; expect more small files until daily `OPTIMIZE` / auto-optimize. |
-| `record_this_run` → `job_runs` | MERGE on `(job_id, run_id)` | Different runs → different keys (low conflict). Many concurrent MERGEs on one table still queue briefly in Delta commits. |
-| `job_task_runs` | Same MERGE pattern | Same as `job_runs`. |
+| The event hook → `load_ledger`, `file_ledger`, `load_metric` | Append-only writes, three at once | Designed for fan-out. Concurrent Delta appends scale; expect more small files until daily `OPTIMIZE` / auto-optimize. `file_ledger` adds one row per file, so a run of many files writes many rows in one append. |
+| `job_runs`, `job_task_runs` | Append-only INSERT by `framework_runs` | One writer, hourly; views keep the latest row per key. |
 | `<job>_event_log` | One table per delivery | Isolated — no cross-job write contention. |
-| Hourly `framework_runs` | Catch-up MERGE | Off the NRT critical path; a burst may make catch-up take longer. |
+| Hourly `framework_runs` | Catch-up | Off the load path; a burst may make catch-up take longer. |
 
 **Usually hits first (workspace limits, not meta design):** Jobs/Lakeflow pipeline concurrency quotas, serverless capacity, UC API rate limits.
 
-**Guidance:** recon/status meta can absorb high fan-out. Rely on append to `load_ledger` (never multi-job MERGE into it). After large parallel waves, let `framework_optimize` compact. If `job_runs` MERGE latency spikes under extreme parallelism, NRT status can lag slightly while `load_ledger` appends stay fine — watch commit duration.
+**Guidance:** recon meta can absorb high fan-out. Rely on append to `load_ledger` and `file_ledger` (never multi-job MERGE into them). After large parallel waves, let `framework_optimize` compact.
 
 ## Frozen read API (query these)
 
@@ -64,13 +63,13 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 **Optional (system grants):** `v_job_costs`, `v_pipeline_costs`, `v_observed_lineage`
 
-**Physical tables still written:** `asset_registry`, `asset_registry_current` (with stable `asset_id`), `ownership_refusals`, `job_runs`, `job_task_runs`, `pipeline_updates`, `load_ledger` (`pipeline_id` = spec id, `update_pipeline_uuid` = Lakeflow UUID), `load_metric` (long shape), matching `*_archive`, `ref_*` enum tables, `ddl_applied`, plus per-job `*_event_log` under `framework_events`. `table_health` / `run_ledger` / `run_current` were removed. Append-only facts use views for latest-per-key.
+**Physical tables still written:** `asset_registry`, `asset_registry_current` (with stable `asset_id`), `ownership_refusals`, `job_runs`, `job_task_runs`, `pipeline_updates`, `load_ledger` (`pipeline_id` = spec id, `update_pipeline_uuid` = Lakeflow UUID; counts including `rows_dropped`, `rows_blocked`, `files_read`, `files_failed`, and `batch_id`), `file_ledger` (one row per file per load), `load_metric` (long shape), matching `*_archive`, `ref_*` enum tables, `ddl_applied`, plus per-job `*_event_log` under `framework_events`. `table_health` / `run_ledger` / `run_current` were removed. Append-only facts use views for latest-per-key.
 
 ## Ops: failure and repair
 
-1. Query `v_load_failures` and/or `v_job_status`.
+1. Query `v_load_failures` and/or `v_job_status`. A job can be green while its load is `FAILED` (no file, or an empty one): query `v_loads` for `target_status = 'FAILED'`, and `file_ledger` for the file.
 2. Fix the cause.
-3. Jobs UI: **Repair and run failed tasks**.
+3. A failed run: Jobs UI **Repair and run failed tasks**. A file that was read is not read again, so a blocked or empty file is reloaded with `./run.sh backfill` (`mode=files` or `mode=failed`).
 4. Confirm a new `v_loads` row and SUCCEEDED status.
 
 ## Deploy note

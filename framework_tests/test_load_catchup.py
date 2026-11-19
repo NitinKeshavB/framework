@@ -6,10 +6,11 @@ import json
 
 from lakeflow_framework.load_catchup import catch_up_loads
 from lakeflow_framework.load_metrics import LEDGER_COLUMNS
+from lakeflow_framework.pipeline_metrics import EXTRA_LEDGER_COLUMNS
 from test_pipeline_metrics import BRONZE, QUARANTINE, loaded
 
 UPDATE_ID = "0f8fad5b-d9cb-469f-a165-70867728950e"
-COLUMNS = [*LEDGER_COLUMNS, "batch_id"]
+COLUMNS = [*LEDGER_COLUMNS, "batch_id", *EXTRA_LEDGER_COLUMNS]
 
 
 class Frame:
@@ -78,6 +79,8 @@ class Spark:
             return [{"update_id": update_id} for update_id in self.missing]
         if "to_json(named_struct" in statement:
             return [{"event": json.dumps(event)} for event in loaded(100, 90, 10)]
+        if "WHERE _batch_id =" in statement:  # the run's per-file counts: none in this test
+            return []
         if "SELECT DISTINCT _batch_id" in statement:
             return [{"batch": batch} for batch in self.batches]
         if "framework_meta.load_ledger WHERE job_name" in statement:
@@ -108,7 +111,7 @@ def test_an_update_with_no_ledger_row_is_replayed_and_written() -> None:
     assert (row["rows_read"], row["rows_written"], row["rows_quarantine"]) == (100, 90, 10)
     assert row["target_status"] == "COMPLETED" and row["failure_reason"] is None
     assert row["batch_id"] == "batch-1"
-    assert len(spark.saved["aal_dev_fdh.framework_meta.load_metric"]) == 6
+    assert len(spark.saved["aal_dev_fdh.framework_meta.load_metric"]) == 10
     # Only the pipeline's own event log was read, and only the last week of it.
     lookup = next(s for s in spark.statements if "NOT EXISTS" in s)
     assert "aal_dev_fdh.framework_events.abs_daily_event_log" in lookup

@@ -13,6 +13,7 @@ from lakeflow_framework.config import config_from_document
 from lakeflow_framework.load_metrics import LEDGER_COLUMNS
 from lakeflow_framework.pipeline import _configs_from_manifest, _install_recorder
 from lakeflow_framework.pipeline_metrics import (
+    EXTRA_LEDGER_COLUMNS,
     LEDGER_SCHEMA,
     Dataflow,
     UpdateRecorder,
@@ -342,12 +343,15 @@ class _Spark:
 
     def __init__(self, recorded: tuple[str, ...] = ()) -> None:
         self.recorded = recorded
+        self.files: list[dict] = []
         self.queries: list[str] = []
         self.saved: dict[str, _Frame] = {}
 
     def sql(self, statement: str):
         assert statement.lstrip().upper().startswith("SELECT"), "a pipeline allows only SELECT"
         self.queries.append(statement)
+        if "_batch_id =" in statement:  # the per-file view of a run
+            return type("Result", (), {"collect": lambda _self: self.files})()
         return type(
             "Result", (), {"collect": lambda _self: [{"dataflow": d} for d in self.recorded]}
         )()
@@ -361,8 +365,9 @@ def test_ledger_records_match_the_ledger_columns_with_zeros_not_nulls() -> None:
     at = datetime(2026, 11, 19, tzinfo=UTC)
     records = ledger_records(rows, at)
     columns = [part.split()[0] for part in LEDGER_SCHEMA.split(", ")]
-    # The table's order: LEDGER_COLUMNS, then batch_id, which ALTER TABLE added after recorded_at.
-    assert columns == [*LEDGER_COLUMNS, "batch_id"] and len(records) == 2
+    # The table's order: LEDGER_COLUMNS, then batch_id and the later counts that ALTER TABLE added.
+    assert columns == [*LEDGER_COLUMNS, "batch_id", *EXTRA_LEDGER_COLUMNS] and len(records) == 2
+    assert all(value is not None for record in records for value in record[-4:])
     first = dict(zip(columns, records[0], strict=True))
     assert (first["rows_read"], first["rows_written"], first["rows_quarantine"]) == (5, 5, 0)
     assert (first["rows_upserted"], first["rows_deleted"]) == (0, 0)
@@ -382,6 +387,10 @@ def test_metric_records_have_every_metric_for_every_dataflow() -> None:
         "rows_deleted": 0,
         "rows_quarantine": 10,
         "rows_processed": 100,
+        "rows_dropped": 0,
+        "rows_blocked": 0,
+        "files_read": 0,
+        "files_failed": 0,
     }
     assert all(
         record[:4] == ("abs_daily", "bronze", UPDATE, "abs_accounting") for record in records
@@ -396,7 +405,7 @@ def test_write_rows_appends_with_the_dataframe_writer_not_sql() -> None:
     ledger = spark.saved["aal_dev_fdh.framework_meta.load_ledger"]
     metric = spark.saved["aal_dev_fdh.framework_meta.load_metric"]
     assert (ledger.save_mode, metric.save_mode) == ("append", "append")
-    assert len(ledger.data) == 1 and len(metric.data) == 6
+    assert len(ledger.data) == 1 and len(metric.data) == 10
     assert ledger.schema == LEDGER_SCHEMA
 
 
@@ -516,7 +525,7 @@ def test_the_pipeline_installs_a_recorder_for_every_table_in_the_delivery() -> N
         "aal_dev_fdh.framework_meta.load_metric",
     }
     # One row for the table that loaded and one for the table whose spec failed to register.
-    columns = [*LEDGER_COLUMNS, "batch_id"]
+    columns = [*LEDGER_COLUMNS, "batch_id", *EXTRA_LEDGER_COLUMNS]
     loaded_row, broken_row = (
         dict(zip(columns, record, strict=True))
         for record in spark.saved["aal_dev_fdh.framework_meta.load_ledger"].data
@@ -530,7 +539,7 @@ def test_the_pipeline_installs_a_recorder_for_every_table_in_the_delivery() -> N
     assert broken_row["dataflow"] == "abs_broken" and broken_row["target_status"] == "FAILED"
     assert broken_row["failure_reason"] == "failed to register: ValueError: bad rule"
     assert broken_row["rows_read"] == broken_row["rows_written"] == 0
-    assert len(spark.saved["aal_dev_fdh.framework_meta.load_metric"].data) == 12
+    assert len(spark.saved["aal_dev_fdh.framework_meta.load_metric"].data) == 20
 
 
 def test_manifest_problems_name_the_spec_and_the_delivery(tmp_path) -> None:

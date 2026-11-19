@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -87,7 +88,7 @@ def _catch_up_job(spark: Any, catalog: str, meta: str, event_log: str, job: str,
             continue
         for row in rows:
             row["batch_id"] = _batch_of(spark, row)
-        written += write_rows(spark, catalog, rows)
+        written += write_rows(spark, catalog, rows, replay=True)
         log.info("load catch-up: recorded %s update %s", job, update_id)
     return written
 
@@ -102,9 +103,19 @@ def _dataflows(spark: Any, meta: str, job: str) -> list[Dataflow]:
             staged=f"{row['pipeline_id']}_staged",
             target=str(row.get("target_table") or ""),
             quarantine=str(row.get("quarantine_table") or ""),
+            files=_files_view(row),
         )
         for row in found
     ]
+
+
+def _files_view(row: dict[str, Any]) -> str:
+    """Where the per-file counts live: in the pipeline's own schema, named after the table.
+    A table that has no such view (a database source) makes the read fail, which counts as none."""
+
+    target = str(row.get("target_table") or "")
+    catalog = target.split(".", 1)[0] if "." in target else ""
+    return f"{catalog}.framework_meta.{row['pipeline_id']}_files" if catalog else ""
 
 
 def _replay(
@@ -120,7 +131,7 @@ def _replay(
             )
         )
     ]
-    recorder = UpdateRecorder(job, LAYER, _in_this_update(dataflows, events))
+    recorder = UpdateRecorder(job, LAYER, _with_checks(_in_this_update(dataflows, events), events))
     for event in events:
         rows = recorder.handle(event)
         if rows:
@@ -148,27 +159,62 @@ def _in_this_update(dataflows: list[Dataflow], events: list[dict[str, Any]]) -> 
     return mine or dataflows
 
 
+def _with_checks(dataflows: list[Dataflow], events: list[dict[str, Any]]) -> list[Dataflow]:
+    """Wait for the per-file view and the blocked-file check only when this update ran them.
+
+    The pipeline's own hook knows from the spec. A replay knows from the events: a table with
+    no ``fail`` rule has no check, and an update that failed before it ran has no flow for it.
+    The check is what fails the update, so without it a failed update would be read as complete.
+    """
+
+    names = [(event.get("origin") or {}).get("flow_name") for event in events]
+    result = []
+    for flow in dataflows:
+        stem = flow.files.rsplit(".", 1)[0] if flow.files else ""
+        check = f"{stem}.{flow.pipeline_id}_blocked_check" if stem else ""
+        arrivals = f"{stem}.{flow.pipeline_id}_arrivals" if stem else ""
+        ran_files = bool(flow.files) and any(_same_table(name, flow.files) for name in names)
+        ran_check = bool(check) and any(_same_table(name, check) for name in names)
+        ran_arrivals = bool(arrivals) and any(_same_table(name, arrivals) for name in names)
+        result.append(
+            replace(
+                flow,
+                files=flow.files if ran_files else "",
+                blocked_check=check if ran_check else "",
+                arrivals=arrivals if ran_arrivals else "",
+            )
+        )
+    return result
+
+
 def _batch_of(spark: Any, row: dict[str, Any]) -> str | None:
     """The ``_batch_id`` this run stamped on its rows, read back from the table it wrote.
 
-    The hook knew it in memory. A replay finds it from the rows loaded during the run. None when
-    the run loaded nothing, or the table cannot be read.
+    The hook knew it in memory. A replay finds it from the rows loaded during the run, in bronze
+    or, when everything was kept out of bronze, in quarantine. None when the run loaded nothing,
+    or the tables cannot be read.
     """
 
-    target, start, end = row.get("target_table"), row.get("started_at"), row.get("ended_at")
-    if not target or not isinstance(start, datetime) or not isinstance(end, datetime):
+    start, end = row.get("started_at"), row.get("ended_at")
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
         return None
-    try:
-        found = _rows(
-            spark.sql(
-                f"SELECT DISTINCT _batch_id AS batch FROM {target} "
-                f"WHERE _ingest_timestamp >= {_utc(start)} - INTERVAL 1 MINUTE "
-                f"AND _ingest_timestamp <= {_utc(end)} + INTERVAL 1 MINUTE LIMIT 2"
+    for table in (row.get("target_table"), row.get("quarantine_table")):
+        if not table:
+            continue
+        try:
+            found = _rows(
+                spark.sql(
+                    f"SELECT DISTINCT _batch_id AS batch FROM {table} "
+                    f"WHERE _ingest_timestamp >= {_utc(start)} - INTERVAL 1 MINUTE "
+                    f"AND _ingest_timestamp <= {_utc(end)} + INTERVAL 1 MINUTE LIMIT 2"
+                )
             )
-        )
-    except Exception:
-        return None
-    return str(found[0]["batch"]) if len(found) == 1 and found[0]["batch"] else None
+        except Exception:
+            log.warning("load catch-up: could not read the batch of a run from %s", table)
+            continue
+        if len(found) == 1 and found[0]["batch"]:
+            return str(found[0]["batch"])
+    return None
 
 
 def _utc(value: datetime) -> str:

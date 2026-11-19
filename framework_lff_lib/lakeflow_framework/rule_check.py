@@ -160,6 +160,9 @@ def databricks_cli(profile: str | None, warehouse: str) -> Runner:
             first = next((line for line in message.splitlines() if line.strip()), message)
             raise RuleCheckError(first.strip()[:300])
         columns = [c["name"] for c in reply["manifest"]["schema"].get("columns", [])]
-        return [dict(zip(columns, row, strict=True)) for row in reply.get("result", {}).get("data_array", [])]
+        return [
+            dict(zip(columns, row, strict=True))
+            for row in reply.get("result", {}).get("data_array", [])
+        ]
 
     return run

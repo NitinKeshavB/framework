@@ -7,7 +7,7 @@ How the framework is put together: the folders, the code, every table it writes,
 Folders at the repository root start with `framework_`.
 
 - `framework_lff_lib` is the wheel. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`.
-- `framework_bundle` deploys that wheel and the frozen metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, hourly `framework_runs` (catch-up for job runs / pipeline updates; delivery NRT is separate), and daily `framework_optimize` (compaction, `archive_hot`). See [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).
+- `framework_bundle` deploys that wheel and the frozen metadata registry: `sql/framework_meta.sql` and `sql/system_views.sql`, the DDL jobs, hourly `framework_runs` (records job runs and pipeline updates, and writes the `load_ledger` row of any update whose own hook did not finish), daily `framework_optimize` (compaction, `archive_hot`), and `framework_backfill` (reloads files of any one table, or refreshes it; run it with `./run.sh backfill`). See [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).
 - `framework_ingestion` is source to bronze: source systems, table specs, and the pipelines and jobs generated from them.
 - `framework_curation/<domain>/<project>` is one bundle per project for silver, gold, and data products.
 - `framework_examples/ingestion` is the set of specs to copy for each source kind. `framework_examples/consumer` is the original single-bundle example and is reference only.
@@ -26,11 +26,17 @@ Each module imports only the ones listed. `ingestion` is a thin re-export of `so
 | `spark_types` | nothing | Optional `pyspark.sql.types` plus `require_writer` so registry writes never silently no-op |
 | `config` | `sqlnames` | Validates specs, joins a spec with its `source.yaml`, and holds `PipelineConfig` |
 | `load` | `config`, `sqlnames` | Load strategies: Auto Loader options, `schemaHints`, and batch SQL. No `pyspark` |
-| `quality` | `config`, `load` | Rules to SQL predicates, `_dq_failed_rules`, and the warn expectations |
-| `pipeline` | `config`, `load`, `quality` | `assemble` builds the dataset graph; `build_pipelines` reads `lff.manifest` (legacy `lff.specs`) and registers with `pyspark.pipelines` |
+| `quality` | `config`, `load` | Rules to SQL predicates, `_dq_failed_rules`, each row's `_dq_result` (`pass`, `quarantine`, `drop`, `fail`), the rule actions, and the warn expectations |
+| `volume_listing` | nothing | Lists a volume folder by name, size and arrival time, including files with no bytes (which Spark's `binaryFile` reader leaves out) |
+| `pipeline` | `config`, `load`, `quality`, `volume_listing` | `assemble` builds the dataset graph; `build_pipelines` reads `lff.manifest` (legacy `lff.specs`) and registers with `pyspark.pipelines`; `stage_frame` is the staging step a backfill shares; installs the ledger hook |
+| `pipeline_metrics` | `load_metrics`, `sqlnames` | The event hook: folds one update's events into `load_ledger` rows and writes them (with `file_ledger` and `load_metric`) once, in parallel; reads the per-file and arrivals views |
+| `load_catchup` | `pipeline_metrics`, `metadata` | Replays a cut-off update's event log through the same recorder and writes its rows (`framework_runs`, hourly) |
+| `backfill` | `pipeline`, `pipeline_metrics`, `quality`, `volume_listing` | Reloads chosen files of one table through the pipeline's own staging step, or starts a full refresh of it |
+| `rule_check` | `quality`, `config` | Runs every quality rule on a SQL warehouse before deploy (`check:rules`) |
+| `silver_reader` | `sqlnames` | Reads only what is new in a bronze table, by change feed or `_ingest_timestamp` |
 | `metadata` | `config`, `quality`, `sqlnames` | Registry rows, ownership-refusal payloads, DDL text (package data), and SQL lookups |
 | `registry` | `metadata`, `spark_types`, `sqlnames` | The only registry writer: definitions, ownership refusals, retirement, and DDL apply |
-| `load_metrics` | `sqlnames` | Appends `load_ledger` / `load_metric` from pipeline event logs (`record_load_metrics`) |
+| `load_metrics` | `sqlnames` | The ledger's column list and the older event-log SQL it came from; the pipeline now writes its own rows (`pipeline_metrics`) |
 | `unity` | `sqlnames` | Applies schema, table, and column tags and column comments to Unity Catalog |
 | `runs` | `sqlnames`, `spark_types` | Records job runs from the Jobs API / `system.lakeflow` and pipeline updates from event logs |
 | `sources` | `config`, `metadata`, `unity` | Reads `source.yaml` and specs; builds deploy registry rows |
@@ -75,42 +81,54 @@ flowchart TD
   batchLoad --> refresh[refresh_pipeline]
   trigger -. no batch specs .-> refresh
   specs["lff.manifest (compiled delivery JSON)"] --> refresh
-  refresh --> tables[(staged, bronze, and quarantine tables)]
+  refresh --> tables[(staged, bronze, quarantine, and per-file views)]
   refresh --> eventLog[("&lt;job&gt;_event_log")]
-  refresh --> recordMetrics["record_load_metrics (run_if ALL_DONE)"]
-  eventLog --> recordMetrics
-  recordMetrics --> ledger[(load_ledger)]
-  recordMetrics --> recordThisRun[record_this_run]
-  recordThisRun --> jobRuns[(job_runs NRT)]
+  refresh --> hook["event hook (inside the pipeline)"]
+  hook --> ledger[(load_ledger, file_ledger, load_metric)]
+  eventLog --> catchUp["framework_runs, hourly"]
+  catchUp --> ledger
+  catchUp --> jobRuns[(job_runs, pipeline_updates)]
   trigger --> jobsApi[(Jobs API run history)]
 ```
 
-The job runs **refresh_pipeline**, then **record_load_metrics** with `run_if: ALL_DONE` (even when the pipeline failed), which appends one `load_ledger` row per registered dataflow for the job's medallion `layer`, left-joined to that update's `flow_progress` (FAILED when a dataflow has no progress, including partial delivery failures). Then **record_this_run** writes NRT status and `failure_reason` into `job_runs`. Insert only; no MERGE; no scan of target tables. Frozen `cloud_files` methods add **batch_load** before the refresh. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry for specs. Hourly `framework_runs` is catch-up from the Jobs API and event logs.
+The job has one task, **refresh_pipeline**. (Frozen `cloud_files` methods add **batch_load** before it.) There is no recording task after it. The pipeline records its own loads: an **event hook** inside the pipeline folds the update's events into one `load_ledger` row per table, one `file_ledger` row per file, and the long-shape `load_metric` rows, and writes them once, the three tables at the same time. Every count is a number, and a table that failed or could not register is `FAILED` with the error. The hook starts as soon as every flow of the delivery has finished, because serverless can shut the pipeline down within seconds of a failure and cancel a write still running. If a write is cut off anyway, the update has no `load_ledger` row, and the hourly `framework_runs` finds it from the event log and writes it through the same recorder (that path does not run the missing-file check below). Insert only; no MERGE; no scan of target tables. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry for specs. **A pipeline's own restart of a failed update is turned off** (`pipelines.numUpdateRetryAttempts` is `0` in the generated pipeline): a file blocked by a `fail` rule fails the update on purpose, and a restart would find the file already read and finish, hiding the failure.
 
 ### Inside one pipeline: source to bronze and quarantine
 
 ```mermaid
 flowchart LR
   source[raw volume files or foreign table] -->|read once| staged["&lt;pipeline_id&gt;_staged (private)"]
-  staged -->|"size(_dq_failed_rules) = 0"| valid["&lt;pipeline_id&gt;_valid (temporary view)"]
+  staged -->|"_dq_result = pass, file not blocked"| valid["&lt;pipeline_id&gt;_valid (temporary view)"]
   valid --> bronze[bronze table]
-  staged -->|"size(_dq_failed_rules) > 0"| quarantine["quarantine table (_qrntn)"]
+  staged -->|"_dq_result = fail or quarantine"| quarantine["quarantine table (_qrntn)"]
+  staged -->|"one row per file"| files["&lt;pipeline_id&gt;_files (view)"]
+  files -->|"blocked files"| valid
+  files -->|"blocked files"| check["&lt;pipeline_id&gt;_blocked_check (fails the update)"]
+  listing[volume listing] --> arrivals["&lt;pipeline_id&gt;_arrivals (view)"]
+  files --> arrivals
 ```
 
-The staging table computes `_dq_failed_rules` once per row and carries one warn expectation per rule, so pass and fail counts reach the event log. Bronze is an append streaming table, an Auto CDC streaming table (`dedup: true`, or database `merge`), or a materialized view (database `snapshot`). The frozen `cloud_files` methods add a raw table before the staging table.
+The staging table computes `_dq_failed_rules` once per row, and from it `_dq_result` (`fail`, `quarantine`, `drop` or `pass`; a row that broke only warn rules passes). Both are stored with the row, so a rule changed later never reclassifies a file already read. It carries one warn expectation per rule, so pass and fail counts reach the event log. Bronze is an append streaming table, an Auto CDC streaming table (`dedup: true`, or database `merge`), or a materialized view (database `snapshot`). The frozen `cloud_files` methods add a raw table before the staging table.
+
+A table loaded from **files** has three more datasets, all in the pipeline's own schema (`framework_meta`), not beside bronze:
+
+- **`<pipeline_id>_files`** is a materialized view with one row per file of this run: rows read, loaded, quarantined, dropped and blocked, and a status (`PROCESSED`, `WARNING`, or `FAILED` when a `fail` rule blocked it). It reads only this run's rows of the staging table (found by `_batch_id` and the load time the staging table is clustered on). The ledger is written from it, and the valid view uses it to keep a blocked file's good rows out of bronze (a left anti-join on the blocked files).
+- **`<pipeline_id>_blocked_check`**, only when a rule has `on_fail: fail`, is a materialized view over the blocked files with an `expect_all_or_fail`. It runs after bronze and quarantine have finished, so the file is already marked read when it fails the update. This is the only way to fail the run and still consume the file: a failing load flow would leave Auto Loader's checkpoint behind, and the next run would read the file again.
+- **`<pipeline_id>_arrivals`**, only when the table expects a file each run (`source.expect_file`), lists the files that arrived since the previous regular run and says whether this run read rows from each. The hook uses it to record a run with no file, or a file with no rows, as `FAILED` while the job still succeeds.
+
+A database source has no files, so a `fail` rule there is a run-level `expect_all_or_fail` on the staging table.
 
 ### Metrics and governance
 
 ```mermaid
 flowchart LR
   ingestionPipelines[ingestion pipelines] --> eventLogs[("&lt;job&gt;_event_log")]
-  anyJob[any layer job record_load_metrics ALL_DONE] --> eventLogs
-  anyJob --> ledger[(load_ledger)]
+  ingestionPipelines -->|event hook| ledger[(load_ledger, file_ledger, load_metric)]
+  backfillJob[framework_backfill] --> ledger
   ledger --> loads[v_loads]
   loads --> failures[v_load_failures]
-  anyJob --> recordThisRun[record_this_run]
-  recordThisRun --> runTables[(job_runs, job_task_runs)]
-  jobsApi[(Jobs API)] --> runsJob[framework_runs, hourly catch-up]
+  jobsApi[(Jobs API)] --> runsJob[framework_runs, hourly]
+  runsJob -->|updates the hook did not record| ledger
   eventLogs --> runsJob
   runsJob --> runTables
   runsJob --> updates[(pipeline_updates)]
@@ -139,17 +157,21 @@ Editable Lucidchart (tabs: ERD, **framework_meta catalog**, **Team process: patt
 | `asset_registry_current` | `framework_meta` | `registry_sync` | One row per `(object_kind, full_name)` | Delta, merged |
 | `{job}_event_log` | `framework_events` | each delivery pipeline | Lakeflow event log (out of `framework_meta` so SHOW TABLES scales) | Delta |
 | `ownership_refusals` | `framework_meta` | `registry_sync` | One refused definition (another owner already holds the name) | Delta, insert-only |
-| `job_runs` | `framework_meta` | each job (`record_this_run`) + hourly `framework_runs` | One append per observed run state (retries OK) | Delta, append-only; `v_job_runs` keeps latest `(job_id, run_id)` |
-| `job_task_runs` | `framework_meta` | `record_this_run` + hourly `framework_runs` | One append per observed task state | Delta, append-only; `v_job_task_runs` keeps latest `(job_run_id, task_run_id)` |
+| `job_runs` | `framework_meta` | hourly `framework_runs` | One append per observed run state (retries OK) | Delta, append-only; `v_job_runs` keeps latest `(job_id, run_id)` |
+| `job_task_runs` | `framework_meta` | hourly `framework_runs` | One append per observed task state | Delta, append-only; `v_job_task_runs` keeps latest `(job_run_id, task_run_id)` |
 | `pipeline_updates` | `framework_meta` | `framework_runs` | One update of an ingestion pipeline | Delta, merged on `(pipeline_id, update_id)` |
-| `load_ledger` | `framework_meta` | each job (`record_load_metrics`) | One job, layer, update, and registered dataflow (FAILED when no progress / missing event log); `job_run_id`, AUTO CDC upserts/deletes | Delta, insert-only, ~7-day hot |
+| `load_ledger` | `framework_meta` | the pipeline's event hook; `framework_backfill`; hourly `framework_runs` for an update whose hook was cut off | One table's load in one update: counts (`rows_read`, `rows_written`, `rows_quarantine`, `rows_dropped`, `rows_blocked`, `files_read`, `files_failed`, never NULL), status, error, `batch_id` | Delta, insert-only, ~7-day hot |
+| `file_ledger` | `framework_meta` | the same writers | One file in one load: path, name, status (`PROCESSED`, `WARNING`, `FAILED`), its row counts, the rules that blocked it, `error_message`, `load_kind` (`regular` or `backfill`) | Delta, insert-only |
+| `load_metric` | `framework_meta` | the same writers | The ledger's counts in long shape: one row per table, update and metric | Delta, insert-only |
 | `load_ledger_archive` / `job_runs_archive` / `job_task_runs_archive` / `pipeline_updates_archive` | `framework_meta` | `framework_optimize` `archive_hot` | Rows moved off hot after 7 days | Delta, forever |
 | `ddl_applied` | `framework_meta` | `framework_ddl` / `apply_ddl` | One SQL file hash per successful apply | Delta, insert-only |
 | `<pipeline_id>_staged` | none (private) | ingestion pipeline | One source row | Private streaming table or materialized view |
+| `<pipeline_id>_files`, `_blocked_check`, `_arrivals` | `framework_meta` | ingestion pipeline (file sources) | The latest run's files; the blocked files of that run; the files that arrived since the previous run | Materialized views (see "Inside one pipeline") |
+| `backfill_state` | `framework_meta` (a volume) | `framework_backfill` | The Auto Loader schema and checkpoint of one backfill run | Volume; a finished run's folder can be deleted |
 | bronze, `<schema>.<table>` | `<source>_bronze` | ingestion pipeline | One passing row, or one row per key with Auto CDC | Streaming table or materialized view |
 | quarantine, `<table>_qrntn` | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |
 
-The registry tables change once per deploy, hot→archive once a day, and hourly `framework_runs` is catch-up. A delivery or curation run writes its own data tables, event log under `framework_events`, one append into `load_ledger` for its layer, and NRT `job_runs` via `record_this_run`. Schemas, volumes, and foreign catalogs exist before a deploy. Until go-live, drop `framework_meta` (and recreate `framework_events` via DDL) to pick up new columns; `CREATE IF NOT EXISTS` will not ALTER existing tables.
+The registry tables change once per deploy, hot→archive once a day, and hourly `framework_runs` records job runs and pipeline updates. A delivery run writes its own data tables, event log under `framework_events`, and, from the pipeline's event hook, its rows in `load_ledger`, `file_ledger` and `load_metric`. Schemas, volumes, and foreign catalogs exist before a deploy. Until go-live, drop `framework_meta` (and recreate `framework_events` via DDL) to pick up new columns; `CREATE IF NOT EXISTS` will not ALTER existing tables.
 
 ### Registry, physical
 
@@ -260,7 +282,7 @@ erDiagram
   }
 ```
 
-- **Job runs.** Append-only (like `load_ledger`): `record_this_run` and hourly catch-up INSERT; `v_job_runs` / `v_job_task_runs` keep the latest `recorded_at` per key — no MERGE under concurrent NRT writers. Catch-up prefers one INSERT SELECT over `system.lakeflow.job_run_timeline` / `job_task_run_timeline` (needs `SELECT` on `system.lakeflow`); without it, Jobs API walk. `status` is `RUNNING`, `SUCCEEDED`, `SKIPPED`, or `FAILED` (`SUCCESS_WITH_FAILURES` → `FAILED` on the API path). System-table freshness is typically up to about an hour.
+- **Job runs.** Append-only (like `load_ledger`): the hourly `framework_runs` job INSERTs; `v_job_runs` / `v_job_task_runs` keep the latest `recorded_at` per key — no MERGE. Catch-up prefers one INSERT SELECT over `system.lakeflow.job_run_timeline` / `job_task_run_timeline` (needs `SELECT` on `system.lakeflow`); without it, Jobs API walk. `status` is `RUNNING`, `SUCCEEDED`, `SKIPPED`, or `FAILED` (`SUCCESS_WITH_FAILURES` → `FAILED` on the API path). System-table freshness is typically up to about an hour.
 - **Pipeline updates.** The `pipeline_updates` task reads the `update_progress` events in every `<job>_event_log`. An update with an event in the window is read whole. `state` is the last update state, and `status` is `SUCCEEDED`, `FAILED`, `CANCELED`, or `RUNNING`.
 - **Cost, optional.** `system_views.sql` joins `job_runs` and `pipeline_updates` to `system.billing.usage` and `list_prices` as `v_job_costs` and `v_pipeline_costs`. It needs `SELECT` on `system.billing` and runs only when the target sets `system_views` to `true`. `v_observed_lineage` there needs `system.access`.
 
@@ -307,9 +329,9 @@ What each table the pipeline writes holds, beyond the spec's `columns`:
 
 | Table | Extra columns | Rows |
 | --- | --- | --- |
-| `<pipeline_id>_staged` | `_src_file_path`, `_src_file_name` (files), `_src_row_hash`, `_ingest_timestamp`, `_rescued_data` (Auto Loader on CSV, delimited, JSON, text), `_dq_failed_rules`; `_batch_id` is added when the row is staged | Every source row |
-| bronze | The same lineage columns, without `_dq_failed_rules` | Rows with no failed rule; with Auto CDC, the latest row per key by the watermark |
-| quarantine | The same lineage columns and `failed_rules` | Rows with at least one failed rule |
+| `<pipeline_id>_staged` | `_src_file_path`, `_src_file_name` (files), `_src_row_hash`, `_ingest_timestamp`, `_rescued_data` (Auto Loader on CSV, delimited, JSON, text), `_dq_failed_rules`, `_dq_result` (files); `_batch_id` is added when the row is staged | Every source row |
+| bronze | The same lineage columns, without `_dq_failed_rules` and `_dq_result` | Rows that passed, from files that were not blocked; with Auto CDC, the latest row per key by the watermark |
+| quarantine | The same lineage columns and `failed_rules` | Rows that broke a `quarantine` or `fail` rule, including the bad rows of a blocked file |
 
 Every published table gets a comment, `table_properties` (`quality` = its layer, and `lakeflow_framework.pipeline_id`), and liquid clustering. At deploy, `registry_sync` sets these Unity Catalog tags:
 
@@ -325,7 +347,8 @@ A tag with no value is not set, and one the spec no longer gives is unset. Tags 
 
 ```mermaid
 erDiagram
-  event_log ||--o{ load_ledger : "record_load_metrics per update and layer"
+  event_log ||--o{ load_ledger : "event hook, once per update (hourly catch-up if cut off)"
+  load_ledger ||--o{ file_ledger : "update_id, dataflow"
   load_ledger ||--o| v_loads : "latest per job, layer, update, dataflow"
   load_ledger ||--o| load_ledger_archive : "archive_hot after 7 days"
   load_ledger_archive ||--o| v_loads_90d : "hot union archive"
@@ -345,12 +368,45 @@ erDiagram
     string target_status
     string failure_reason
     timestamp recorded_at
+    string batch_id
+    bigint rows_dropped
+    bigint rows_blocked
+    bigint files_read
+    bigint files_failed
+  }
+  file_ledger {
+    string update_id
+    string dataflow
+    string src_file_path
+    string src_file_name
+    string status
+    bigint rows_read
+    bigint rows_loaded
+    bigint rows_quarantined
+    bigint rows_blocked
+    string blocking_rules
+    string error_message
+    string load_kind
   }
 ```
 
 `job_name` comes from the event log's table name, `<job>_event_log`. `pipeline_id` is the Databricks pipeline id, which joins to `v_pipeline_updates` with `update_id`. `dataflow` is the spec's `pipeline_id`, which joins to the registry. Rule counts land on the ledger from staged `flow_progress` when present.
 
-**Per-load counts.** `v_loads` (or `load_ledger`) is the sole recon SoR for bronze, silver, gold, and product. Each delivery job (`ALL_DONE`) writes one row per registered dataflow, left-joined to that update's event log; missing progress is FAILED so partial delivery failures stay visible. Never MERGE. Filter on `layer` for one medallion layer (`WHERE layer = 'bronze'` for bronze only). `v_loads_90d` unions 7-day hot with forever archive for dashboards. `v_load_failures` joins loads to job/task `failure_reason` for repair.
+**Per-load counts.** `v_loads` (or `load_ledger`) is the sole recon SoR for bronze, silver, gold, and product. The pipeline's event hook writes one row per registered dataflow per update; a table with no progress, or one that failed to register, is `FAILED` with the error, so partial delivery failures stay visible. Never MERGE. Filter on `layer` for one medallion layer (`WHERE layer = 'bronze'` for bronze only). `v_loads_90d` unions 7-day hot with forever archive for dashboards. `v_load_failures` joins loads to job/task `failure_reason` for repair.
+
+**What the counts mean.** For an append load, `rows_read = rows_written + rows_quarantine + rows_dropped + rows_blocked`; the hook logs a warning when it does not. `rows_dropped` are rows a `drop` rule removed. `rows_blocked` are the good rows of a file a `fail` rule blocked, which load nowhere. A load that failed or read nothing has every count 0, never NULL. `files_read` counts the files of the run and `files_failed` those recorded `FAILED`.
+
+**When a load is `FAILED` though the job succeeded.** Three things set `target_status` to `FAILED`, and the first also fails the job:
+
+| Cause | Job | Ledger reason |
+| --- | --- | --- |
+| A file broke a `fail` rule (a table loaded from files) | **Fails** | `N of M file(s) blocked by fail rules, none of their rows loaded to <bronze>: <file> (<rule>)` |
+| A table that expects a file got none | Succeeds | `no file arrived in <folder> since the previous run` |
+| A file arrived with no rows (0 bytes, or a header only) | Succeeds | `N file(s) arrived with no rows: <names>`, and a `file_ledger` row `FAILED` for each |
+
+A backfill records the same facts (plus `file not found` for a name that is not in the folder) in `load_ledger` and `file_ledger` with `load_kind = 'backfill'` and an `update_id` that starts `backfill-`, and its job succeeds with a `WARNING:` line.
+
+**Writes.** The three tables are appended at the same time, because the pipeline shuts down within seconds of a failed update and cancels a write still running. The `load_ledger` row is what says an update was recorded: if it is missing, the hourly catch-up writes the whole update from the event log (it skips file rows already written). If it is there but a `file_ledger` write was cut off, those file rows are not recovered, because the per-file view holds only the latest run.
 
 ## Views
 
@@ -394,7 +450,7 @@ flowchart TD
   system_tables --> v_observed_lineage
 ```
 
-`framework_meta.sql` creates every view except three; `system_views.sql` creates `v_job_costs`, `v_pipeline_costs`, and `v_observed_lineage`, in their own job because they need system table grants. That job runs them only when the target sets `system_views` to `true`. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs` (NRT from `record_this_run`; hourly `framework_runs` is catch-up). `v_ownership_refusals` lists every definition `registry_sync` refused. `v_loads` keeps the latest `load_ledger` row per job, layer, update, and dataflow (retries of `record_load_metrics` may append again). `v_loads_90d` unions hot and archive; `v_load_failures` surfaces what failed and why. Frozen schema: [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).
+`framework_meta.sql` creates every view except three; `system_views.sql` creates `v_job_costs`, `v_pipeline_costs`, and `v_observed_lineage`, in their own job because they need system table grants. That job runs them only when the target sets `system_views` to `true`. The views read fields from `config` with `config:path`. `v_job_status` is each workflow and its latest run from `v_job_runs` (recorded hourly by `framework_runs`). `v_ownership_refusals` lists every definition `registry_sync` refused. `v_loads` keeps the latest `load_ledger` row per job, layer, update, and dataflow (a repeated write may append again), with the new counts shown as 0 when empty. `v_loads_90d` unions hot and archive; `v_load_failures` surfaces what failed and why, including the dropped, blocked and file counts. Frozen schema: [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).
 
 `v_asset_registry_history` reads the SCD columns from `asset_registry`; it does not window. Filter `owner`, the first clustering key, to read less. `asset_registry_current` is keyed by `object_kind` and `full_name`: a pipeline or table has one current row. `v_source_systems` and `v_schemas` list the current source systems and the schemas they use, with their tags. `v_metadata_drift` covers schema, table, and column tags, with `securable` saying which.
 
@@ -432,7 +488,7 @@ How the views join their sources:
 
 **The registry records intent; the platform records what happened.** Definitions and owners are in the registry, written once per deploy. Row counts and pipeline update states come from the event logs, job runs from the Jobs API, and, where the grants exist, cost from `system.billing` and observed lineage from `system.access`. The views join them.
 
-**System tables are preferred, not required, for catch-up.** Hourly job-run catch-up prefers `system.lakeflow` and falls back to the Jobs API without the grant. Cost and observed lineage still need `system.billing` / `system.access` and stay behind `system_views`. NRT status never waits on system tables (`record_this_run`).
+**System tables are preferred, not required, for catch-up.** Hourly job-run catch-up prefers `system.lakeflow` and falls back to the Jobs API without the grant. Cost and observed lineage still need `system.billing` / `system.access` and stay behind `system_views`. Load recording never waits on system tables: the pipeline's hook writes its own rows.
 
 **Unity Catalog holds the governance metadata.** The spec and `source.yaml` are the source; `registry_sync` writes them to Unity Catalog at every deploy and changes only what differs. `v_metadata_drift` shows anything that disagrees.
 

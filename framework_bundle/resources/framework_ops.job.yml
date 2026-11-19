@@ -53,7 +53,7 @@ resources:
         enabled: true
 
     # Job runs hourly: prefers system.lakeflow (SELECT grant); falls back to Jobs API.
-    # Pipeline updates from framework_events. NRT status is record_this_run on each delivery.
+    # Pipeline updates from framework_events. Load recon is written by each pipeline's own hook.
     framework_runs:
       name: framework_runs
       performance_target: PERFORMANCE_OPTIMIZED
@@ -93,6 +93,50 @@ resources:
       queue:
         enabled: true
 
+    # One job reloads any table: it loads the table's spec from the registry and runs the same
+    # staging step as the pipeline, so rules, rule actions and the ledger match the normal load.
+    # A blocked file is recorded FAILED in the ledger; the run still succeeds, with a warning.
+    framework_backfill:
+      name: framework_backfill
+      performance_target: PERFORMANCE_OPTIMIZED
+      parameters:
+        - name: table
+          default: ""
+        - name: mode # files, dates, failed or full_refresh
+          default: files
+        - name: files # comma-separated file names (mode files)
+          default: ""
+        - name: date_from # arrival time, YYYY-MM-DD or YYYY-MM-DD HH:MM (mode dates)
+          default: ""
+        - name: date_to
+          default: ""
+        - name: dry_run # true lists the files and changes nothing
+          default: "true"
+        - name: confirm # true is needed for full_refresh and for no selector at all
+          default: "false"
+      tasks:
+        - task_key: backfill
+          environment_key: framework_env
+          spark_python_task:
+            python_file: ../src/backfill.py
+            parameters:
+              - ${var.catalog}
+              - "{{job.parameters.table}}"
+              - "{{job.parameters.mode}}"
+              - "{{job.parameters.files}}"
+              - "{{job.parameters.date_from}}"
+              - "{{job.parameters.date_to}}"
+              - "{{job.parameters.dry_run}}"
+              - "{{job.parameters.confirm}}"
+      environments:
+        - environment_key: framework_env
+          spec:
+            environment_version: "4"
+            dependencies:
+              - ../../framework_lff_lib/dist/*.whl
+      queue:
+        enabled: true
+
     framework_optimize:
       name: framework_optimize
       performance_target: PERFORMANCE_OPTIMIZED
@@ -122,4 +166,4 @@ resources:
             dependencies:
               - ../../framework_lff_lib/dist/*.whl
 
-    # Recon is load_ledger / v_loads from each delivery's record_load_metrics task.
+    # Recon is load_ledger / file_ledger / v_loads, written by each pipeline's event hook.

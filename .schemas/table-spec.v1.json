@@ -77,6 +77,7 @@
         "path_glob": { "type": "string" },
         "multiline": { "type": "boolean" },
         "file_events": { "type": "boolean" },
+        "expect_file": { "type": "boolean" },
         "max_files_per_trigger": { "type": "integer", "minimum": 1 },
         "catalog": { "type": "string" },
         "table": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$" },
@@ -101,6 +102,12 @@
           "type": "string",
           "enum": ["insert_only", "scd1", "scd2", "full_refresh"],
           "description": "How rows are taken. insert_only appends. scd1 upserts on primary_keys by watermark_column. scd2 keeps every version. full_refresh (database tables) mirrors the source and keeps a removed key, closed. Omitted: scd1 when dedup is true, else insert_only for files."
+        },
+        "on_bad_rows": {
+          "type": "string",
+          "enum": ["quarantine", "drop", "warn", "fail"],
+          "default": "quarantine",
+          "description": "What happens to a row that fails a rule, for every rule that does not say its own on_fail. fail stops the whole update, so good rows of that run are not loaded either."
         },
         "delete_when": {
           "type": "string",
@@ -130,6 +137,11 @@
               "expression": {
                 "type": "string",
                 "description": "Boolean SQL over this table's columns, literals, and approved functions only."
+              },
+              "on_fail": {
+                "type": "string",
+                "enum": ["quarantine", "drop", "warn", "fail"],
+                "description": "What happens to a row that fails this rule. Overrides on_bad_rows. quarantine: to the quarantine table. drop: discarded. warn: loads, only counted. fail: the update fails, so no row of the run reaches bronze."
               }
             }
           }

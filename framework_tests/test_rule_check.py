@@ -80,7 +80,9 @@ def test_the_sample_row_has_every_column_a_rule_may_name_with_a_value_of_its_typ
     assert sample_value("date") == "DATE '2026-01-01'"
     assert sample_value("timestamp") == "TIMESTAMP '2026-01-01 00:00:00'"
     assert sample_value("boolean") == "true" and sample_value("string") == "'x'"
-    assert sample_value("int") == "CAST(1 AS int)" and sample_value("double") == "CAST(1.5 AS double)"
+    assert (
+        sample_value("int") == "CAST(1 AS int)" and sample_value("double") == "CAST(1.5 AS double)"
+    )
 
 
 def test_with_a_table_each_rule_says_how_many_existing_rows_it_would_quarantine() -> None:
@@ -126,7 +128,8 @@ def test_the_command_exits_non_zero_when_a_rule_is_broken(monkeypatch, capsys) -
     bundle = Path(__file__).resolve().parents[1] / "framework_ingestion"
     for refuse, expected in (((), 0), (("rlike",), 1)):
         monkeypatch.setattr(
-            "lakeflow_framework.rule_check.databricks_cli", lambda *_a, refuse=refuse: Warehouse(refuse)
+            "lakeflow_framework.rule_check.databricks_cli",
+            lambda *_a, refuse=refuse: Warehouse(refuse),
         )
         code = main(["check-rules", str(bundle), "--warehouse", "w", "--profile", "P"])
         assert code == expected
@@ -146,7 +149,9 @@ def test_the_command_exits_non_zero_when_a_rule_is_broken(monkeypatch, capsys) -
         ("a IN ('x',", "never closed"),
     ],
 )
-def test_generate_catches_unclosed_brackets_and_half_written_conditions(expression, message) -> None:
+def test_generate_catches_unclosed_brackets_and_half_written_conditions(
+    expression, message
+) -> None:
     errors: list[str] = []
     assert_safe_rule_expression(expression, {"a"}, label="s", name="r", errors=errors)
     assert errors and message in errors[0]

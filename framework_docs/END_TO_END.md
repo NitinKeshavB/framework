@@ -38,22 +38,26 @@ Every framework job task writes timestamped log lines to its run's output: the a
 
 ## What a delivery job does
 
-A delivery job runs **refresh_pipeline**, then **record_load_metrics** with `run_if: ALL_DONE` (runs even when the pipeline failed), then **record_this_run** (NRT job status into `job_runs`). Metrics append one `load_ledger` row per registered dataflow for the job (`layer = bronze`), left-joined to that update's `flow_progress` (AUTO CDC upserts/deletes when `num_output_rows` is absent). Missing progress, a missing event log, or only some tables emitting metrics → **FAILED**. Each row stores `{{job.run_id}}` so `v_load_failures` equi-joins. Both `load_ledger` and `job_runs` / `job_task_runs` are insert-only (no MERGE); `v_loads` / `v_job_runs` keep the latest `recorded_at` per key. Use `v_loads` for recon and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint. Hourly `framework_runs` is catch-up. The job does not write definitions to the registry.
+A delivery job has one task, **refresh_pipeline**. The pipeline records its own loads: an event hook inside it writes, once per update, one `load_ledger` row per registered dataflow (`layer = bronze`), one `file_ledger` row per file, and the long-shape `load_metric` rows, from that update's events (AUTO CDC upserts/deletes when `num_output_rows` is absent). A table with no progress, or one whose spec could not be registered, is **FAILED** with the error. Every count is a number: a load that failed or read nothing has 0, never NULL. If the pipeline is shut down before the hook finishes, the hourly `framework_runs` writes the missing update from the event log. All of it is insert-only (no MERGE); `v_loads` / `v_job_runs` keep the latest `recorded_at` per key. Use `v_loads` for recon, `file_ledger` for what happened to each file, and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint, so **a file that was read is not read again**: to load a blocked file, fix it and run `./run.sh backfill`. The job does not write definitions to the registry.
 
 The pipeline reads its delivery from the deployed bundle. The generated pipeline sets `lff.manifest` to a compiled JSON under `.build/manifests/` (legacy `lff.specs` still works) and `lff.catalog` to the target catalog; `build_pipelines` validates with `validate_configs`. A pipeline id missing from the delivery is an error. A pipeline without either setting falls back to reading `framework_meta.v_asset_registry_current`.
 
-Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log. Each delivery job writes NRT status via `record_this_run`; hourly `framework_runs` is catch-up into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row counts for recon are in `v_loads`. Cost needs the optional system views.
+Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log. The hourly `framework_runs` records them into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row counts for recon are in `v_loads`. Cost needs the optional system views.
 
 ## How each kind loads
 
-Each table reads its source once, into a private `<pipeline_id>_staged` table that is not published to Unity Catalog. A pipeline cannot send one read to two tables, and a temporary view runs again for every dataset that reads it, so the staging table is what lets bronze and quarantine share one read. It adds `_dq_failed_rules`, the names of the rules the row failed, so each rule is evaluated once per row. Nothing is dropped with `expect_or_drop`.
+Each table reads its source once, into a private `<pipeline_id>_staged` table that is not published to Unity Catalog. A pipeline cannot send one read to two tables, and a temporary view runs again for every dataset that reads it, so the staging table is what lets bronze and quarantine share one read. It adds `_dq_failed_rules`, the names of the rules the row failed, so each rule is evaluated once per row, and (for files) `_dq_result`, what those failures mean for the row: `fail`, `quarantine`, `drop` or `pass`. Both are stored with the row, so changing a rule affects only files read from then on. Nothing is dropped with `expect_or_drop`.
 
-- **Bronze** holds only passing rows. It reads the staging table `WHERE size(_dq_failed_rules) = 0`, without that column, through the `<pipeline_id>_valid` temporary view. With `dedup: true` or a database `merge`, Auto CDC reads the same view.
-- **Quarantine** reads the staging table `WHERE size(_dq_failed_rules) > 0`, with the column renamed to `failed_rules`.
+- **Bronze** holds the rows whose result is `pass`, from files that were not blocked, without the two rule columns, through the `<pipeline_id>_valid` temporary view. With `dedup: true` or a database `merge`, Auto CDC reads the same view.
+- **Quarantine** holds the rows whose result is `quarantine` or `fail`, with the rule names in `failed_rules`.
+- **`<pipeline_id>_files`** (files only) has one row per file of the run with its counts and status. A file with a row that broke a `fail` rule is `FAILED`: the valid view leaves all its rows out of bronze, and **`<pipeline_id>_blocked_check`** then fails the update, after bronze and quarantine have finished, so the file is already marked read and is not picked up again.
+- **`<pipeline_id>_arrivals`** (files, when `source.expect_file` is on) lists the files that arrived since the previous run, so a run with no file, or a file with no rows, is recorded `FAILED` in the ledger while the job succeeds.
 
-The cost is one extra Delta write of every row, and the staging table's storage. It is cheaper than listing and parsing the files, or querying the database, a second time.
+The cost is one extra Delta write of every row, the staging table's storage, and a small grouped read of this run's rows for the per-file view. It is cheaper than listing and parsing the files, or querying the database, a second time.
 
 Each rule is also a warn expectation on the staging table, `NOT array_contains(_dq_failed_rules, '<rule>')`, so pass and fail counts reach the pipeline event log without evaluating the rule again.
+
+**Reloading files.** The `framework_backfill` job (`./run.sh backfill`) reloads files of one table, chosen by name or arrival date, or refreshes the whole table. It loads the table's spec from the registry and runs the same staging step as the pipeline, so rules, rule actions, audit columns and ledger match a normal load. A reloaded file's earlier rows are removed from bronze and quarantine first, so nothing is duplicated. See [QUALITY_RULES.md](../framework_ingestion/QUALITY_RULES.md#reloading-files-backfill) for the modes and what each records.
 
 | Kind and method | Reads | Quarantine | Bronze |
 | --- | --- | --- | --- |
@@ -129,7 +133,7 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_columns`, `v_column_history` | Current and past columns of raw, bronze, and quarantine. |
 | `v_lineage` | Latest link per parent, child, and relation. |
 | `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
-| `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. NRT via `record_this_run`; hourly `framework_runs` is catch-up only. |
+| `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. Recorded hourly by `framework_runs`. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
 | `v_loads`, `v_load_failures` | Per-load recon, written by the pipeline's event hook once per update, and failure reasons for repair. |
 | `v_bronze_tables` | Every bronze table and its owner. |
@@ -153,21 +157,24 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | Table or view | Built by | What it holds |
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
-| `load_ledger`, `v_loads`, `v_loads_90d` | The pipeline's event hook (`pipeline_metrics`), once per update | Central recon SoR: one row per registered dataflow, counts always numbers, FAILED with the error when a table fails or cannot register. `v_loads_90d` unions 7-day hot with forever archive for dashboards |
+| `load_ledger`, `v_loads`, `v_loads_90d` | The pipeline's event hook (`pipeline_metrics`), once per update; `framework_backfill`; hourly `framework_runs` for an update whose hook was cut off | Central recon SoR: one row per registered dataflow, counts always numbers (`rows_read`, `rows_written`, `rows_quarantine`, `rows_dropped`, `rows_blocked`, `files_read`, `files_failed`), FAILED with the error when a table fails, cannot register, has a blocked file, got no file, or got an empty file. `v_loads_90d` unions 7-day hot with forever archive for dashboards |
+| `file_ledger` | The same writers | One row per file per load: status (`PROCESSED`, `WARNING`, `FAILED`), its counts, the rules that blocked it, `error_message` (`blocked by fail rule(s): ...`, `file has no rows`, `file not found`), and `load_kind` (`regular` or `backfill`) |
 | `v_load_failures` | Views over loads + job/task runs | What failed and why (`failure_reason`, task, run page) for repair |
 | `job_runs`, `v_job_runs`, `v_job_status` | The hourly `framework_runs` job | Append-only run events; `v_job_runs` keeps latest per `(job_id, run_id)` |
-| `job_task_runs`, `v_job_task_runs` | NRT + hourly catch-up | Append-only task events; view keeps latest per `(job_run_id, task_run_id)` |
+| `job_task_runs`, `v_job_task_runs` | Hourly `framework_runs` | Append-only task events; view keeps latest per `(job_run_id, task_run_id)` |
 | `pipeline_updates`, `v_pipeline_updates` | Hourly `framework_runs` from `update_progress` in each `<job>_event_log` | Each pipeline update: start, end, last state, and status |
 | `v_job_costs`, `v_pipeline_costs` | `framework_system_views`, only when `system_views` is `true` | DBUs and list cost per job run and per pipeline update, from `system.billing.usage` and `list_prices` |
 | `v_observed_lineage` | `framework_system_views`, only when `system_views` is `true` | What `system.access.table_lineage` saw each bronze and quarantine table read, next to the declared raw source: `declared`, `undeclared`, or `not_observed`. The registry's link and flow rows stay the declared intent. |
 
-Quality rules are checked on the private staging table; expectation counts on the ledger come from that update's `flow_progress` when present. Recon SoR is `load_ledger` / `v_loads` (NRT on each delivery job).
+Quality rules are checked on the private staging table; expectation counts on the ledger come from that update's `flow_progress` when present. Recon SoR is `load_ledger` / `v_loads`, written by the pipeline itself.
+
+**Reading the ledger when a job is green.** A job can succeed and its load still be `FAILED`: a table that expects a file got none, or got one with no rows (`source.expect_file`, on by default in a scheduled delivery), and a backfill that hit a blocked, missing or empty file. A job fails only when a file breaks a `fail` rule, or when something is really broken. Watch `v_load_failures` (or `v_loads WHERE target_status = 'FAILED'`), not only the job status. The pipelines run with their own restart of a failed update turned off (`pipelines.numUpdateRetryAttempts = 0`), because a restart would find a blocked file already read and finish, hiding the failure.
 
 Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] ` in prod). `framework_runs` matches a job on its `lakeflow_framework_workflow` tag, which the generator sets to the job name, and a pipeline update on the name of the event log it is in. Prefer granting that identity `SELECT` on `system.lakeflow` so catch-up is one MERGE; without it the Jobs API fallback needs `CAN_VIEW` on the delivery jobs. The Jobs API keeps 60 days of runs, and `job_runs` keeps them after that.
 
 **Trust model for quality rules.** Rule names are identifiers. Rule expressions are boolean SQL over that table's columns, literals, and an allow-listed function set — subqueries, comments, and DDL/DML are rejected. They still execute as the pipeline's `run_as` identity. Set `run_as` on each `source.yaml` to that source's service principal and grant it only its own raw volume, foreign catalog, and bronze schema so a careless expression cannot reach another team's data. Without `run_as`, the job runs as the deploying human.
 
-**Per-spec isolation.** `build_pipelines` validates and registers each table on its own. One bad or missing spec is logged and skipped; healthy tables in the same delivery still load. `record_load_metrics` then appends `FAILED` for registered dataflows with no event-log progress.
+**Per-spec isolation.** `build_pipelines` validates and registers each table on its own. One bad or missing spec is logged and skipped; healthy tables in the same delivery still load. The event hook then records that table as `FAILED` with the error that stopped it, in the same update's rows.
 
 ```sql
 -- rows read and loaded for any layer (append-only ledger, not a table scan)
@@ -249,7 +256,7 @@ None of the following has run on Databricks. The code assumes them:
 - `DESCRIBE DETAIL` `numRecords` on streaming tables and materialized views.
 - Reading `${workspace.file_path}` manifests from a serverless pipeline, and `spark.conf.get` of `lff.manifest` inside it.
 - Workspace concurrency if many pipelines run together.
-- `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names `record_load_metrics` / `v_loads` read.
+- `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names the pipeline's event hook and `v_loads` read.
 - `databricks-sdk` on serverless environment version 4 without listing it as a dependency, `WorkspaceClient()` with the job's own credentials, and `jobs.list` returning `settings.tags` without `expand_tasks`.
 - The Jobs API run fields `framework_runs` reads: `state.life_cycle_state` and `result_state`, `status.termination_details.code`, `setup_duration`, `queue_duration`, `execution_duration`, and `run_duration`.
 - `details:update_progress.state` on the published event log, and `dlt_update_id` in `usage_metadata` for the optional cost view.

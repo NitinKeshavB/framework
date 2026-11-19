@@ -638,6 +638,12 @@ class _Frame:
         self.reader.selects.append(parts)
         return self
 
+    def select(self, *parts: str) -> _Frame:
+        return self
+
+    def join(self, other, on=None, how=None) -> _Frame:
+        return self
+
 
 class _Reader:
     def __init__(self) -> None:
@@ -667,6 +673,9 @@ class _Spark:
     def __init__(self) -> None:
         self.readStream = _Reader()
         self.read = _Reader()
+
+    def sql(self, statement: str) -> _Frame:
+        return _Frame(self.read)
 
 
 class _Pipelines:
@@ -750,10 +759,13 @@ def test_billing_raw_to_bronze_is_pipeline_job_dataflow_and_flows(bundle: Path) 
     assert "billing_invoices_staged" in pipelines.names
     rules = [part for parts in spark.readStream.selects for part in parts if "amount >= 0" in part]
     assert rules == [rules[0]] and rules[0].endswith(" AS _dq_failed_rules")
-    assert spark.readStream.wheres == ["size(_dq_failed_rules) = 0", "size(_dq_failed_rules) > 0"]
-    assert ("* EXCEPT (_dq_failed_rules)",) in spark.readStream.selects
+    assert spark.readStream.wheres == [
+        "_dq_result = 'pass'",
+        "_dq_result IN ('fail', 'quarantine')",
+    ]
+    assert ("* EXCEPT (_dq_failed_rules, _dq_result)",) in spark.readStream.selects
     assert (
-        "* EXCEPT (_dq_failed_rules)",
+        "* EXCEPT (_dq_failed_rules, _dq_result)",
         "_dq_failed_rules AS failed_rules",
     ) in spark.readStream.selects
 

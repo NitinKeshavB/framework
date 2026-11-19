@@ -48,7 +48,7 @@ ENVIRONMENT_VERSION = "4"
 # TEMPORARY (pre-go-live): PERFORMANCE_OPTIMIZED for fast cold starts while iterating.
 # Switch back to "STANDARD" (cheaper) at go-live.
 PERFORMANCE_TARGET = "PERFORMANCE_OPTIMIZED"
-PACKAGE_VERSION = "0.1.11"  # keep in sync with framework_lff_lib/pyproject.toml [project].version
+PACKAGE_VERSION = "0.1.19"  # keep in sync with framework_lff_lib/pyproject.toml [project].version
 # Each pipeline publishes its event log to framework_meta as <job name><suffix>.
 EVENT_LOG_SUFFIX = "_event_log"
 WORKFLOW_TAG = "lakeflow_framework_workflow"

@@ -8,8 +8,8 @@ Two shapes, chosen by the load method:
   files already in the raw volume, or the database table itself.
 
 ``build_pipelines`` isolates per-spec failures: one bad or missing spec is logged and skipped so
-the other tables in the delivery still register. ``record_load_metrics`` then appends FAILED for
-registered dataflows with no event-log progress.
+the other tables in the delivery still register. The pipeline's event hook (``pipeline_metrics``)
+then records that table FAILED, with the error that stopped it.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -41,13 +42,18 @@ from lakeflow_framework.pipeline_metrics import Dataflow, UpdateRecorder
 from lakeflow_framework.pipeline_metrics import install as install_recorder
 from lakeflow_framework.quality import (
     DQ_COLUMN,
-    FAILED,
-    PASSED,
+    DQ_RESULT,
+    blocking_rules,
     compile_rules,
     expectations,
+    fail_expectations,
     failed_rules_sql,
+    quarantine_where,
+    result_sql,
+    valid_where,
 )
-from lakeflow_framework.sqlnames import sql_string
+from lakeflow_framework.sqlnames import require_catalog, sql_string
+from lakeflow_framework.volume_listing import list_volume_files
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +77,7 @@ class Graph:
     expectations: list[tuple[str, str]]
     batch_sql: list[str]
     auto_cdc: dict[str, Any] | None
+    fail_expectations: list[tuple[str, str]] = field(default_factory=list)
 
 
 def build_pipeline(
@@ -349,12 +356,39 @@ def _install_recorder(
                 quarantine=config.table_name("quarantine"),
                 append=not config.uses_auto_cdc,
                 build_error=error,
+                files=_sibling(config, files_name(config)) if is_file_load(config) else "",
+                blocked_check=(
+                    _sibling(config, f"{pipeline_id}_blocked_check")
+                    if is_file_load(config) and _has_fail_rule(config)
+                    else ""
+                ),
+                arrivals=(
+                    _sibling(config, arrivals_name(config))
+                    if is_file_load(config) and config.expect_file
+                    else ""
+                ),
+                path=config.path if is_file_load(config) else "",
             )
         )
     recorder = UpdateRecorder(
         job_name, (known.layer if known else "bronze"), dataflows, batch_id=batch_id()
     )
     install_recorder(pipelines, spark, recorder, catalog)
+
+
+# The schema a generated pipeline publishes its own working tables to (staged, files, checks).
+# Bronze and quarantine are named explicitly, so only these land here.
+PIPELINE_SCHEMA = "framework_meta"
+
+
+def _sibling(config: PipelineConfig, name: str) -> str:
+    """The full name of a working table the pipeline publishes in its own schema."""
+
+    return f"{config.catalog}.{PIPELINE_SCHEMA}.{name}"
+
+
+def _has_fail_rule(config: PipelineConfig) -> bool:
+    return bool(blocking_rules(compile_rules(config)))
 
 
 def _conf(spark: Any, key: str) -> str | None:
@@ -390,6 +424,50 @@ def _cluster_pipelines() -> Any:
     return pipelines
 
 
+def is_file_load(config: PipelineConfig) -> bool:
+    """True when the source is files, where one file is the unit that is read, counted and blocked."""
+
+    return config.load_method in {"autoloader", "volume_files"}
+
+
+def files_name(config: PipelineConfig) -> str:
+    return f"{config.pipeline_id}_files"
+
+
+def arrivals_name(config: PipelineConfig) -> str:
+    return f"{config.pipeline_id}_arrivals"
+
+
+# A file that landed a moment before the previous run started still belongs to that run.
+ARRIVAL_SLACK_MINUTES = 5
+
+
+def arrivals_sql(config: PipelineConfig, inventory: str, files: str) -> str:
+    """Files that arrived since the previous regular run: where they are, and whether this run read
+    rows from them (``has_rows``) or an earlier load already recorded them (``recorded_before``).
+
+    A file that arrived, was not read and was never recorded is an empty one: Auto Loader read
+    it and found no rows, so it never shows in the per-file view. ``since`` is the start of the
+    previous regular run, so a backfill (which also writes to the ledger) does not move it.
+    """
+
+    pid = sql_string(config.pipeline_id)
+    ledger = f"{PIPELINE_SCHEMA}.load_ledger"
+    return (
+        f"SELECT i.file_path, regexp_extract(i.file_path, '[^/]+$', 0) AS file_name, "
+        "i.file_bytes, i.arrived_at, "
+        f"f.{SRC_FILE_PATH} IS NOT NULL AS has_rows, l.src_file_path IS NOT NULL AS recorded_before "
+        f"FROM {inventory} i "
+        f"LEFT JOIN {files} f ON f.{SRC_FILE_PATH} = i.file_path "
+        f"LEFT JOIN (SELECT DISTINCT src_file_path FROM {PIPELINE_SCHEMA}.file_ledger "
+        f"WHERE dataflow = {pid}) l ON l.src_file_path = i.file_path "
+        "WHERE i.arrived_at > coalesce(("
+        f"SELECT max(started_at) FROM {ledger} WHERE dataflow = {pid} "
+        "AND update_id NOT LIKE 'backfill-%'"
+        f") - INTERVAL {ARRIVAL_SLACK_MINUTES} MINUTES, TIMESTAMP '1970-01-01')"
+    )
+
+
 def assemble(config: PipelineConfig) -> Graph:
     """The datasets for one table. The source is read once, into a private staging table.
 
@@ -423,8 +501,10 @@ def assemble(config: PipelineConfig) -> Graph:
     else:
         origin = config.path
     checked = {"source": origin, "failed_rules": failed_rules_sql(rules)}
-    if config.load_method in {"autoloader", "volume_files"}:
+    files = is_file_load(config)
+    if files:
         checked["options"] = strategy.options(config)
+        checked["result"] = result_sql(rules)
     staged_name = f"{config.pipeline_id}_staged"
     valid_name = f"{config.pipeline_id}_valid"
     datasets.append(Dataset(kind="staged", name=staged_name, relation=relation, detail=checked))
@@ -433,9 +513,43 @@ def assemble(config: PipelineConfig) -> Graph:
             kind="valid",
             name=valid_name,
             relation="temporary_view",
-            detail={"source": staged_name, "where": PASSED},
+            detail={
+                "source": staged_name,
+                "where": valid_where(rules, files=files),
+                "blocked_by": files_name(config) if blocking_rules(rules) and files else None,
+            },
         )
     )
+    if files:
+        # One row per file of this run, with its counts and status. The ledger is written from it,
+        # and a file with a ``fail`` rule broken is kept out of bronze through it.
+        datasets.append(
+            Dataset(
+                kind="files",
+                name=files_name(config),
+                relation="materialized_view",
+                detail={"source": staged_name, "blocking": blocking_rules(rules)},
+            )
+        )
+        if config.expect_file:
+            # Every file that arrived since the last run, with whether this run read rows from it.
+            datasets.append(
+                Dataset(
+                    kind="arrivals",
+                    name=arrivals_name(config),
+                    relation="materialized_view",
+                    detail={"path": config.path, "files": files_name(config)},
+                )
+            )
+        if blocking_rules(rules):
+            datasets.append(
+                Dataset(
+                    kind="blocked_check",
+                    name=f"{config.pipeline_id}_blocked_check",
+                    relation="materialized_view",
+                    detail={"source": files_name(config)},
+                )
+            )
     auto_cdc = None
     if config.uses_auto_cdc:
         datasets.append(
@@ -471,13 +585,14 @@ def assemble(config: PipelineConfig) -> Graph:
             kind="quarantine",
             name=config.table_name("quarantine"),
             relation=relation,
-            detail={"source": staged_name, "where": FAILED},
+            detail={"source": staged_name, "where": quarantine_where(rules, files=files)},
         )
     )
     return Graph(
         pipeline_id=config.pipeline_id,
         datasets=datasets,
-        expectations=list(expectations(rules).items()),
+        expectations=list(expectations(rules, files=files).items()),
+        fail_expectations=list(fail_expectations(rules, files=files).items()),
         batch_sql=strategy.batch_sql(config),
         auto_cdc=auto_cdc,
     )
@@ -540,6 +655,14 @@ CHANGE_FEED_RETENTION = "interval 30 days"
 # Columns the pipeline stamps on every load. An SCD2 table must not open a version because of them.
 UNTRACKED_COLUMNS = (SRC_FILE_PATH, SRC_FILE_NAME, BATCH_ID, INGEST_TIMESTAMP)
 _BATCH_ID: str | None = None
+_BATCH_STARTED: datetime | None = None
+# The per-file status of a file of this run. FAILED means a ``fail`` rule blocked the file.
+FILE_STATUS = "file_status"
+FILE_FAILED = "FAILED"
+FILE_WARNING = "WARNING"
+FILE_PROCESSED = "PROCESSED"
+# A clock that runs a little behind the cluster's must not hide rows of this run.
+_CLOCK_SLACK = timedelta(minutes=5)
 
 
 def batch_id() -> str:
@@ -550,10 +673,54 @@ def batch_id() -> str:
     the same process, writes it to ``load_ledger.batch_id`` beside the real update id.
     """
 
-    global _BATCH_ID
+    global _BATCH_ID, _BATCH_STARTED
     if _BATCH_ID is None:
         _BATCH_ID = str(uuid.uuid4())
+        _BATCH_STARTED = datetime.now(UTC)
     return _BATCH_ID
+
+
+def files_sql(staged: str, blocking: list[str], *, this_run: bool = True) -> str:
+    """One row per file of this run: counts and status, from the staged rows of this run only.
+
+    The run is found by ``_batch_id`` and, so Delta can skip older files, by the load time the
+    staged table is clustered on. A backfill passes ``this_run=False`` for a view that holds
+    nothing but the rows it is counting.
+    """
+
+    run = batch_id()
+    since = (_BATCH_STARTED or datetime.now(UTC)) - _CLOCK_SLACK
+    scope = (
+        f"WHERE {BATCH_ID} = {sql_string(run)} "
+        f"AND {INGEST_TIMESTAMP} >= TIMESTAMP '{since.strftime('%Y-%m-%d %H:%M:%S')}+00:00' "
+        if this_run
+        else ""
+    )
+    names = ", ".join(sql_string(name) for name in blocking)
+    blockers = (
+        f"array_join(array_intersect(array_distinct(flatten(collect_list({DQ_COLUMN}))), "
+        f"array({names})), ', ')"
+        if blocking
+        else "''"
+    )
+    return (
+        f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, {BATCH_ID}, "
+        "count(*) AS rows_read, "
+        f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN 0 "
+        f"ELSE count_if({DQ_RESULT} = 'pass') END AS rows_loaded, "
+        f"count_if({DQ_RESULT} IN ('fail', 'quarantine')) AS rows_quarantined, "
+        f"count_if({DQ_RESULT} = 'drop') AS rows_dropped, "
+        f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 "
+        f"THEN count_if({DQ_RESULT} = 'pass') ELSE 0 END AS rows_blocked, "
+        f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN '{FILE_FAILED}' "
+        f"WHEN count_if({DQ_RESULT} <> 'pass') > 0 THEN '{FILE_WARNING}' "
+        f"ELSE '{FILE_PROCESSED}' END AS {FILE_STATUS}, "
+        f"{blockers} AS blocking_rules, "
+        f"array_join(array_sort(array_distinct(flatten(collect_list({DQ_COLUMN})))), ', ') "
+        "AS failed_rules "
+        f"FROM {staged} {scope}"
+        f"GROUP BY {SRC_FILE_PATH}, {SRC_FILE_NAME}, {BATCH_ID}"
+    )
 
 
 def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
@@ -575,8 +742,22 @@ def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
             "lakeflow_framework.pipeline_id": config.pipeline_id,
         },
     }
+    if layer == "files":
+        options["comment"] = (
+            f"One row per file of the latest run of {config.pipeline_id}: counts and status."
+        )
+        return options
+    if layer == "arrivals":
+        options["comment"] = (
+            f"Files that arrived for {config.pipeline_id} since its previous run, and whether "
+            "the run read rows from each. A file with none is empty."
+        )
+        return options
     if layer == "staged":
         options["private"] = True
+        if is_file_load(config):
+            # The per-file view reads only the rows of this run, found by load time.
+            options["cluster_by"] = [INGEST_TIMESTAMP]
         return options
     if layer in {"bronze", "quarantine"}:
         options["table_properties"].update(
@@ -599,17 +780,51 @@ def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
     return options
 
 
-def _audit_exprs(config: PipelineConfig) -> list[str]:
+def _audit_exprs(config: PipelineConfig, batch: str | None = None) -> list[str]:
     """Select expressions for the audit columns added when a row is staged.
 
     The row hash, file path, file name, and load time come from the read itself, where ``*`` is
-    exactly what the source gave (see ``_read_source`` and ``load.projection_exprs``).
+    exactly what the source gave (see ``file_columns`` and ``load.projection_exprs``).
     """
 
-    exprs = [f"{sql_string(batch_id())} AS {BATCH_ID}"]
+    exprs = [f"{sql_string(batch or batch_id())} AS {BATCH_ID}"]
     if config.delete_when:
         exprs.append(f"coalesce(CAST(({config.delete_when}) AS BOOLEAN), false) AS {IS_DELETED}")
     return exprs
+
+
+def file_columns(loaded_at: datetime | None = None) -> list[str]:
+    """What is added to a row as it is read from a file: its hash, where it came from, and when.
+
+    A backfill passes ``loaded_at`` so every evaluation of its micro-batch gives a row the same load
+    time; the pipeline lets Spark stamp the moment it reads.
+    """
+
+    stamp = (
+        f"TIMESTAMP '{loaded_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M:%S.%f')}+00:00'"
+        if loaded_at
+        else "current_timestamp()"
+    )
+    return [
+        ROW_HASH_EXPR,
+        f"_metadata.file_path AS {SRC_FILE_PATH}",
+        f"_metadata.file_name AS {SRC_FILE_NAME}",
+        f"{stamp} AS {INGEST_TIMESTAMP}",
+    ]
+
+
+def stage_frame(frame: Any, config: PipelineConfig, batch: str | None = None) -> Any:
+    """The staging step: audit columns, the rules each row failed, and what each row's failures
+    mean for it. The main pipeline and a backfill both run exactly this, so a row is judged the
+    same way whichever loaded it. ``frame`` already has ``file_columns`` added."""
+
+    rules = compile_rules(config)
+    staged = frame.selectExpr(
+        "*", *_audit_exprs(config, batch), f"{failed_rules_sql(rules)} AS {DQ_COLUMN}"
+    )
+    if is_file_load(config):
+        staged = staged.selectExpr("*", f"{result_sql(rules)} AS {DQ_RESULT}")
+    return staged
 
 
 def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) -> None:
@@ -631,12 +846,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
     def _read_source() -> Any:
         if config.load_method == "volume_files":
             frame = _read_files()
-            extra = [
-                ROW_HASH_EXPR,
-                f"_metadata.file_path AS {SRC_FILE_PATH}",
-                f"_metadata.file_name AS {SRC_FILE_NAME}",
-                f"current_timestamp() AS {INGEST_TIMESTAMP}",
-            ]
+            extra = file_columns()
         elif config.load_method == "database_table":
             frame = spark.read.table(config.source_reference())
             extra = [ROW_HASH_EXPR, f"current_timestamp() AS {INGEST_TIMESTAMP}"]
@@ -648,24 +858,79 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
     def _staged() -> Any:
         frame = _read_source()
-        failed_rules = f"{staged.detail['failed_rules']} AS {DQ_COLUMN}"
         if not hasattr(frame, "selectExpr"):
             raise TypeError(
                 "pipeline frames must support .selectExpr; inject a DataFrame-like test double"
             )
-        return frame.selectExpr("*", *_audit_exprs(config), failed_rules)
+        return stage_frame(frame, config)
 
     registered = _staged
     if graph.expectations:
         registered = pipelines.expect_all(dict(graph.expectations))(registered)
+    if graph.fail_expectations:
+        # A row that breaks one of these fails the update, so nothing of that run reaches bronze.
+        registered = pipelines.expect_all_or_fail(dict(graph.fail_expectations))(registered)
     persisted(name=staged.name, **_table_options(config, "staged"))(registered)
+
+    files_dataset = by_kind.get("files")
+    internal = f"{DQ_COLUMN}, {DQ_RESULT}" if files_dataset else DQ_COLUMN
 
     @pipelines.temporary_view(name=valid.name)
     def _valid() -> Any:
-        frame = _filtered(_reader().table(staged.name), PASSED)
+        frame = _filtered(_reader().table(staged.name), valid.detail["where"])
+        if valid.detail.get("blocked_by"):
+            # The files this run blocked. A file is read once, so a blocked file is never retried:
+            # its good rows stay out of bronze by this join while its bad rows go to quarantine.
+            blocked = (
+                spark.read.table(valid.detail["blocked_by"])
+                .filter(f"{FILE_STATUS} = '{FILE_FAILED}'")
+                .select(SRC_FILE_PATH, BATCH_ID)
+            )
+            frame = frame.join(blocked, [SRC_FILE_PATH, BATCH_ID], "left_anti")
         if hasattr(frame, "selectExpr"):
-            frame = frame.selectExpr(f"* EXCEPT ({DQ_COLUMN})")
+            frame = frame.selectExpr(f"* EXCEPT ({internal})")
         return _typed_sequence(frame, config)
+
+    if files_dataset is not None:
+
+        @pipelines.materialized_view(name=files_dataset.name, **_table_options(config, "files"))
+        def _files() -> Any:
+            return spark.sql(files_sql(staged.name, files_dataset.detail["blocking"]))
+
+        arrivals_dataset = by_kind.get("arrivals")
+        if arrivals_dataset is not None:
+            inventory = f"{config.pipeline_id}_inventory"
+
+            @pipelines.temporary_view(name=inventory)
+            def _inventory() -> Any:
+                # Names, sizes and arrival times only: the content of a file is not read, and a
+                # file with no bytes is listed too.
+                return spark.createDataFrame(
+                    [
+                        (item["file_path"], item["file_bytes"], item["arrived_at"])
+                        for item in list_volume_files(config.path, config.path_glob)
+                    ],
+                    "file_path STRING, file_bytes BIGINT, arrived_at TIMESTAMP",
+                )
+
+            @pipelines.materialized_view(
+                name=arrivals_dataset.name, **_table_options(config, "arrivals")
+            )
+            def _arrivals() -> Any:
+                return spark.sql(arrivals_sql(config, inventory, files_dataset.name))
+
+        checked_files = by_kind.get("blocked_check")
+        if checked_files is not None:
+            # Runs after bronze and quarantine have finished, so the files are already read when
+            # it fails the update. Only this run's blocked files are in the files view.
+            @pipelines.expect_all_or_fail({"no_file_blocked_by_fail_rule": "1 = 0"})
+            @pipelines.materialized_view(name=checked_files.name)
+            def _blocked_check() -> Any:
+                return spark.sql(
+                    f"SELECT {SRC_FILE_NAME}, rows_read, rows_quarantined, rows_blocked, "
+                    f"blocking_rules FROM {files_dataset.name} "
+                    f"WHERE {FILE_STATUS} = '{FILE_FAILED}'"
+                )
 
     if bronze.relation == "auto_cdc":
         pipelines.create_streaming_table(name=bronze.name, **_table_options(config, "bronze"))
@@ -689,9 +954,9 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
     @persisted(name=quarantine.name, **_table_options(config, "quarantine"))
     def _quarantine() -> Any:
-        frame = _filtered(_reader().table(staged.name), FAILED)
+        frame = _filtered(_reader().table(staged.name), quarantine.detail["where"])
         if hasattr(frame, "selectExpr"):
-            return frame.selectExpr(f"* EXCEPT ({DQ_COLUMN})", f"{DQ_COLUMN} AS failed_rules")
+            return frame.selectExpr(f"* EXCEPT ({internal})", f"{DQ_COLUMN} AS failed_rules")
         return frame
 
     if config.load_method == "autoloader":
@@ -732,8 +997,13 @@ class UnityMetadata:
         # bound parameter (args=) fails. Each id is safe to inline: it matched IDENTIFIER above,
         # so it holds only letters, digits, and underscores.
         quoted = ", ".join(f"'{pipeline_id}'" for pipeline_id in ids)
+        # A pipeline's default catalog is the deployment's. A job's is not, so a caller outside a
+        # pipeline names the catalog.
+        schema = (
+            f"{require_catalog(self.catalog)}.framework_meta" if self.catalog else "framework_meta"
+        )
         frame = self.spark.sql(
-            "SELECT full_name, config_json FROM framework_meta.v_asset_registry_current "
+            f"SELECT full_name, config_json FROM {schema}.v_asset_registry_current "
             f"WHERE object_kind = 'pipeline' AND full_name IN ({quoted})"
         )
         rows = frame.collect() if hasattr(frame, "collect") else list(frame)

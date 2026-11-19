@@ -458,7 +458,7 @@ def test_pipeline_wiring_uses_auto_cdc_only_when_dedup_is_on():
         config=config_from_document(_billing()),
     )
     kinds = [dataset.kind for dataset in graph.datasets]
-    assert kinds == ["raw", "staged", "valid", "bronze", "quarantine"]
+    assert kinds == ["raw", "staged", "valid", "files", "bronze", "quarantine"]
     assert graph.auto_cdc["stored_as_scd_type"] == 1
     assert pipelines.cdc[0]["keys"] == ["invoice_id"]
     assert "cloudFiles.schemaLocation" not in spark.options
@@ -535,10 +535,15 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     ]
     assert keys and all(len(key.split(",")) <= 4 for key in keys)
     assert "'delta.autoOptimize.autoCompact' = 'false'" not in text
-    # Every statement can run again. The one ALTER kind kept, ADD COLUMN, has no IF NOT EXISTS,
-    # so apply_ddl skips it when the column is already there.
+    # Every statement can run again. ADD COLUMN has no IF NOT EXISTS, so apply_ddl skips it when
+    # the column is already there; a constraint is dropped IF EXISTS before it is added.
     alters = [statement for statement in statements if statement.upper().startswith("ALTER")]
-    assert alters and all(" ADD COLUMN " in statement.upper() for statement in alters)
+    assert alters and all(
+        " ADD COLUMN " in statement.upper()
+        or " DROP CONSTRAINT IF EXISTS " in statement.upper()
+        or " ADD CONSTRAINT " in statement.upper()
+        for statement in alters
+    )
     assert "VIEW framework_dev.framework_meta.v_ownership_refusals" in text
     assert "ownership_refusals" in text
     assert "run_ledger" not in text and "run_current" not in text
@@ -1295,6 +1300,12 @@ class _Frame:
         self.reader.exprs.append(exprs)
         return self
 
+    def select(self, *columns: str) -> _Frame:
+        return self
+
+    def join(self, other, on=None, how=None) -> _Frame:
+        return self
+
 
 class _Reader:
     def __init__(self):
@@ -1327,6 +1338,12 @@ class _FakeSpark:
     def __init__(self):
         self.readStream = _Reader()
         self.read = _Reader()
+
+    def sql(self, statement):
+        return _Frame(self.read)
+
+    def createDataFrame(self, data, schema=None):  # noqa: N802 (Spark's name)
+        return _Frame(self.read)
 
     @property
     def options(self):

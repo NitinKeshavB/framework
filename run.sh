@@ -141,6 +141,28 @@ function check:rules {
         --profile "$profile" --warehouse "$warehouse" "${catalog_args[@]}"
 }
 
+# reload files of one table, or refresh it, through the table's own rules (the framework_backfill
+# job; it needs framework_bundle deployed). Every option is KEY=VALUE after the target:
+#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=files files=a.csv,b.csv
+#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=dates date_from=2026-11-01 date_to=2026-11-03
+#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=failed
+#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=full_refresh confirm=true
+# It lists the files and changes nothing unless dry_run=false is given. With no files or dates it
+# reloads every file, which needs confirm=true.
+function backfill {
+    local target="${1:?usage: ./run.sh backfill <target> <databricks-profile> table=<id> mode=<mode> [KEY=VALUE ...]}"
+    local profile="${2:?usage: ./run.sh backfill <target> <databricks-profile> table=<id> mode=<mode> [KEY=VALUE ...]}"
+    shift 2
+    local params=""
+    # --params splits on commas, so each pair is quoted: files=a.csv,b.csv stays one value.
+    for pair in "$@"; do
+        params="${params:+$params,}\"$pair\""
+    done
+    [ -n "$params" ] || { echo "give at least table=<id> and mode=<mode>" >&2; exit 1; }
+    _require-bundle framework_bundle
+    (cd "$THIS_DIR/framework_bundle" && databricks bundle run framework_backfill -t "$target" --profile "$profile" --params "$params")
+}
+
 # validate a bundle: ./run.sh bundle:validate <bundle> <target> [databricks-profile]
 # <bundle> is a folder with a databricks.yml: framework_bundle, framework_ingestion, or
 # framework_curation/<domain>/<project>

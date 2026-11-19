@@ -95,7 +95,7 @@ raw_to_bronze:
 
 ## Quality rules and quarantine
 
-`raw_to_bronze.rules` holds SQL conditions every good row must meet. A row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantine` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.
+`raw_to_bronze.rules` holds SQL conditions every good row must meet. By default, a row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantine` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.
 
 ```yaml
 raw_to_bronze:
@@ -105,6 +105,8 @@ raw_to_bronze:
     - { name: bike_type_known, expression: "rideable_type IN ('classic_bike', 'electric_bike')" }
     - { name: ended_after_start, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
 ```
+
+What happens to a failing row is a choice: `raw_to_bronze.on_bad_rows` (and `on_fail` on one rule) is `quarantine` (the default), `drop`, `warn` or `fail`. `fail` blocks the whole **file** that holds a bad row: none of its rows reach bronze, its bad rows go to quarantine, the run and job end `FAILED` naming the file, and the file is not picked up again. `framework_backfill` reloads files by name or arrival date, or refreshes a table, through the same rules. A table in a scheduled delivery also expects a file with rows each run: none, or an empty one, is recorded `FAILED` in the ledger while the job still succeeds (`source.expect_file`; see QUALITY_RULES.md). `abs_gl.yaml` shows every option of a spec, commented, at the bottom.
 
 `rlike` matches anywhere in the value, so anchor a pattern with `^` and `$`, and write `[0-9]` instead of `\d`: a single backslash is dropped silently. `./run.sh generate` reads a rule as text. It catches an unknown column, an unapproved function, an unclosed bracket or a half-written condition, but not a regex that does not compile or a function with the wrong arguments, which would fail the whole update at load time. Run **`./run.sh check:rules <profile> <warehouse-id> [catalog]`** before a deploy that changes a rule: it evaluates every rule on a warehouse, and with a catalog also counts the rows each would quarantine. **[QUALITY_RULES.md](QUALITY_RULES.md)** has the regex guide, a copyable pattern list, every kind of check you can add (presence, length, allowed values, numbers, dates, across columns, conditional), the approved functions, the checks that are on by default, what a rule cannot do, how to test a rule against existing data before deploying, and where the results show up. `abs_gl.yaml` has a full example with two rules per column.
 

@@ -18,7 +18,14 @@ def case(name, expr, good, bad, types=None, pattern=None):
     """``good`` and ``bad`` are lists of {column: value}. ``types`` gives a column its SQL type
     (default string). ``pattern`` marks a rule that is one ``rlike``, so Python can check it too."""
 
-    return {"name": name, "expr": expr, "good": good, "bad": bad, "types": types or {}, "pattern": pattern}
+    return {
+        "name": name,
+        "expr": expr,
+        "good": good,
+        "bad": bad,
+        "types": types or {},
+        "pattern": pattern,
+    }
 
 
 CASES = [

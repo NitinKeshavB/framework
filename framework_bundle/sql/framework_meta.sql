@@ -323,7 +323,7 @@ TBLPROPERTIES (
 ALTER TABLE ${catalog}.framework_meta.load_metric DROP CONSTRAINT IF EXISTS load_metric_layer;
 ALTER TABLE ${catalog}.framework_meta.load_metric ADD CONSTRAINT load_metric_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged'));
 ALTER TABLE ${catalog}.framework_meta.load_metric DROP CONSTRAINT IF EXISTS load_metric_name;
-ALTER TABLE ${catalog}.framework_meta.load_metric ADD CONSTRAINT load_metric_name CHECK (metric_name IN ('rows_read', 'rows_written', 'rows_upserted', 'rows_deleted', 'rows_quarantine', 'rows_processed'));
+ALTER TABLE ${catalog}.framework_meta.load_metric ADD CONSTRAINT load_metric_name CHECK (metric_name IN ('rows_read', 'rows_written', 'rows_upserted', 'rows_deleted', 'rows_quarantine', 'rows_processed', 'rows_dropped', 'rows_blocked', 'files_read', 'files_failed'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
   job_name STRING NOT NULL,
@@ -365,6 +365,55 @@ TBLPROPERTIES (
 -- copies by position (h.*, then archived_at). A repeat is skipped by apply_ddl.
 ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN batch_id STRING AFTER recorded_at;
 ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN batch_id STRING AFTER recorded_at;
+
+-- Counts for rows a rule dropped or a blocked file kept out, and for files. They follow batch_id,
+-- in the same order in both tables, for the same reason. A count is never NULL: the pipeline
+-- writes 0 for a load that failed or read nothing.
+ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN rows_dropped BIGINT AFTER batch_id;
+ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN rows_blocked BIGINT AFTER rows_dropped;
+ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN files_read BIGINT AFTER rows_blocked;
+ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN files_failed BIGINT AFTER files_read;
+ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN rows_dropped BIGINT AFTER batch_id;
+ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN rows_blocked BIGINT AFTER rows_dropped;
+ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN files_read BIGINT AFTER rows_blocked;
+ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN files_failed BIGINT AFTER files_read;
+
+-- Scratch space for a backfill's Auto Loader state (schema and checkpoint). It is apart from every
+-- source volume, so the pipelines never read it as a new file.
+CREATE VOLUME IF NOT EXISTS ${catalog}.framework_meta.backfill_state
+COMMENT 'Checkpoints of framework_backfill runs. Safe to delete a run folder once it has finished.';
+
+-- One row per file per load of a file source: the file, its counts, its status, and why it failed.
+-- status: PROCESSED (all rows kept), WARNING (some rows quarantined or dropped), FAILED (a fail rule
+-- blocked it: none of its rows loaded to bronze). load_kind: regular or backfill.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.file_ledger (
+  job_name STRING NOT NULL,
+  layer STRING NOT NULL,
+  update_id STRING NOT NULL,
+  batch_id STRING,
+  dataflow STRING NOT NULL,
+  target_table STRING,
+  src_file_path STRING NOT NULL,
+  src_file_name STRING,
+  status STRING NOT NULL,
+  rows_read BIGINT,
+  rows_loaded BIGINT,
+  rows_quarantined BIGINT,
+  rows_dropped BIGINT,
+  rows_blocked BIGINT,
+  failed_rules STRING,
+  blocking_rules STRING,
+  error_message STRING,
+  load_kind STRING,
+  recorded_at TIMESTAMP NOT NULL
+)
+CLUSTER BY (dataflow, recorded_at)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+);
+ALTER TABLE ${catalog}.framework_meta.file_ledger DROP CONSTRAINT IF EXISTS file_ledger_status;
+ALTER TABLE ${catalog}.framework_meta.file_ledger ADD CONSTRAINT file_ledger_status CHECK (status IN ('PROCESSED', 'WARNING', 'FAILED'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_metric_archive (
   job_name STRING NOT NULL,
@@ -998,7 +1047,11 @@ SELECT
   expectations,
   failure_reason,
   recorded_at,
-  batch_id
+  batch_id,
+  coalesce(rows_dropped, 0) AS rows_dropped,
+  coalesce(rows_blocked, 0) AS rows_blocked,
+  coalesce(files_read, 0) AS files_read,
+  coalesce(files_failed, 0) AS files_failed
 FROM ${catalog}.framework_meta.load_ledger
 QUALIFY row_number() OVER (
   PARTITION BY job_name, layer, update_id, dataflow
@@ -1029,6 +1082,7 @@ WITH combined AS (
     target_table, quarantine_table, started_at, ended_at, duration_seconds,
     rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
     target_status, quarantine_status, expectations, failure_reason, recorded_at, batch_id,
+    rows_dropped, rows_blocked, files_read, files_failed,
     CAST(NULL AS TIMESTAMP) AS archived_at
   FROM ${catalog}.framework_meta.v_loads
   WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
@@ -1039,6 +1093,8 @@ WITH combined AS (
     target_table, quarantine_table, started_at, ended_at, duration_seconds,
     rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
     target_status, quarantine_status, expectations, failure_reason, recorded_at, batch_id,
+    coalesce(rows_dropped, 0), coalesce(rows_blocked, 0), coalesce(files_read, 0),
+    coalesce(files_failed, 0),
     archived_at
   FROM ${catalog}.framework_meta.load_ledger_archive
   WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
@@ -1067,6 +1123,10 @@ SELECT
   l.rows_upserted,
   l.rows_deleted,
   l.rows_quarantine,
+  l.rows_dropped,
+  l.rows_blocked,
+  l.files_read,
+  l.files_failed,
   l.started_at AS load_started_at,
   l.recorded_at AS load_recorded_at,
   l.batch_id,

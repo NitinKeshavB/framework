@@ -92,7 +92,7 @@ raw_to_bronze:
 quarantine: { schema: billing_quarantine}
 ```
 
-`source` also takes `path_glob`, `max_files_per_trigger` (default 1000), `multiline` (JSON only; default false), `header_rows` and `data_address` (Excel, both required), `external_location`, and `file_events` (default false; set it only once file events are enabled on the volume's external location). `raw_to_bronze.bronze.cluster_by` takes up to four columns; without it bronze uses automatic liquid clustering. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`. An Excel address may quote the sheet name, as in `'Sheet1'!A1`.
+`source` also takes `path_glob`, `max_files_per_trigger` (default 1000), `multiline` (JSON only; default false), `header_rows` and `data_address` (Excel, both required), `external_location`, `file_events` (default false; set it only once file events are enabled on the volume's external location), and `expect_file` (every run must bring a file with rows; none, or an empty one, is recorded `FAILED` in the ledger while the job still succeeds. Default: true in a scheduled delivery, false in one fired by a file arriving). `raw_to_bronze.bronze.cluster_by` takes up to four columns; without it bronze uses automatic liquid clustering. Formats are `csv`, `delimited`, `text`, `json`, `parquet`, `avro`, `excel`. `fixed_width` and `yaml` are not supported from a raw volume yet. CSV and delimited files require `delimiter`. An Excel address may quote the sheet name, as in `'Sheet1'!A1`.
 
 ## Table spec: a database table
 
