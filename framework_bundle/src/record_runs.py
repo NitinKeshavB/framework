@@ -1,10 +1,12 @@
-"""Record job runs (system.lakeflow, Jobs API fallback) and pipeline updates from event logs."""
+"""Record job runs (system.lakeflow, Jobs API fallback), pipeline updates from event logs, and
+load ledger rows a pipeline's own hook did not get to write."""
 
 import sys
 
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
 
+from lakeflow_framework.load_catchup import catch_up_loads
 from lakeflow_framework.logs import job_logging, step
 from lakeflow_framework.runs import record_job_runs, record_pipeline_updates
 
@@ -22,6 +24,10 @@ def main() -> None:
         with step(log, "record pipeline updates from the event logs"):
             read = record_pipeline_updates(spark, catalog)
         log.info("read pipeline updates from %d event log(s)", read)
+    elif part == "load_ledger":
+        with step(log, "record loads whose pipeline did not finish writing its own"):
+            written = catch_up_loads(spark, catalog)
+        log.info("wrote %d load ledger row(s) that the pipeline hook missed", written)
     else:
         raise SystemExit(f"unknown part: {part}")
 

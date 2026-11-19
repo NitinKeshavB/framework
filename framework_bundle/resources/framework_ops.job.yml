@@ -75,6 +75,15 @@ resources:
             parameters:
               - ${var.catalog}
               - pipeline_updates
+        # A pipeline writes its own load_ledger rows, but serverless can shut it down before the
+        # write finishes. This writes the rows of any update that has none, from its event log.
+        - task_key: load_ledger
+          environment_key: framework_env
+          spark_python_task:
+            python_file: ../src/record_runs.py
+            parameters:
+              - ${var.catalog}
+              - load_ledger
       environments:
         - environment_key: framework_env
           spec:

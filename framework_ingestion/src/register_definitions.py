@@ -37,13 +37,14 @@ def main() -> None:
     # Retire only among this bundle's owners — never another shard's source systems.
     with step(log, "retire definitions no longer deployed by this bundle's owners"):
         retire_definitions(spark, rows, catalog)
-    # Phase 1 parks tag assignment (tag policies). The call is a no-op until APPLY_TAGS is true.
-    with step(log, "apply tags and comments in Unity Catalog"):
+    # Column comments (the descriptions) are applied. Tag assignment is parked in phase 1 (tag
+    # policies) until APPLY_TAGS is true.
+    with step(log, "apply column comments in Unity Catalog (tags are parked)"):
         applied = apply_metadata(spark, rows, catalog)
     if applied:
         log.info("applied %d Unity Catalog metadata change(s)", len(applied))
     else:
-        log.info("Unity Catalog tags parked for phase 1; registry is up to date")
+        log.info("Unity Catalog column comments are up to date; tags are parked for phase 1")
 
 
 if __name__ == "__main__":

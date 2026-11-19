@@ -36,11 +36,11 @@ raw_to_bronze:
   bronze:
     schema: abs_bronze               # default is <source>_bronze
     table: gl_abs                    # default is the pipeline_id
-  # Declaring the columns turns type inference off, so every column lands as the type given here.
-  # A value that cannot be read as that type goes to _rescued_data instead of failing the load.
   # How rows are taken: insert_only (append) | scd1 (upsert on primary_keys) | scd2 (keep history)
   # | full_refresh (database tables). Omitted: insert_only for files.
   load_type: insert_only
+  # Declaring the columns turns type inference off, so every column lands as the type given here.
+  # A value that cannot be read as that type goes to _rescued_data instead of failing the load.
   columns:
     - { name: ride_id, type: string, description: Unique id of the ride }
     - { name: rideable_type, type: string, description: Kind of bike used }
@@ -57,9 +57,37 @@ raw_to_bronze:
     - { name: member_casual, type: string, description: Whether the rider is a member or casual }
   # Every bronze and quarantine table also gets, with no setting needed: _src_file_path,
   # _src_file_name, _src_row_hash, _batch_id and _ingest_timestamp (and _rescued_data for files).
-  # rules:                           # a row that fails any rule goes to quarantine
-  #   - name: ride_id_present
-  #     expression: ride_id IS NOT NULL
+  # Two rules per column. A row that fails any rule goes to quarantine, with the names of the rules
+  # it failed. A rule must be true for a good row, and a null result counts as a failure, so a
+  # column that may be empty says so with "IS NULL OR ...". Columns are text, so numbers and times
+  # are checked by pattern or with try_cast.
+  rules:
+    - { name: ride_id_present, expression: "ride_id IS NOT NULL AND length(trim(ride_id)) > 0" }
+    - { name: ride_id_format, expression: "ride_id rlike '^[0-9A-Fa-f]{16}$'" }
+    - { name: rideable_type_present, expression: "rideable_type IS NOT NULL AND length(trim(rideable_type)) > 0" }
+    - { name: rideable_type_known, expression: "rideable_type IN ('classic_bike', 'electric_bike', 'docked_bike')" }
+    - { name: started_at_present, expression: "started_at IS NOT NULL AND length(trim(started_at)) > 0" }
+    - { name: started_at_is_timestamp, expression: "try_cast(started_at AS timestamp) IS NOT NULL" }
+    - { name: ended_at_is_timestamp, expression: "try_cast(ended_at AS timestamp) IS NOT NULL" }
+    - { name: ended_not_before_started, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
+    - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
+    - { name: start_station_name_length, expression: "length(start_station_name) <= 200" }
+    - { name: start_station_id_present, expression: "start_station_id IS NOT NULL AND length(trim(start_station_id)) > 0" }
+    - { name: start_station_id_length, expression: "length(start_station_id) <= 50" }
+    - { name: end_station_name_not_blank, expression: "end_station_name IS NULL OR length(trim(end_station_name)) > 0" }
+    - { name: end_station_name_length, expression: "end_station_name IS NULL OR length(end_station_name) <= 200" }
+    - { name: end_station_id_not_blank, expression: "end_station_id IS NULL OR length(trim(end_station_id)) > 0" }
+    - { name: end_station_id_length, expression: "end_station_id IS NULL OR length(end_station_id) <= 50" }
+    - { name: start_lat_is_number, expression: "start_lat rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    - { name: start_lat_in_range, expression: "start_lat rlike '^-?(([0-8]?[0-9])([.][0-9]+)?|90([.]0+)?)$'" }
+    - { name: start_lng_is_number, expression: "start_lng rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    - { name: start_lng_in_range, expression: "start_lng rlike '^-?((1[0-7][0-9]|[0-9]{1,2})([.][0-9]+)?|180([.]0+)?)$'" }
+    - { name: end_lat_is_number, expression: "end_lat IS NULL OR end_lat rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    - { name: end_lat_in_range, expression: "end_lat IS NULL OR end_lat rlike '^-?(([0-8]?[0-9])([.][0-9]+)?|90([.]0+)?)$'" }
+    - { name: end_lng_is_number, expression: "end_lng IS NULL OR end_lng rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    - { name: end_lng_in_range, expression: "end_lng IS NULL OR end_lng rlike '^-?((1[0-7][0-9]|[0-9]{1,2})([.][0-9]+)?|180([.]0+)?)$'" }
+    - { name: member_casual_present, expression: "member_casual IS NOT NULL AND length(trim(member_casual)) > 0" }
+    - { name: member_casual_known, expression: "member_casual IN ('member', 'casual')" }
 
 # Failed rows go to abs_bronze.gl_abs_qrntn: the bronze schema, the bronze table plus _qrntn.
 # Add a quarantine block only to change that:

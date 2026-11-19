@@ -1,10 +1,14 @@
-"""Apply schema tags, table tags, column tags, and column comments to Unity Catalog.
+"""Apply column comments, and schema, table, and column tags, to Unity Catalog.
 
 The registry rows are the declared metadata. registry_sync calls this at deploy after the
-definitions are written. Phase 1 parks the calls: some workspaces have tag policies on the
-same keys, and the deploy identity is not allowed to set those assignments. Set APPLY_TAGS
-to True (or pass apply=True) once an account admin has granted that, or removed the policies.
-Until then the declared tags still land in the registry and show in v_metadata_drift.
+definitions are written. Column comments (the descriptions in the specs) are applied. Tags are
+parked in phase 1: some workspaces have tag policies on the same keys, and the deploy identity is
+not allowed to set those assignments. Set APPLY_TAGS to True (or pass apply=True) once an account
+admin has granted that, or removed the policies. Until then the declared tags still land in the
+registry and show in v_metadata_drift.
+
+A comment lives on the table, so a full refresh or rebuild of a table drops it. Run registry_sync
+again (``databricks bundle run registry_sync``) and it puts them back.
 """
 
 from __future__ import annotations
@@ -20,8 +24,10 @@ from lakeflow_framework.logs import statement_summary
 
 log = logging.getLogger(__name__)
 
-# Phase 1: do not ALTER tags or comments. Tag policies on these keys fail the deploy identity.
+# Phase 1: do not ALTER tags. Tag policies on these keys fail the deploy identity.
 APPLY_TAGS = False
+# Column comments need no tag policy, only the right to alter the table, so they are applied.
+APPLY_COMMENTS = True
 
 # The tags this framework owns. Other tags on the same schemas, tables, and columns stay.
 SCHEMA_TAGS = (
@@ -169,11 +175,11 @@ def applied_metadata(rows: dict[str, list[dict[str, Any]]]) -> tuple[Applied, se
         applied.schema_tags.setdefault(row["schema_name"], {})[row["tag_name"]] = _text(
             row["tag_value"]
         )
-    for row in rows["table_tags"]:
+    for row in rows.get("table_tags", []):
         applied.table_tags.setdefault(row["table_name"], {})[row["tag_name"]] = _text(
             row["tag_value"]
         )
-    for row in rows["column_tags"]:
+    for row in rows.get("column_tags", []):
         key = (row["table_name"], row["column_name"])
         applied.column_tags.setdefault(key, {})[row["tag_name"]] = _text(row["tag_value"])
     existing = set()
@@ -186,15 +192,23 @@ def applied_metadata(rows: dict[str, list[dict[str, Any]]]) -> tuple[Applied, se
     return applied, existing
 
 
-def plan_statements(declared: Declared, applied: Applied, existing: set) -> list[str]:
+def plan_statements(
+    declared: Declared,
+    applied: Applied,
+    existing: set,
+    *,
+    tags: bool = True,
+    comments: bool = True,
+) -> list[str]:
     """ALTER statements that make Unity Catalog match the declared metadata.
 
-    A table or column that does not exist yet is skipped; the next run applies it.
+    ``tags`` and ``comments`` choose which kinds are planned. A table or column that does not
+    exist yet is skipped; the next run applies it.
     """
 
     tables = {table for table, _column in existing}
     statements: list[str] = []
-    for schema in sorted(declared.schema_tags):
+    for schema in sorted(declared.schema_tags if tags else []):
         if ("schema", schema) not in existing:
             continue
         statements += _tag_changes(
@@ -207,57 +221,75 @@ def plan_statements(declared: Declared, applied: Applied, existing: set) -> list
         if table not in tables:
             continue
         target = f"ALTER {ALTER_KEYWORD[declared.kinds[table]]} {_quoted(table)}"
-        statements += _tag_changes(
-            target, declared.table_tags[table], applied.table_tags.get(table, {}), TABLE_TAGS
-        )
+        if tags:
+            statements += _tag_changes(
+                target, declared.table_tags[table], applied.table_tags.get(table, {}), TABLE_TAGS
+            )
         for key in sorted(k for k in declared.column_tags if k[0] == table):
             if key not in existing:
                 continue
             column = f"{target} ALTER COLUMN `{declared.spelled[key]}`"
             comment = declared.comments.get(key)
-            if comment and comment != applied.comments.get(key):
+            if comments and comment and comment != applied.comments.get(key):
                 statements.append(f"{column} COMMENT {_literal(comment)}")
-            statements += _tag_changes(
-                column, declared.column_tags[key], applied.column_tags.get(key, {}), COLUMN_TAGS
-            )
+            if tags:
+                statements += _tag_changes(
+                    column,
+                    declared.column_tags[key],
+                    applied.column_tags.get(key, {}),
+                    COLUMN_TAGS,
+                )
     return statements
 
 
 def apply_metadata(
-    spark, rows: list[dict[str, Any]], catalog: str, *, apply: bool | None = None
+    spark,
+    rows: list[dict[str, Any]],
+    catalog: str,
+    *,
+    apply: bool | None = None,
+    comments: bool | None = None,
 ) -> list[str]:
-    """Make Unity Catalog hold the tags and comments ``rows`` declare. Returns the statements.
+    """Make Unity Catalog hold the column comments and tags ``rows`` declare. Returns the statements.
 
-    When ``apply`` is omitted, ``APPLY_TAGS`` decides. Phase 1 leaves that false so deploy does
-    not need tag-policy grants.
+    ``apply`` (default ``APPLY_TAGS``) decides tags. ``comments`` (default ``APPLY_COMMENTS``)
+    decides column comments. Phase 1 leaves tags false so deploy does not need tag-policy grants,
+    and comments true, which need only the right to alter the table. With tags off the tag
+    information schemas are not read.
     """
 
-    if not (APPLY_TAGS if apply is None else apply):
+    tags_on = APPLY_TAGS if apply is None else apply
+    comments_on = APPLY_COMMENTS if comments is None else comments
+    if not (tags_on or comments_on):
         log.info(
-            "Unity Catalog tags are parked for phase 1 (APPLY_TAGS is false); "
-            "definitions are in the registry, tags are not set on schemas or tables"
+            "Unity Catalog tags and comments are parked; "
+            "definitions are in the registry, nothing is set on schemas or tables"
         )
         return []
     declared = declared_metadata(rows)
-    if not declared.kinds and not declared.schema_tags:
-        log.info("Unity Catalog: no schema or table declares tags or comments")
+    if not declared.kinds and not (tags_on and declared.schema_tags):
+        log.info("Unity Catalog: no table declares tags or comments")
         return []
+    if not tags_on:
+        log.info("Unity Catalog tags are parked for phase 1; applying column comments only")
     log.info(
         "Unity Catalog: %d schema(s) and %d table(s) declare tags or comments",
         len(declared.schema_tags),
         len(declared.kinds),
     )
-    queries = lookup_sql(catalog, declared.kinds, declared.schema_tags)
+    queries = lookup_sql(catalog, declared.kinds, declared.schema_tags if tags_on else [])
+    if not tags_on:
+        queries = {"columns": queries["columns"]}
     rows = {name: _rows(spark.sql(statement)) for name, statement in queries.items()}
     applied, existing = applied_metadata(rows)
     tables = {table for table, _column in existing}
-    for schema in sorted(declared.schema_tags):
+    for schema in sorted(declared.schema_tags if tags_on else []):
         if ("schema", schema) not in existing:
             log.info("Unity Catalog: schema %s does not exist yet; tagged on a later run", schema)
     for table in sorted(declared.kinds):
         if table not in tables:
-            log.info("Unity Catalog: table %s does not exist yet; tagged on a later run", table)
-    statements = plan_statements(declared, applied, existing)
+            log.info("Unity Catalog: table %s does not exist yet; set on a later run", table)
+    statements = plan_statements(declared, applied, existing, tags=tags_on, comments=comments_on)
     if not statements:
         log.info("Unity Catalog: no change to apply")
     for number, statement in enumerate(statements, 1):

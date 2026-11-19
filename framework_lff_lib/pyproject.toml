@@ -4,7 +4,7 @@
 
 [project]
 name = "lakeflow_framework"
-version = "0.1.8"
+version = "0.1.11"
 description = "Config-driven Lakeflow file ingestion. Consumers pin this wheel and supply YAML."
 authors = [{ name = "NitinKeshav", email = "nitinkeshav.bolla@allianz.com" }]
 readme = "README.md"

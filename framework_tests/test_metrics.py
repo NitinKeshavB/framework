@@ -67,7 +67,8 @@ def test_ops_bundle_wires_ddl_system_views_runs_and_archive():
     # TEMPORARY: prod target uses the dev catalog until go-live; back to aal_prod_fdh then.
     assert bundle["targets"]["prod"]["variables"]["catalog"] == "aal_dev_fdh"
     runs = {task["task_key"]: task for task in jobs["framework_runs"]["tasks"]}
-    assert set(runs) == {"job_runs", "pipeline_updates"}
+    # load_ledger writes the rows of any update whose pipeline did not finish writing its own.
+    assert set(runs) == {"job_runs", "pipeline_updates", "load_ledger"}
     for part, task in runs.items():
         assert task["spark_python_task"]["parameters"] == ["${var.catalog}", part]
     assert "schedule" in jobs["framework_runs"]

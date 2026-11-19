@@ -205,6 +205,44 @@ def test_sql_comments_have_no_semicolon_because_the_ddl_task_splits_on_it():
             assert not (line.strip().startswith("--") and ";" in line), f"{path.name}: {line}"
 
 
-def test_apply_metadata_is_parked_for_phase_1():
-    assert apply_metadata(object(), _rows(), "framework_dev") == []
-    assert apply_metadata(object(), _rows(), "framework_dev", apply=False) == []
+def test_apply_metadata_does_nothing_when_tags_and_comments_are_both_parked():
+    assert apply_metadata(object(), _rows(), "framework_dev", apply=False, comments=False) == []
+
+
+def test_column_comments_are_applied_while_tags_stay_parked():
+    wanted = "Identifier of the pipeline run that wrote this row; joins load_ledger.batch_id"
+    spark = _Spark(
+        columns=[
+            {"table_name": BRONZE, "column_name": "invoice_id", "comment": None},
+            {"table_name": BRONZE, "column_name": "_batch_id", "comment": None},
+            {"table_name": BRONZE, "column_name": "_src_row_hash", "comment": "stale text"},
+            {"table_name": BRONZE, "column_name": "_ingest_timestamp", "comment": None},
+        ]
+    )
+    # With tags parked, reading a tag view would be a bug (the deploy identity may not).
+    for name in ("schemata", "schema_tags", "table_tags", "column_tags"):
+        del spark.answers[name]
+    statements = apply_metadata(spark, _rows(), "framework_dev")  # the defaults
+    assert statements == spark.ran and statements
+    assert not any("TAGS" in statement for statement in statements)
+    assert (
+        f"ALTER STREAMING TABLE {QUOTED} ALTER COLUMN `_batch_id` COMMENT '{wanted}'" in statements
+    )
+    # A stale comment is replaced, and a column with nothing to say gets no statement.
+    assert any("`_src_row_hash` COMMENT 'SHA-256" in statement for statement in statements)
+    assert not any("`invoice_id`" in statement for statement in statements)
+    # Run again with the comments in place: nothing to change.
+    done = _Spark(
+        columns=[
+            {"table_name": BRONZE, "column_name": "_batch_id", "comment": wanted},
+        ]
+    )
+    for name in ("schemata", "schema_tags", "table_tags", "column_tags"):
+        del done.answers[name]
+    assert not [s for s in apply_metadata(done, _rows(), "framework_dev") if "_batch_id" in s]
+
+
+def test_tags_can_still_be_turned_on_without_comments():
+    spark = _Spark()
+    statements = apply_metadata(spark, _rows(), "framework_dev", apply=True, comments=False)
+    assert statements and not any(" COMMENT " in statement for statement in statements)

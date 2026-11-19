@@ -1,5 +1,6 @@
-# Registers every spec in this bundle into framework_meta. Unity Catalog tags are parked in phase 1.
-# and column comments. ./run.sh bundle:deploy runs it. It is the only writer of definitions.
+# Registers every spec in this bundle into framework_meta and sets the column comments in Unity
+# Catalog (tags are parked in phase 1). ./run.sh bundle:deploy runs it, and so can you, to restore
+# comments after a full refresh. It is the only writer of definitions.
 # Hand-written: it covers the whole bundle, not one delivery, so generate does not own it.
 resources:
   jobs:

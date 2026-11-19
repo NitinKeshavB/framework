@@ -137,7 +137,7 @@ If bronze is rebuilt (a full refresh, a replace, a restore), the change feed can
 
 ## Describe your tables and columns
 
-`description:` on a spec describes the bronze table and `quarantine.description` the reject table. A `description:` on each declared column describes that column. They are stored in `framework_meta.v_tables.description` and `v_columns.description`, and the table description is also the table comment in Unity Catalog. The audit columns have standard descriptions. Descriptions of columns are only kept for columns the spec declares under `columns:`; a table that declares none lets Auto Loader infer its types, so only its audit columns are registered.
+`description:` on a spec describes the bronze table and `quarantine.description` the reject table. A `description:` on each declared column describes that column. They are stored in `framework_meta.v_tables.description` and `v_columns.description`. The table description is the table comment in Unity Catalog, and `registry_sync` sets each column's description as its column comment at every deploy (tags stay parked). A comment lives on the table, so after a full refresh run `databricks bundle run registry_sync` to put the comments back. The audit columns have standard descriptions. Descriptions of columns are only kept for columns the spec declares under `columns:`; a table that declares none lets Auto Loader infer its types, so only its audit columns are registered.
 
 `./run.sh generate` prints a warning for every table with no description, every declared column with none, and every table that declares no columns. It never stops a deploy. `./run.sh new-table` writes `TODO` placeholders, and `generate` refuses a file until they are replaced.
 
