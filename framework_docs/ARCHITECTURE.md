@@ -33,7 +33,7 @@ Each module imports only the ones listed. `ingestion` is a thin re-export of `so
 | `load_catchup` | `pipeline_metrics`, `metadata` | Replays a cut-off update's event log through the same recorder and writes its rows (`framework_runs`, hourly) |
 | `backfill` | `pipeline`, `pipeline_metrics`, `quality`, `volume_listing` | Reloads chosen files of one table through the pipeline's own staging step, or starts a full refresh of it |
 | `rule_check` | `quality`, `config` | Runs every quality rule on a SQL warehouse before deploy (`check:rules`) |
-| `silver_reader` | `sqlnames` | Reads only what is new in a bronze table, by change feed or `_ingest_timestamp` |
+| `silver_reader` | `sqlnames` | Reads only what is new from a source; appends SUCCEEDED to `flow_checkpoint` after commit |
 | `metadata` | `config`, `quality`, `sqlnames` | Registry rows, ownership-refusal payloads, DDL text (package data), and SQL lookups |
 | `registry` | `metadata`, `spark_types`, `sqlnames` | The only registry writer: definitions, ownership refusals, retirement, and DDL apply |
 | `load_metrics` | `sqlnames` | The ledger's column list and the older event-log SQL it came from; the pipeline now writes its own rows (`pipeline_metrics`) |
@@ -387,6 +387,13 @@ erDiagram
     string blocking_rules
     string error_message
     string load_kind
+  }
+  flow_checkpoint {
+    string reader_table PK
+    string source_table PK
+    timestamp last_ingest_timestamp
+    bigint last_commit_version
+    timestamp processed_at
   }
 ```
 

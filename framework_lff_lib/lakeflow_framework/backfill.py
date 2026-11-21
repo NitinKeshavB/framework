@@ -343,6 +343,7 @@ def _load(
         "dataflow": config.pipeline_id,
         "target_table": bronze,
         "load_kind": "backfill",
+        "started_at": datetime.now(UTC),
     }
     ledger = f"{require_catalog(config.catalog)}.framework_meta.{FILE_LEDGER}"
 
@@ -472,38 +473,31 @@ def _record(
     written = sum(int(item["rows_loaded"] or 0) for item in files)
     quarantined = sum(int(item["rows_quarantined"] or 0) for item in files)
     row: dict[str, Any] = {
-        "job_name": config.job_name,
         "layer": config.layer or LAYER,
-        "job_run_id": None,
-        "pipeline_id": config.pipeline_id,
-        "update_pipeline_uuid": None,
-        "pipeline_name": "framework_backfill",
+        "job_name": config.job_name,
+        "started_at": started,
         "update_id": update_id,
         "dataflow": config.pipeline_id,
-        "owner_kind": config.owner_kind,
-        "owner": config.owner,
+        "load_kind": "backfill",
+        "target_status": "COMPLETED",
+        "ended_at": ended,
+        "batch_id": batch,
+        "job_run_id": None,
+        "update_pipeline_uuid": None,
         "source_kind": config.source_kind or "",
         "run_as": config.run_as or "",
-        "load_kind": "backfill",
         "target_table": config.table_name("bronze"),
-        "quarantine_table": config.table_name("quarantine"),
-        "started_at": started,
-        "ended_at": ended,
-        "duration_seconds": round(max((ended - started).total_seconds(), 0.0), 3),
         "rows_read": read,
         "rows_inserted": written,
         "rows_updated": 0,
         "rows_deleted": result.rows_replaced,
         "rows_quarantined": quarantined,
         "rows_dropped": 0,
-        "target_status": "COMPLETED",
-        "quarantine_status": "COMPLETED",
-        "expectations": "[]",
-        "failure_reason": None,
-        "batch_id": batch,
         "files_read": 0,
         "files_failed": 0,
+        "failure_reason": None,
         "_append": True,
+        "_quarantine_table": config.table_name("quarantine"),
     }
     apply_files(row, files)
     if row["files_failed"]:

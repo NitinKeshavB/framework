@@ -165,14 +165,14 @@
       {
         kind: "table", name: "load_ledger",
         writtenBy: "the pipeline's event hook · framework_backfill · framework_runs (catch-up)", grain: "One load of one table in one update",
-        purpose: "Unified recon SoR for all layers: append-only one row per registered dataflow per update. Keys include source_kind, run_as, load_kind (regular|backfill|catchup). Counts are numbers (0 when failed/empty): rows_read/inserted/updated/deleted/quarantined/dropped plus files_read/files_failed. FAILED when the table failed or could not register, a file broke a fail rule, expected file missing/empty. Hot ~90 days; older rows move to load_ledger_archive PARTITIONED BY archive_quarter. Query v_loads / v_load_failures.",
-        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_pipeline_uuid", "pipeline_name", "update_id", "dataflow", "owner_kind", "owner", "source_kind", "run_as", "load_kind", "target_table", "quarantine_table", "started_at", "ended_at", "duration_seconds", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined", "rows_dropped", "target_status", "quarantine_status", "expectations", "failure_reason", "recorded_at", "batch_id", "files_read", "files_failed"]
+        purpose: "Lean append-only recon SoR. CLUSTER BY (layer, job_name, started_at). batch_id bridges to row _batch_id. Child ledger_detail joins on (update_id, dataflow). Hot ~90d → archive_quarter. Query v_loads.",
+        columns: ["layer", "job_name", "started_at", "update_id", "dataflow", "load_kind", "target_status", "load_date", "ended_at", "recorded_at", "batch_id", "job_run_id", "update_pipeline_uuid", "source_kind", "run_as", "target_table", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined", "rows_dropped", "files_read", "files_failed", "failure_reason"]
       },
       {
         kind: "table", name: "ledger_detail",
         writtenBy: "the pipeline's event hook · framework_backfill · framework_runs", grain: "One file or curated input in one load",
-        purpose: "Child unit-of-work rows. detail_kind=file (bronze path) or input (curated upstream FQN). Status PROCESSED|WARNING|FAILED. Join load_ledger on update_id+dataflow. Hot ~90d → ledger_detail_archive (archive_quarter). Query v_ledger_detail.",
-        columns: ["job_name", "layer", "update_id", "batch_id", "dataflow", "target_table", "detail_kind", "src_object", "src_file_path", "src_file_name", "status", "rows_read", "rows_inserted", "rows_quarantined", "rows_dropped", "failed_rules", "blocking_rules", "error_message", "load_kind", "recorded_at"]
+        purpose: "Child unit-of-work. Join load_ledger on (update_id, dataflow). No batch_id. CLUSTER BY (update_id, dataflow, recorded_at). Query v_ledger_detail.",
+        columns: ["update_id", "dataflow", "recorded_at", "detail_kind", "status", "load_date", "job_name", "layer", "load_kind", "target_table", "src_object", "src_file_path", "src_file_name", "rows_read", "rows_inserted", "rows_quarantined", "rows_dropped", "failed_rules", "blocking_rules", "error_message"]
       },
       {
         kind: "table", name: "load_ledger_archive",
@@ -197,6 +197,12 @@
         writtenBy: "framework_ddl / apply_ddl", grain: "One SQL file hash per successful apply",
         purpose: "Skip unchanged framework_meta.sql on later deploys. Delete rows or pass force to reapply.",
         columns: ["sql_hash", "applied_at"]
+      },
+      {
+        kind: "table", name: "flow_checkpoint",
+        writtenBy: "silver_reader.read_new commit (and future JDBC/incremental bronze)", grain: "One SUCCEEDED/FAILED/STARTED event per advance attempt",
+        purpose: "Append-only flow checkpoint (not curated-only). Effective mark: v_flow_checkpoint = latest SUCCEEDED per (reader_table, source_table). Never MERGE. Correlate to load_ledger via update_id/batch_id.",
+        columns: ["reader_table", "source_table", "recorded_at", "status", "load_kind", "progress_kind", "watermark_column", "watermark_ts", "watermark_id", "job_name", "pipeline_id", "update_id", "batch_id"]
       },
       {
         kind: "mv", name: "<job>_event_log",

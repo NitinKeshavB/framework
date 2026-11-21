@@ -11,7 +11,7 @@
 -- asset_id is a stable SHA-256 of source coordinates (not the display full_name), so a rename
 -- is a new version of the same asset rather than an unrelated object.
 --
--- load_ledger is append-only recon (sole load-grain SoR). pipeline_id is the spec id
+-- load_ledger is append-only recon (sole load-grain SoR). dataflow is the spec id
 -- (joins v_pipelines). update_pipeline_uuid is the Lakeflow pipeline UUID from events.
 -- ledger_detail holds file (bronze) or input (curated) child rows.
 -- Hot run/recon tables keep about 90 days. Forever archives use PARTITIONED BY archive_quarter.
@@ -242,43 +242,36 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- Append-only recon. pipeline_id = spec id, update_pipeline_uuid = Lakeflow UUID from events.
--- Hot ~90 days. forever archive is PARTITIONED BY archive_quarter (Hive. not liquid clustered).
+-- Append-only recon. dataflow = spec id. update_pipeline_uuid = Lakeflow UUID from events.
+-- Hot ~90 days (liquid CLUSTER BY). Forever archive PARTITIONED BY archive_quarter (Hive).
+-- Child ledger_detail joins on (update_id, dataflow). batch_id bridges to row _batch_id only.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
-  job_name STRING NOT NULL,
   layer STRING NOT NULL,
-  job_run_id STRING,
-  pipeline_id STRING NOT NULL,
-  update_pipeline_uuid STRING,
-  pipeline_name STRING,
+  job_name STRING NOT NULL,
+  started_at TIMESTAMP NOT NULL,
   update_id STRING NOT NULL,
   dataflow STRING NOT NULL,
-  owner_kind STRING NOT NULL,
-  owner STRING NOT NULL,
+  load_kind STRING NOT NULL,
+  target_status STRING,
+  load_date DATE NOT NULL,
+  ended_at TIMESTAMP NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  batch_id STRING,
+  job_run_id STRING,
+  update_pipeline_uuid STRING,
   source_kind STRING,
   run_as STRING,
-  load_kind STRING NOT NULL,
   target_table STRING,
-  quarantine_table STRING,
-  started_at TIMESTAMP,
-  ended_at TIMESTAMP,
-  duration_seconds DOUBLE,
   rows_read BIGINT,
   rows_inserted BIGINT,
   rows_updated BIGINT,
   rows_deleted BIGINT,
   rows_quarantined BIGINT,
   rows_dropped BIGINT,
-  target_status STRING,
-  quarantine_status STRING,
-  expectations STRING,
-  failure_reason STRING,
-  recorded_at TIMESTAMP NOT NULL,
-  batch_id STRING,
   files_read BIGINT,
   files_failed BIGINT,
+  failure_reason STRING,
   CONSTRAINT load_ledger_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged')),
-  CONSTRAINT load_ledger_owner_kind CHECK (owner_kind IN ('source_system', 'project')),
   CONSTRAINT load_ledger_load_kind CHECK (load_kind IN ('regular', 'backfill', 'catchup'))
 )
 CLUSTER BY (layer, job_name, started_at)
@@ -288,38 +281,31 @@ TBLPROPERTIES (
 );
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
-  job_name STRING NOT NULL,
   layer STRING NOT NULL,
-  job_run_id STRING,
-  pipeline_id STRING NOT NULL,
-  update_pipeline_uuid STRING,
-  pipeline_name STRING,
+  job_name STRING NOT NULL,
+  started_at TIMESTAMP NOT NULL,
   update_id STRING NOT NULL,
   dataflow STRING NOT NULL,
-  owner_kind STRING NOT NULL,
-  owner STRING NOT NULL,
+  load_kind STRING NOT NULL,
+  target_status STRING,
+  load_date DATE NOT NULL,
+  ended_at TIMESTAMP NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  batch_id STRING,
+  job_run_id STRING,
+  update_pipeline_uuid STRING,
   source_kind STRING,
   run_as STRING,
-  load_kind STRING NOT NULL,
   target_table STRING,
-  quarantine_table STRING,
-  started_at TIMESTAMP,
-  ended_at TIMESTAMP,
-  duration_seconds DOUBLE,
   rows_read BIGINT,
   rows_inserted BIGINT,
   rows_updated BIGINT,
   rows_deleted BIGINT,
   rows_quarantined BIGINT,
   rows_dropped BIGINT,
-  target_status STRING,
-  quarantine_status STRING,
-  expectations STRING,
-  failure_reason STRING,
-  recorded_at TIMESTAMP NOT NULL,
-  batch_id STRING,
   files_read BIGINT,
   files_failed BIGINT,
+  failure_reason STRING,
   archived_at TIMESTAMP NOT NULL,
   archive_quarter STRING NOT NULL
 )
@@ -333,19 +319,21 @@ TBLPROPERTIES (
 CREATE VOLUME IF NOT EXISTS ${catalog}.framework_meta.backfill_state
 COMMENT 'Checkpoints of framework_backfill runs. Safe to delete a run folder once it has finished.';
 
--- Child unit-of-work rows: detail_kind=file (bronze paths) or input (curated upstream FQN).
+-- Child unit-of-work: detail_kind=file|input. Join parent on (update_id, dataflow). No batch_id.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail (
+  update_id STRING NOT NULL,
+  dataflow STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  detail_kind STRING NOT NULL,
+  status STRING NOT NULL,
+  load_date DATE NOT NULL,
   job_name STRING NOT NULL,
   layer STRING NOT NULL,
-  update_id STRING NOT NULL,
-  batch_id STRING,
-  dataflow STRING NOT NULL,
+  load_kind STRING,
   target_table STRING,
-  detail_kind STRING NOT NULL,
   src_object STRING,
   src_file_path STRING,
   src_file_name STRING,
-  status STRING NOT NULL,
   rows_read BIGINT,
   rows_inserted BIGINT,
   rows_quarantined BIGINT,
@@ -353,29 +341,29 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail (
   failed_rules STRING,
   blocking_rules STRING,
   error_message STRING,
-  load_kind STRING,
-  recorded_at TIMESTAMP NOT NULL,
   CONSTRAINT ledger_detail_status CHECK (status IN ('PROCESSED', 'WARNING', 'FAILED')),
   CONSTRAINT ledger_detail_kind CHECK (detail_kind IN ('file', 'input'))
 )
-CLUSTER BY (dataflow, recorded_at)
+CLUSTER BY (update_id, dataflow, recorded_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail_archive (
+  update_id STRING NOT NULL,
+  dataflow STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  detail_kind STRING NOT NULL,
+  status STRING NOT NULL,
+  load_date DATE NOT NULL,
   job_name STRING NOT NULL,
   layer STRING NOT NULL,
-  update_id STRING NOT NULL,
-  batch_id STRING,
-  dataflow STRING NOT NULL,
+  load_kind STRING,
   target_table STRING,
-  detail_kind STRING NOT NULL,
   src_object STRING,
   src_file_path STRING,
   src_file_name STRING,
-  status STRING NOT NULL,
   rows_read BIGINT,
   rows_inserted BIGINT,
   rows_quarantined BIGINT,
@@ -383,8 +371,6 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail_archive (
   failed_rules STRING,
   blocking_rules STRING,
   error_message STRING,
-  load_kind STRING,
-  recorded_at TIMESTAMP NOT NULL,
   archived_at TIMESTAMP NOT NULL,
   archive_quarter STRING NOT NULL
 )
@@ -473,16 +459,51 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
   applied_at TIMESTAMP NOT NULL
 );
 
--- Where each silver table has read up to in a bronze table that has no change feed. One row per
--- pair, so it stays small however long the pipelines run. The silver reader keeps it.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.silver_progress (
-  silver_table STRING NOT NULL,
-  bronze_table STRING NOT NULL,
-  last_ingest_timestamp TIMESTAMP,
-  last_commit_version BIGINT,
-  processed_at TIMESTAMP NOT NULL,
-  CONSTRAINT silver_progress_pk PRIMARY KEY (silver_table, bronze_table)
+-- Append-only flow checkpoint (incremental watermark for any flow: JDBC bronze, read_new, …).
+-- Effective mark: v_flow_checkpoint (latest SUCCEEDED). Never MERGE/UPDATE the physical table.
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.flow_checkpoint (
+  reader_table STRING NOT NULL,
+  source_table STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL,
+  status STRING NOT NULL,
+  load_kind STRING,
+  progress_kind STRING,
+  watermark_column STRING,
+  watermark_ts TIMESTAMP,
+  watermark_id STRING,
+  job_name STRING,
+  pipeline_id STRING,
+  update_id STRING,
+  batch_id STRING,
+  CONSTRAINT flow_checkpoint_status CHECK (status IN ('SUCCEEDED', 'FAILED', 'STARTED'))
+)
+CLUSTER BY (reader_table, source_table)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
 );
+
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_flow_checkpoint AS
+SELECT
+  reader_table,
+  source_table,
+  recorded_at,
+  status,
+  load_kind,
+  progress_kind,
+  watermark_column,
+  watermark_ts,
+  watermark_id,
+  job_name,
+  pipeline_id,
+  update_id,
+  batch_id
+FROM ${catalog}.framework_meta.flow_checkpoint
+WHERE status = 'SUCCEEDED'
+QUALIFY row_number() OVER (
+  PARTITION BY reader_table, source_table
+  ORDER BY recorded_at DESC
+) = 1;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_asset_registry_current AS
 SELECT
@@ -981,67 +1002,74 @@ FROM ${catalog}.framework_meta.pipeline_updates pu
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads AS
+WITH latest AS (
+  SELECT *
+  FROM ${catalog}.framework_meta.load_ledger
+  QUALIFY row_number() OVER (
+    PARTITION BY job_name, layer, update_id, dataflow
+    ORDER BY recorded_at DESC
+  ) = 1
+)
 SELECT
-  job_name,
-  layer,
-  job_run_id,
-  pipeline_id,
-  update_pipeline_uuid,
-  pipeline_name,
-  update_id,
-  dataflow,
-  owner_kind,
-  owner,
-  source_kind,
-  run_as,
-  load_kind,
-  target_table,
-  quarantine_table,
-  started_at,
-  ended_at,
-  duration_seconds,
-  rows_read,
-  rows_inserted,
-  rows_updated,
-  rows_deleted,
-  rows_quarantined,
-  coalesce(rows_dropped, 0) AS rows_dropped,
-  target_status,
-  quarantine_status,
-  expectations,
-  failure_reason,
-  recorded_at,
-  batch_id,
-  coalesce(files_read, 0) AS files_read,
-  coalesce(files_failed, 0) AS files_failed
-FROM ${catalog}.framework_meta.load_ledger
-QUALIFY row_number() OVER (
-  PARTITION BY job_name, layer, update_id, dataflow
-  ORDER BY recorded_at DESC
-) = 1;
+  l.layer,
+  l.job_name,
+  l.started_at,
+  l.update_id,
+  l.dataflow,
+  l.load_kind,
+  l.target_status,
+  l.load_date,
+  l.ended_at,
+  l.recorded_at,
+  l.batch_id,
+  l.job_run_id,
+  l.update_pipeline_uuid,
+  l.source_kind,
+  l.run_as,
+  l.target_table,
+  l.rows_read,
+  l.rows_inserted,
+  l.rows_updated,
+  l.rows_deleted,
+  l.rows_quarantined,
+  coalesce(l.rows_dropped, 0) AS rows_dropped,
+  coalesce(l.files_read, 0) AS files_read,
+  coalesce(l.files_failed, 0) AS files_failed,
+  l.failure_reason,
+  (unix_millis(l.ended_at) - unix_millis(l.started_at)) / 1000.0 AS duration_seconds,
+  p.owner_kind,
+  p.owner,
+  cast(d.quarantine AS STRING) AS quarantine_table,
+  pu.pipeline_name
+FROM latest l
+LEFT JOIN ${catalog}.framework_meta.v_pipelines p ON p.pipeline = l.dataflow
+LEFT JOIN ${catalog}.framework_meta.v_dataflows d ON d.dataflow = l.dataflow
+LEFT JOIN ${catalog}.framework_meta.pipeline_updates pu
+  ON pu.update_id = l.update_id
+ AND (l.update_pipeline_uuid IS NULL OR pu.pipeline_id = l.update_pipeline_uuid);
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ledger_detail AS
 SELECT
+  update_id,
+  dataflow,
+  recorded_at,
+  detail_kind,
+  status,
+  load_date,
   job_name,
   layer,
-  update_id,
-  batch_id,
-  dataflow,
+  load_kind,
   target_table,
-  detail_kind,
   src_object,
   src_file_path,
   src_file_name,
-  status,
   rows_read,
   rows_inserted,
   rows_quarantined,
   rows_dropped,
   failed_rules,
   blocking_rules,
-  error_message,
-  load_kind,
-  recorded_at
+  error_message
 FROM ${catalog}.framework_meta.ledger_detail
 QUALIFY row_number() OVER (
   PARTITION BY job_name, layer, update_id, dataflow, detail_kind,
@@ -1059,10 +1087,8 @@ SELECT
   l.dataflow,
   l.target_table,
   l.update_id,
-  l.pipeline_id,
   l.update_pipeline_uuid,
   l.target_status,
-  l.quarantine_status,
   l.failure_reason AS load_failure_reason,
   l.rows_read,
   l.rows_inserted,
@@ -1073,8 +1099,13 @@ SELECT
   l.files_read,
   l.files_failed,
   l.started_at AS load_started_at,
+  l.ended_at AS load_ended_at,
   l.recorded_at AS load_recorded_at,
+  l.load_date,
   l.batch_id,
+  l.duration_seconds,
+  l.owner_kind,
+  l.owner,
   coalesce(l.job_run_id, j.run_id) AS job_run_id,
   j.status AS job_status,
   j.result_state AS job_result_state,

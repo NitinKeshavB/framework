@@ -98,9 +98,10 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 ## `framework_meta` data model
 
-Editable Lucidchart: [framework_meta ERD](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit). Table/view catalog: [framework_meta_data_dictionary.html](framework_docs/framework_meta_data_dictionary.html).
+Editable Lucidchart (source of truth): [framework_meta ERD + taxonomy](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit).  
+Pages: [1 · ERD](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=page1#) · [2 · table/view lookup](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=ejCNub9Z7cfa#). Offline catalog: [framework_meta_data_dictionary.html](framework_docs/framework_meta_data_dictionary.html).
 
-Archive note: after ~90 days, load & recon (`load_ledger`, `ledger_detail`) and job/run tracking (`job_runs`, `job_task_runs`, `pipeline_updates`) move to matching `*_archive` tables (`PARTITIONED BY archive_quarter`). Archive tables are not drawn below; query via `v_loads` / `v_ledger_detail` / `v_job_runs` (hot ∪ archive). Event logs live in `framework_events`.
+**Archive note:** after ~90 days, load & recon (`load_ledger`, `ledger_detail`) and job/run tracking move to `*_archive` (`PARTITIONED BY archive_quarter`). Hot recon uses liquid `CLUSTER BY` (not day Hive partitions). Query via `v_loads` / `v_ledger_detail` / `v_job_runs`. Event logs live in `framework_events`. Incremental watermarks: `flow_checkpoint` / `v_flow_checkpoint` (append-only; not folded into the ledger).
 
 ```mermaid
 erDiagram
@@ -108,86 +109,69 @@ erDiagram
   asset_registry_current ||--o{ ownership_refusals : "refused name"
   job_runs ||--o{ job_task_runs : "job_run_id"
   job_runs ||--o{ pipeline_updates : "job delivery"
-  pipeline_updates ||--o{ load_ledger : "pipeline_id, update_id"
+  pipeline_updates ||--o{ load_ledger : "update_id"
   load_ledger ||--o{ ledger_detail : "update_id, dataflow"
 
-  asset_registry {
-    string asset_id
-    string object_kind PK
-    string full_name PK
-    timestamp valid_from PK
-    string owner_kind
-    string owner
-    boolean is_current
-    boolean is_deleted
-  }
-  asset_registry_current {
-    string object_kind PK
-    string full_name PK
-    string owner_kind
-    string owner
-  }
-  ownership_refusals {
-    string object_kind
-    string full_name
-    string refused_owner
-    string holder_owner
-    timestamp recorded_at
-  }
-  job_runs {
-    string job_id PK
-    string run_id PK
-    string job_name
-    string status
-    string run_as
-    timestamp recorded_at
-  }
-  job_task_runs {
-    string job_run_id PK
-    string task_run_id PK
-    string task_key
-    string status
-  }
-  pipeline_updates {
-    string pipeline_id PK
-    string update_id PK
-    string job_name
-    string status
-    string run_as
-  }
   load_ledger {
+    string layer PK
+    string job_name PK
+    timestamp started_at
     string update_id PK
-    string job_name
-    string layer
-    string dataflow
+    string dataflow PK
+    string load_kind
+    string target_status
+    date load_date
+    timestamp ended_at
+    timestamp recorded_at
+    string batch_id
+    string job_run_id
+    string update_pipeline_uuid
     string source_kind
     string run_as
-    string load_kind
+    string target_table
     bigint rows_read
     bigint rows_inserted
     bigint rows_updated
+    bigint rows_deleted
     bigint rows_quarantined
     bigint rows_dropped
-    string target_status
-    timestamp recorded_at
+    bigint files_read
+    bigint files_failed
+    string failure_reason
   }
   ledger_detail {
     string update_id PK
-    string dataflow
+    string dataflow PK
+    timestamp recorded_at
     string detail_kind
+    string status
+    date load_date
+    string job_name
+    string layer
     string src_file_path
+    string src_object
+    bigint rows_read
+    bigint rows_inserted
+    string error_message
+  }
+  flow_checkpoint {
+    string reader_table
+    string source_table
+    timestamp recorded_at
     string status
     string load_kind
-    timestamp recorded_at
+    string progress_kind
+    string watermark_column
+    timestamp watermark_ts
+    string watermark_id
+    string job_name
+    string pipeline_id
+    string update_id
+    string batch_id
   }
   ddl_applied {
     string sql_hash PK
     timestamp applied_at
-  }
-  silver_progress {
-    string silver_table PK
-    string bronze_table PK
-    timestamp last_ingest_timestamp
   }
 ```
 

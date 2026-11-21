@@ -64,7 +64,7 @@ Ingestion commits only `SOURCE_MAP.md`. Job/pipeline YAML, pipeline entrypoints,
 - Add a Unity Catalog tag key only by listing it in `SCHEMA_TAGS` or `TABLE_RECORD_TAGS` in `unity.py` and in `v_metadata_drift`. `unity.py` unsets only listed keys, so tags set by others stay.
 - Do not write `asset_registry` except through `append_definitions` and `retire_definitions`. They keep exactly one current version per `(object_kind, full_name)`; a plain `INSERT` breaks that.
 - Do not drop the `event_log` block, the `lff.manifest` / `lff.catalog` settings, or the `lakeflow_framework_workflow` tag from generated pipelines and jobs. The pipeline, its event hook and `v_loads`, and the run views depend on them.
-- Do not reintroduce retired meta objects (`load_metric`, `file_ledger`, `v_loads_90d`, `v_bronze_tables`, `run_ledger`, `run_current`, `v_process`, `v_run_current`, `v_bronze_loads`, `load_daily_rollup`, ops `flow_events` / `table_load_metrics`). See [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).
+- Do not reintroduce retired meta objects (`load_metric`, `file_ledger`, `curated_progress` / `silver_progress`, `v_loads_90d`, `v_bronze_tables`, `run_ledger`, `run_current`, `v_process`, `v_run_current`, `v_bronze_loads`, `load_daily_rollup`, ops `flow_events` / `table_load_metrics`). Prefer `ledger_detail` and `flow_checkpoint`. See [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md).
 
 ## Adding a source kind
 

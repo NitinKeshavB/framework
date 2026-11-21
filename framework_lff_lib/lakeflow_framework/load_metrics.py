@@ -19,40 +19,34 @@ log = logging.getLogger(__name__)
 EVENT_LOG_SUFFIX = "_event_log"
 LEDGER = "load_ledger"
 LAYERS = frozenset({"bronze", "silver", "gold", "product"})
-# Physical column order of load_ledger (hot). Archive matches, then archived_at, archive_quarter.
+# Physical column order of load_ledger (hot). Aligns with CLUSTER BY + Delta stats budget.
+# Archive matches, then archived_at, archive_quarter.
 LEDGER_COLUMNS = (
-    "job_name",
     "layer",
-    "job_run_id",
-    "pipeline_id",
-    "update_pipeline_uuid",
-    "pipeline_name",
+    "job_name",
+    "started_at",
     "update_id",
     "dataflow",
-    "owner_kind",
-    "owner",
+    "load_kind",
+    "target_status",
+    "load_date",
+    "ended_at",
+    "recorded_at",
+    "batch_id",
+    "job_run_id",
+    "update_pipeline_uuid",
     "source_kind",
     "run_as",
-    "load_kind",
     "target_table",
-    "quarantine_table",
-    "started_at",
-    "ended_at",
-    "duration_seconds",
     "rows_read",
     "rows_inserted",
     "rows_updated",
     "rows_deleted",
     "rows_quarantined",
     "rows_dropped",
-    "target_status",
-    "quarantine_status",
-    "expectations",
-    "failure_reason",
-    "recorded_at",
-    "batch_id",
     "files_read",
     "files_failed",
+    "failure_reason",
 )
 LOAD_KINDS = frozenset({"regular", "backfill", "catchup"})
 # Retired: load_metric dual-write. Kept as empty aliases so older imports do not crash mid-refactor.
@@ -134,9 +128,16 @@ def record_loads(
     if not written:
         log.info("load metrics: no dataflows registered for %s; nothing to append", job_name)
         return 0
-    # recorded_at is stamped here; other columns come from the SELECT.
+    # recorded_at / load_date stamped here; other columns come from the SELECT.
     select_cols = ", ".join(
-        "current_timestamp() AS recorded_at" if c == "recorded_at" else c for c in LEDGER_COLUMNS
+        (
+            "current_timestamp() AS recorded_at"
+            if c == "recorded_at"
+            else "CAST(DATE(started_at) AS DATE) AS load_date"
+            if c == "load_date"
+            else c
+        )
+        for c in LEDGER_COLUMNS
     )
     spark.sql(f"INSERT INTO {meta}.{LEDGER} SELECT {select_cols} FROM _framework_loads")
     log_cols = ", ".join(_LOAD_LOG_COLS)
@@ -170,37 +171,29 @@ def missing_event_log_loads_sql(
     run_id = _job_run_id_sql(job_run_id)
     return f"""
 SELECT
-  CAST('{job_name}' AS STRING) AS job_name,
   CAST('{layer}' AS STRING) AS layer,
-  {run_id} AS job_run_id,
-  CAST(reg.pipeline_id AS STRING) AS pipeline_id,
-  CAST(NULL AS STRING) AS update_pipeline_uuid,
-  CAST(NULL AS STRING) AS pipeline_name,
+  CAST('{job_name}' AS STRING) AS job_name,
+  CAST(current_timestamp() AS TIMESTAMP) AS started_at,
   CAST(CONCAT('failed-', date_format(current_timestamp(), 'yyyyMMddHHmmss')) AS STRING) AS update_id,
   CAST(reg.dataflow AS STRING) AS dataflow,
-  CAST(reg.owner_kind AS STRING) AS owner_kind,
-  CAST(reg.owner AS STRING) AS owner,
+  CAST('regular' AS STRING) AS load_kind,
+  CAST('FAILED' AS STRING) AS target_status,
+  CAST(current_timestamp() AS TIMESTAMP) AS ended_at,
+  CAST(NULL AS STRING) AS batch_id,
+  {run_id} AS job_run_id,
+  CAST(NULL AS STRING) AS update_pipeline_uuid,
   CAST('' AS STRING) AS source_kind,
   CAST('' AS STRING) AS run_as,
-  CAST('regular' AS STRING) AS load_kind,
   CAST(reg.target_table AS STRING) AS target_table,
-  CAST(reg.quarantine_table AS STRING) AS quarantine_table,
-  CAST(current_timestamp() AS TIMESTAMP) AS started_at,
-  CAST(current_timestamp() AS TIMESTAMP) AS ended_at,
-  CAST(NULL AS DOUBLE) AS duration_seconds,
   CAST(0 AS BIGINT) AS rows_read,
   CAST(0 AS BIGINT) AS rows_inserted,
   CAST(0 AS BIGINT) AS rows_updated,
   CAST(0 AS BIGINT) AS rows_deleted,
   CAST(0 AS BIGINT) AS rows_quarantined,
   CAST(0 AS BIGINT) AS rows_dropped,
-  CAST('FAILED' AS STRING) AS target_status,
-  CAST(NULL AS STRING) AS quarantine_status,
-  CAST(NULL AS STRING) AS expectations,
-  CAST('{_MISSING_EVENT_LOG_REASON}' AS STRING) AS failure_reason,
-  CAST(NULL AS STRING) AS batch_id,
   CAST(0 AS BIGINT) AS files_read,
-  CAST(0 AS BIGINT) AS files_failed
+  CAST(0 AS BIGINT) AS files_failed,
+  CAST('{_MISSING_EVENT_LOG_REASON}' AS STRING) AS failure_reason
 FROM ({_registered_dataflows_sql(meta, job_name, layer)}) reg
 """
 
@@ -218,14 +211,13 @@ def latest_loads_sql(
     registered = _registered_dataflows_sql(meta, job_name, layer)
     run_id = _job_run_id_sql(job_run_id)
     target_table = _max_when_layer(layer, "r.table_name")
-    quarantine_table = _max_when_layer("quarantine", "r.table_name")
     rows_read = _max_when_layer("staged", "r.rows_written")
     rows_written = _max_when_layer(layer, "r.rows_written")
     rows_upserted = _max_when_layer(layer, "r.rows_upserted")
     rows_deleted = _max_when_layer(layer, "r.rows_deleted")
     rows_quarantine = _max_when_layer("quarantine", "r.rows_written")
     target_status = _max_when_layer(layer, "r.status")
-    quarantine_status = _max_when_layer("quarantine", "r.status")
+    quarantine_status = _max_when_layer("quarantine", "r.status")  # folded into failure_reason only
     return f"""
 WITH latest AS (
   SELECT origin.update_id AS update_id
@@ -313,54 +305,30 @@ resolved AS (
   LEFT JOIN targets t ON t.pipeline_id = l.pipeline_id AND t.flow_name = l.flow_name
   LEFT JOIN flows f ON f.table_name = lower(replace(coalesce(t.table_name, l.flow_name), '`', ''))
 ),
-staged_expectations AS (
-  SELECT
-    r.dataflow,
-    to_json(sort_array(collect_list(named_struct(
-      'name', c.name, 'passed_records', c.passed_records, 'failed_records', c.failed_records
-    )))) AS expectations
-  FROM resolved r
-  JOIN progress p ON p.pipeline_id = r.pipeline_id AND p.update_id = r.update_id
-    AND p.flow_name = r.flow_name
-  LATERAL VIEW explode(p.checks) exploded AS c
-  WHERE r.layer = 'staged' AND r.dataflow IS NOT NULL
-  GROUP BY r.dataflow
-),
 from_events AS (
   SELECT
     CAST(r.pipeline_id AS STRING) AS update_pipeline_uuid,
-    CAST(max(r.pipeline_name) AS STRING) AS pipeline_name,
     CAST(r.update_id AS STRING) AS update_id,
     CAST(r.dataflow AS STRING) AS dataflow,
-    CAST(max(r.owner_kind) AS STRING) AS owner_kind,
-    CAST(max(r.owner) AS STRING) AS owner,
     CAST({target_table} AS STRING) AS target_table,
-    CAST({quarantine_table} AS STRING) AS quarantine_table,
     CAST(min(r.started_at) AS TIMESTAMP) AS started_at,
     CAST(max(r.ended_at) AS TIMESTAMP) AS ended_at,
-    CAST(
-      (unix_millis(max(r.ended_at)) - unix_millis(min(r.started_at))) / 1000.0 AS DOUBLE
-    ) AS duration_seconds,
     CAST({rows_read} AS BIGINT) AS rows_read,
     CAST({rows_written} AS BIGINT) AS rows_written,
     CAST({rows_upserted} AS BIGINT) AS rows_upserted,
     CAST({rows_deleted} AS BIGINT) AS rows_deleted,
     CAST({rows_quarantine} AS BIGINT) AS rows_quarantine,
-    CAST(
-      coalesce({rows_written}, 0) + coalesce({rows_quarantine}, 0) AS BIGINT
-    ) AS rows_processed,
     CAST({target_status} AS STRING) AS target_status,
-    CAST({quarantine_status} AS STRING) AS quarantine_status,
-    CAST(max(e.expectations) AS STRING) AS expectations,
     CAST(
       CASE
         WHEN {target_status} IN ('FAILED', 'CANCELED')
         THEN CONCAT('flow status ', {target_status})
+        WHEN {quarantine_status} IN ('FAILED', 'CANCELED')
+        THEN CONCAT('quarantine flow status ', {quarantine_status})
         ELSE NULL
       END AS STRING
     ) AS failure_reason
   FROM resolved r
-  LEFT JOIN staged_expectations e ON e.dataflow = r.dataflow
   WHERE r.dataflow IS NOT NULL
     AND r.layer IN ('staged', '{layer}', 'quarantine')
   GROUP BY r.pipeline_id, r.update_id, r.dataflow
@@ -370,12 +338,9 @@ registered AS (
   {registered}
 )
 SELECT
-  CAST('{job_name}' AS STRING) AS job_name,
   CAST('{layer}' AS STRING) AS layer,
-  {run_id} AS job_run_id,
-  CAST(reg.pipeline_id AS STRING) AS pipeline_id,
-  CAST(e.update_pipeline_uuid AS STRING) AS update_pipeline_uuid,
-  CAST(e.pipeline_name AS STRING) AS pipeline_name,
+  CAST('{job_name}' AS STRING) AS job_name,
+  CAST(coalesce(e.started_at, current_timestamp()) AS TIMESTAMP) AS started_at,
   CAST(
     coalesce(
       e.update_id,
@@ -384,16 +349,15 @@ SELECT
     ) AS STRING
   ) AS update_id,
   CAST(reg.dataflow AS STRING) AS dataflow,
-  CAST(coalesce(e.owner_kind, reg.owner_kind) AS STRING) AS owner_kind,
-  CAST(coalesce(e.owner, reg.owner) AS STRING) AS owner,
+  CAST('regular' AS STRING) AS load_kind,
+  CAST(coalesce(e.target_status, 'FAILED') AS STRING) AS target_status,
+  CAST(coalesce(e.ended_at, current_timestamp()) AS TIMESTAMP) AS ended_at,
+  CAST(NULL AS STRING) AS batch_id,
+  {run_id} AS job_run_id,
+  CAST(e.update_pipeline_uuid AS STRING) AS update_pipeline_uuid,
   CAST('' AS STRING) AS source_kind,
   CAST('' AS STRING) AS run_as,
-  CAST('regular' AS STRING) AS load_kind,
   CAST(coalesce(e.target_table, reg.target_table) AS STRING) AS target_table,
-  CAST(coalesce(e.quarantine_table, reg.quarantine_table) AS STRING) AS quarantine_table,
-  CAST(coalesce(e.started_at, current_timestamp()) AS TIMESTAMP) AS started_at,
-  CAST(coalesce(e.ended_at, current_timestamp()) AS TIMESTAMP) AS ended_at,
-  CAST(e.duration_seconds AS DOUBLE) AS duration_seconds,
   CAST(coalesce(e.rows_read, 0) AS BIGINT) AS rows_read,
   CAST(
     CASE WHEN coalesce(e.rows_upserted, 0) > 0 THEN 0 ELSE coalesce(e.rows_written, 0) END AS BIGINT
@@ -402,18 +366,14 @@ SELECT
   CAST(coalesce(e.rows_deleted, 0) AS BIGINT) AS rows_deleted,
   CAST(coalesce(e.rows_quarantine, 0) AS BIGINT) AS rows_quarantined,
   CAST(0 AS BIGINT) AS rows_dropped,
-  CAST(coalesce(e.target_status, 'FAILED') AS STRING) AS target_status,
-  CAST(e.quarantine_status AS STRING) AS quarantine_status,
-  CAST(e.expectations AS STRING) AS expectations,
+  CAST(0 AS BIGINT) AS files_read,
+  CAST(0 AS BIGINT) AS files_failed,
   CAST(
     CASE
       WHEN e.dataflow IS NULL THEN '{_FAILED_REASON}'
       ELSE e.failure_reason
     END AS STRING
-  ) AS failure_reason,
-  CAST(NULL AS STRING) AS batch_id,
-  CAST(0 AS BIGINT) AS files_read,
-  CAST(0 AS BIGINT) AS files_failed
+  ) AS failure_reason
 FROM registered reg
 LEFT JOIN latest ON true
 LEFT JOIN from_events e ON e.dataflow = reg.dataflow

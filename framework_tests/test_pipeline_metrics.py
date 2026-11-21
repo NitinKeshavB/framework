@@ -102,18 +102,17 @@ def test_a_load_records_read_written_and_quarantined_once() -> None:
     (row,) = run(rec, loaded(read=100, written=90, quarantined=10))
     assert (row["rows_read"], row["rows_inserted"], row["rows_quarantined"]) == (100, 90, 10)
     assert (row["rows_updated"], row["rows_deleted"]) == (0, 0)
-    assert (row["target_status"], row["quarantine_status"]) == ("COMPLETED", "COMPLETED")
+    assert row["target_status"] == "COMPLETED"
     assert row["failure_reason"] is None
     # From the first flow starting (not the update waiting for compute) to the last flow finishing.
-    assert row["duration_seconds"] == 3.0
     assert row["started_at"].second == 1 and row["ended_at"].second == 4
-    assert row["update_pipeline_uuid"] == "uuid-1" and row["pipeline_name"] == "[fdh] abs_daily"
+    assert row["update_pipeline_uuid"] == "uuid-1"
     assert (row["job_name"], row["layer"], row["dataflow"]) == (
         "abs_daily",
         "bronze",
         "abs_accounting",
     )
-    assert (row["target_table"], row["quarantine_table"]) == (BRONZE, QUARANTINE)
+    assert row["target_table"] == BRONZE
     # The same update, replayed or finished twice, produces nothing more.
     assert run(rec, [update_state("COMPLETED", 10)]) is None
     assert run(rec, loaded(100, 90, 10)) is None
@@ -157,7 +156,7 @@ def test_a_failed_flow_is_recorded_once_the_rest_have_finished() -> None:
         progress(QUARANTINE, "COMPLETED", 3),
     ]
     (row,) = run(recorder(), events)
-    assert row["target_status"] == "FAILED" and row["quarantine_status"] == "COMPLETED"
+    assert row["target_status"] == "FAILED"
     assert row["failure_reason"]
 
 
@@ -285,22 +284,24 @@ def test_a_spec_that_could_not_register_is_failed_with_its_error() -> None:
     assert bad["target_status"] == "FAILED"
     assert bad["failure_reason"] == "invalid spec: path must be a /Volumes path"
     assert [bad[count] for count in COUNTS] == [0, 0, 0, 0, 0]
-    assert bad["target_table"] is None and bad["quarantine_table"] is None
+    assert bad["target_table"] is None
 
 
-def test_expectations_are_kept_from_the_staged_flow() -> None:
-    checks = json.dumps(
-        [{"name": "amount_ok", "dataset": "x", "passed_records": 90, "failed_records": 10}]
+def test_expectations_are_not_stored_on_the_ledger() -> None:
+    """Expectations stay in the event log; the lean ledger does not carry them."""
+
+    checks = [{"name": "id_present", "passed_records": 9, "failed_records": 1}]
+    (row,) = run(
+        recorder(),
+        [
+            *loaded(10, 9, 1)[:-2],
+            progress(
+                STAGED, "COMPLETED", 2, data_quality={"expectations": checks, "dropped_records": 0}
+            ),
+            update_state("COMPLETED", 9),
+        ],
     )
-    events = loaded(100, 90, 10)
-    events.insert(
-        2,
-        progress(STAGED, "RUNNING", 2, data_quality={"expectations": checks, "dropped_records": 0}),
-    )
-    (row,) = run(recorder(), events)
-    assert json.loads(row["expectations"]) == [
-        {"name": "amount_ok", "passed_records": 90, "failed_records": 10}
-    ]
+    assert "expectations" not in row
 
 
 def test_a_very_long_error_is_cut() -> None:

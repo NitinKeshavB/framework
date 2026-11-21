@@ -1,4 +1,4 @@
-"""How silver reads only what is new from bronze: by the change feed, or by the load time."""
+"""How a flow checkpoint reader consumes only what is new from a source."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ class Spark:
         self.newest = newest
         self.trace: list[tuple] = []
         self.statements: list[str] = []
-        self.merges: list[str] = []
+        self.inserts: list[str] = []
         self.read = Frame(self)
 
     def sql(self, statement: str):
@@ -78,10 +78,20 @@ class Spark:
             rows = [{"key": "delta.enableChangeDataFeed", "value": value}]
         elif statement.startswith("DESCRIBE HISTORY"):
             rows = [{"version": self.version, "operation": self.operation}]
-        elif "FROM aal.framework_meta.silver_progress" in statement:
-            rows = [self.progress] if self.progress else []
-        elif statement.startswith("MERGE INTO"):
-            self.merges.append(statement)
+        elif "FROM aal.framework_meta.v_flow_checkpoint" in statement:
+            if self.progress:
+                rows = [
+                    {
+                        "watermark_ts": self.progress.get("last_ingest_timestamp"),
+                        "watermark_id": (
+                            str(self.progress["last_commit_version"])
+                            if self.progress.get("last_commit_version") is not None
+                            else None
+                        ),
+                    }
+                ]
+        elif statement.startswith("INSERT INTO"):
+            self.inserts.append(statement)
         return type("Result", (), {"collect": lambda _self: rows})()
 
     def steps(self, kind: str) -> list[tuple]:
@@ -92,7 +102,6 @@ def test_the_first_read_takes_the_table_as_it_is_and_commit_records_the_version(
     spark = Spark(feed=True, version=9)
     changes = read_new(spark, BRONZE, SILVER)
     assert changes.mode == "change_feed"
-    # Pinned to version 9, so rows committed meanwhile cannot slip past the saved mark.
     assert ("option", "versionAsOf", 9) in spark.trace
     assert spark.steps("selectExpr")[-1] == (
         "selectExpr",
@@ -100,12 +109,13 @@ def test_the_first_read_takes_the_table_as_it_is_and_commit_records_the_version(
         "'insert' AS _change_type",
         "9 AS _commit_version",
     )
-    assert not spark.merges
+    assert not spark.inserts
     changes.commit()
-    (merge,) = spark.merges
-    assert "aal.framework_meta.silver_progress" in merge
-    assert "'aal.silver.rides' AS silver_table" in merge and "'aal.abs_bronze.gl_abs'" in merge
-    assert "CAST(9 AS BIGINT) AS last_commit_version" in merge
+    (insert,) = spark.inserts
+    assert "aal.framework_meta.flow_checkpoint" in insert
+    assert "'SUCCEEDED'" in insert
+    assert f"'{SILVER}'" in insert and f"'{BRONZE}'" in insert
+    assert "'9'" in insert  # watermark_id
 
 
 def test_later_reads_ask_the_change_feed_for_only_the_commits_not_yet_read() -> None:
@@ -117,26 +127,23 @@ def test_later_reads_ask_the_change_feed_for_only_the_commits_not_yet_read() -> 
     assert {("readChangeFeed", "true"), ("startingVersion", 7), ("endingVersion", 9)} <= options
     assert ("format", "delta") in spark.trace
     assert ("where", "_change_type != 'update_preimage'") in spark.trace
-    # The change feed says update_postimage; silver is told update.
     last = spark.steps("selectExpr")[-1]
     assert last[1] == "* EXCEPT (_change_type)"
     assert "'update_postimage' THEN 'update'" in last[2]
-    assert not spark.steps("join")  # no keys given, so no content comparison
+    assert not spark.steps("join")
     changes.commit()
-    assert "CAST(9 AS BIGINT) AS last_commit_version" in spark.merges[0]
+    assert "'9'" in spark.inserts[0]
 
 
 def test_a_rebuilt_table_stops_the_read_with_what_to_do_instead_of_a_delta_error() -> None:
     progress = {"last_ingest_timestamp": None, "last_commit_version": 4}
     refreshed = Spark(feed=True, version=9, progress=progress, operation="DLT REFRESH")
     with pytest.raises(
-        ValueError, match="rebuilt since silver last read it.*DLT REFRESH at version 9"
+        ValueError, match="rebuilt since the reader last consumed it.*DLT REFRESH at version 9"
     ) as error:
         read_new(refreshed, BRONZE, SILVER)
-    assert "silver_progress" in str(error.value)
-    # Only the commits silver has not read are looked at: five of them (versions 5 to 9).
+    assert "flow_checkpoint" in str(error.value)
     assert ("DESCRIBE HISTORY aal.abs_bronze.gl_abs LIMIT 5") in refreshed.statements
-    # A refresh that silver had already read is no obstacle, and nothing new needs no look.
     fine = Spark(
         feed=True,
         version=9,
@@ -153,7 +160,6 @@ def test_an_update_that_changed_nothing_is_left_out_when_keys_are_given() -> Non
     )
     read_new(spark, BRONZE, SILVER, keys=["ride_id"])
     same = ("ride_id", "_commit_version", "_src_row_hash")
-    # Rows after the change, less those whose preimage had the same key, commit, and hash.
     assert ("where", "_change_type = 'update_preimage'") in spark.trace
     assert ("select", *same) in spark.trace
     assert ("join", same, "left_anti") in spark.trace
@@ -166,8 +172,8 @@ def test_nothing_new_gives_no_rows_and_does_not_ask_the_feed_for_a_later_version
     changes = read_new(spark, BRONZE, SILVER)
     assert ("where", "1 = 0") in spark.trace
     assert not [key for _s, key, _v in spark.steps("option") if key == "readChangeFeed"]
-    changes.commit()  # still safe to commit: it records the same version
-    assert "CAST(9 AS BIGINT) AS last_commit_version" in spark.merges[0]
+    changes.commit()
+    assert "'9'" in spark.inserts[0]
 
 
 def test_without_a_change_feed_the_first_read_is_everything_and_commit_saves_the_newest_load_time() -> (
@@ -178,12 +184,12 @@ def test_without_a_change_feed_the_first_read_is_everything_and_commit_saves_the
     changes = read_new(spark, BRONZE, SILVER)
     assert changes.mode == "ingest_timestamp"
     assert ("option", "versionAsOf", 4) in spark.trace
-    assert not spark.steps("where")  # no mark yet, so no filter
+    assert not spark.steps("where")
     assert spark.steps("selectExpr")[-1] == ("selectExpr", "*", "'upsert' AS _change_type")
     changes.commit()
-    (merge,) = spark.merges
-    assert "TIMESTAMP '2026-11-19 10:30:05.250000' AS last_ingest_timestamp" in merge
-    assert "CAST(NULL AS BIGINT) AS last_commit_version" in merge
+    (insert,) = spark.inserts
+    assert "TIMESTAMP '2026-11-19 10:30:05.250000'" in insert
+    assert "CAST(NULL AS STRING)" in insert  # watermark_id
 
 
 def test_without_a_change_feed_later_reads_take_only_rows_loaded_after_the_last_read() -> None:
@@ -202,8 +208,8 @@ def test_a_flagged_row_is_a_delete_and_a_run_with_no_new_rows_saves_nothing() ->
         "CASE WHEN coalesce(_is_deleted, false) THEN 'delete' ELSE 'upsert' END"
         in (spark.steps("selectExpr")[-1][-1])
     )
-    changes.commit()  # no new rows: the mark must not move
-    assert not spark.merges
+    changes.commit()
+    assert not spark.inserts
 
 
 def test_an_scd2_table_cannot_be_read_by_load_time_because_closures_leave_no_trace() -> None:

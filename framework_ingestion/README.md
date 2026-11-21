@@ -147,32 +147,35 @@ Every bronze and quarantine table carries the same audit columns. They need no s
 
 Both tables also keep a Delta change feed for 30 days and are clustered on `_ingest_timestamp`, so a reader that wants only newer rows skips the older files. A pipeline cannot read its own update id, which is why `_batch_id` is its own id rather than the update id.
 
-## Silver reads only what is new
+## Curated readers: only what is new
 
 ```python
 from lakeflow_framework.silver_reader import read_new
 
 changes = read_new(
-    spark, "cat.billing_bronze.invoices", "cat.silver.invoices_clean", keys=["invoice_id"]
+    spark,
+    source_table="cat.billing_bronze.invoices",
+    reader_table="cat.silver.invoices_clean",
+    keys=["invoice_id"],
 )
 changes.frame  # the new rows, plus _change_type
-# ... merge changes.frame into the silver table ...
-changes.commit()  # only now: record how far silver has read
+# ... merge changes.frame into the reader table ...
+changes.commit()  # only now: record how far the reader has consumed
 ```
 
-`mode="auto"` (the default) uses the change feed when the table has it, and otherwise the load time.
+`mode="auto"` (the default) uses the change feed when the source has it, and otherwise the load time. Argument order is **source then reader** (any upstream → any curated consumer).
 
 | | Change feed | Load time (no feed) |
 | --- | --- | --- |
-| Finds | Exactly the commits silver has not read | Rows with `_ingest_timestamp` after the last read |
+| Finds | Exactly the commits the reader has not consumed | Rows with `_ingest_timestamp` after the last read |
 | `_change_type` | `insert`, `update`, `delete` | `upsert` (new or changed), `delete` for a row flagged `_is_deleted` |
 | Sees a removed row | Yes | No, only a flagged one |
-| Sees an SCD2 closure | Yes | No, so SCD2 tables must use the feed |
+| Sees an SCD2 closure | Yes | No, so SCD2 sources must use the feed |
 | First read | The whole table, as `insert` | The whole table |
 
-Progress is one row per silver and bronze table pair in `framework_meta.silver_progress`. The read is pinned to one table version, so rows committed meanwhile are picked up next time and none are skipped. `commit()` comes after silver has used the rows, so a run that stops before it reads the same rows again: **a silver merge must be idempotent.** With `keys`, the feed leaves out an update that only restamped a row without changing its content.
+Progress is one row per `(reader_table, source_table)` in `framework_meta.flow_checkpoint` (layer-independent). The read is pinned to one table version, so rows committed meanwhile are picked up next time and none are skipped. `commit()` comes after the reader has used the rows, so a run that stops before it reads the same rows again: **the merge must be idempotent.** With `keys`, the feed leaves out an update that only restamped a row without changing its content.
 
-If bronze is rebuilt (a full refresh, a replace, a restore), the change feed cannot be followed across it. The reader stops and says so. Delete that pair's row in `silver_progress`, rebuild the silver table, and the next read starts again from the table as it is.
+If the source is rebuilt (a full refresh, a replace, a restore), the change feed cannot be followed across it. The reader stops and says so. Delete that pair's row in `flow_checkpoint`, rebuild the reader table, and the next read starts again from the source as it is.
 
 ## Describe your tables and columns
 
@@ -199,7 +202,7 @@ flowchart LR
 | `rows_inserted`, `rows_updated`, `rows_deleted` | What happened in the target table |
 | `rows_quarantined`, `rows_dropped` | Rows that failed a rule (quarantine vs drop/block) |
 | `source_kind`, `run_as`, `load_kind` | Source type, identity, and regular / backfill / catchup |
-| `target_status`, `quarantine_status` | `COMPLETED`, `FAILED`, or `CANCELED` |
+| `target_status` | `COMPLETED`, `FAILED`, or `CANCELED` (quarantine issues fold into `failure_reason`) |
 | `failure_reason` | The error the run reported, or why the table could not register |
 | `batch_id`, `update_id` | The `_batch_id` on the rows, and the Databricks update |
 

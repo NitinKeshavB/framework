@@ -42,7 +42,7 @@ MAX_PART_CHARS = 1500
 _COLUMN_TYPES = {
     "started_at": "TIMESTAMP",
     "ended_at": "TIMESTAMP",
-    "duration_seconds": "DOUBLE",
+    "load_date": "DATE",
     "rows_read": "BIGINT",
     "rows_inserted": "BIGINT",
     "rows_updated": "BIGINT",
@@ -53,7 +53,9 @@ _COLUMN_TYPES = {
     "files_failed": "BIGINT",
     "recorded_at": "TIMESTAMP",
 }
-_ROW_COLUMNS = tuple(column for column in LEDGER_COLUMNS if column != "recorded_at")
+_ROW_COLUMNS = tuple(
+    column for column in LEDGER_COLUMNS if column not in {"recorded_at", "load_date"}
+)
 
 
 @dataclass(frozen=True)
@@ -251,46 +253,48 @@ class UpdateRecorder:
         failed = (
             flow.build_error is not None
             or target_status in {"FAILED", "CANCELED"}
+            or quarantine_status in {"FAILED", "CANCELED"}
             or (state != "COMPLETED")
         )
         started = update.started or update.first_seen or ended
+        reason = self._reason(update_id, update, state, flow) if failed else None
+        if (
+            failed
+            and not reason
+            and quarantine_status in {"FAILED", "CANCELED"}
+            and target_status not in {"FAILED", "CANCELED"}
+        ):
+            reason = f"quarantine flow status {quarantine_status}"
         row: dict[str, Any] = {
-            "job_name": self.job_name,
             "layer": self.layer,
-            "job_run_id": None,
-            "pipeline_id": flow.pipeline_id,
-            "update_pipeline_uuid": update.pipeline_uuid,
-            "pipeline_name": update.pipeline_name,
+            "job_name": self.job_name,
+            "started_at": started,
             "update_id": update_id,
             "dataflow": flow.pipeline_id,
-            "owner_kind": flow.owner_kind,
-            "owner": flow.owner,
+            "load_kind": self.load_kind,
+            "target_status": target_status,
+            "ended_at": ended,
+            "batch_id": self.batch_id,
+            "job_run_id": None,
+            "update_pipeline_uuid": update.pipeline_uuid,
             "source_kind": flow.source_kind or "",
             "run_as": flow.run_as or "",
-            "load_kind": self.load_kind,
             "target_table": flow.target or None,
-            "quarantine_table": flow.quarantine or None,
-            "started_at": started,
-            "ended_at": ended,
-            "duration_seconds": round(max((ended - started).total_seconds(), 0.0), 3),
             "rows_read": read,
             "rows_inserted": inserted,
             "rows_updated": updated,
             "rows_deleted": deleted,
             "rows_quarantined": quarantined,
             "rows_dropped": 0,
-            "target_status": target_status,
-            "quarantine_status": quarantine_status,
-            "expectations": _expectations_json(staged) if counted["staged"] else None,
-            "failure_reason": self._reason(update_id, update, state, flow) if failed else None,
-            "batch_id": self.batch_id,
             "files_read": 0,
             "files_failed": 0,
+            "failure_reason": reason,
             # Not ledger columns: where the per-file rows are read from, and what to wait for.
             "_files_table": flow.files,
             "_arrivals_table": flow.arrivals,
             "_path": flow.path,
             "_append": flow.append,
+            "_quarantine_table": flow.quarantine or None,
         }
         if not flow.files and healthy and flow.append:
             # Not a file source, so no per-file counts: what was read and not kept was dropped.
@@ -341,17 +345,19 @@ def metric_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tu
 LEDGER_DETAIL = "ledger_detail"
 FILE_LEDGER = LEDGER_DETAIL  # alias for older call sites / tests mid-refactor
 DETAIL_COLUMNS = (
+    "update_id",
+    "dataflow",
+    "recorded_at",
+    "detail_kind",
+    "status",
+    "load_date",
     "job_name",
     "layer",
-    "update_id",
-    "batch_id",
-    "dataflow",
+    "load_kind",
     "target_table",
-    "detail_kind",
     "src_object",
     "src_file_path",
     "src_file_name",
-    "status",
     "rows_read",
     "rows_inserted",
     "rows_quarantined",
@@ -359,17 +365,34 @@ DETAIL_COLUMNS = (
     "failed_rules",
     "blocking_rules",
     "error_message",
-    "load_kind",
-    "recorded_at",
 )
 _DETAIL_NUMBERS = frozenset({"rows_read", "rows_inserted", "rows_quarantined", "rows_dropped"})
-DETAIL_SCHEMA = ", ".join(
-    f"{column} {'BIGINT' if column in _DETAIL_NUMBERS else 'TIMESTAMP' if column == 'recorded_at' else 'STRING'}"
-    for column in DETAIL_COLUMNS
-)
+
+
+def _detail_type(column: str) -> str:
+    if column in _DETAIL_NUMBERS:
+        return "BIGINT"
+    if column == "recorded_at":
+        return "TIMESTAMP"
+    if column == "load_date":
+        return "DATE"
+    return "STRING"
+
+
+DETAIL_SCHEMA = ", ".join(f"{column} {_detail_type(column)}" for column in DETAIL_COLUMNS)
 FILE_COLUMNS = DETAIL_COLUMNS  # alias
 FILE_SCHEMA = DETAIL_SCHEMA
 MAX_FILES_IN_REASON = 5
+
+
+def _load_date(started_at: Any) -> Any:
+    """Calendar day of the load start (UTC date), for filters and archive predicates."""
+
+    if started_at is None:
+        return None
+    if hasattr(started_at, "date"):
+        return started_at.date()
+    return started_at
 
 
 def ledger_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tuple]:
@@ -381,6 +404,8 @@ def ledger_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tu
         for column in LEDGER_COLUMNS:
             if column == "recorded_at":
                 values.append(recorded_at)
+            elif column == "load_date":
+                values.append(_load_date(row.get("started_at") or recorded_at))
             elif column in {
                 "rows_read",
                 "rows_inserted",
@@ -403,17 +428,19 @@ def file_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tupl
 
     return [
         (
+            row["update_id"],
+            row["dataflow"],
+            recorded_at,
+            item.get("detail_kind") or "file",
+            item["status"],
+            _load_date(row.get("started_at") or recorded_at),
             row["job_name"],
             row["layer"],
-            row["update_id"],
-            row["batch_id"],
-            row["dataflow"],
+            item.get("load_kind") or row.get("load_kind") or "regular",
             row["target_table"],
-            item.get("detail_kind") or "file",
             item.get("src_object"),
             item.get("src_file_path"),
             item.get("src_file_name"),
-            item["status"],
             int(item.get("rows_read") or 0),
             int(item.get("rows_inserted") or item.get("rows_loaded") or 0),
             int(item.get("rows_quarantined") or 0),
@@ -421,8 +448,6 @@ def file_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tupl
             item.get("failed_rules") or "",
             item.get("blocking_rules") or "",
             item.get("error_message"),
-            item.get("load_kind") or row.get("load_kind") or "regular",
-            recorded_at,
         )
         for row in rows
         for item in row.get("_files") or []

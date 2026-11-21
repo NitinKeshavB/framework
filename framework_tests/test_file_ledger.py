@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from lakeflow_framework.load_metrics import LEDGER_COLUMNS
 from lakeflow_framework.pipeline_metrics import (
     DETAIL_COLUMNS,
     DETAIL_SCHEMA,
@@ -75,7 +76,7 @@ def test_every_file_is_written_with_its_own_counts_and_the_batch() -> None:
     records = file_records([row], AT)
     assert len(records) == 100
     first = dict(zip(DETAIL_COLUMNS, records[0], strict=True))
-    assert first["batch_id"] == "batch-1" and first["src_file_name"] == "ok_000.csv"
+    assert first["src_file_name"] == "ok_000.csv"
     assert (first["rows_read"], first["rows_inserted"], first["rows_dropped"]) == (10, 10, 0)
     bad = dict(zip(DETAIL_COLUMNS, records[-1], strict=True))
     assert bad["status"] == "FAILED" and bad["rows_inserted"] == 0 and bad["rows_dropped"] == 8
@@ -99,8 +100,8 @@ def test_a_warned_file_is_not_a_failure() -> None:
 
 def test_the_counts_are_numbers_even_when_nothing_was_read() -> None:
     row = row_for([], read=0, written=0, quarantine=0)
-    record = ledger_records([row], AT)[0]
-    assert record[-2:] == (0, 0)  # files_read, files_failed
+    record = dict(zip(LEDGER_COLUMNS, ledger_records([row], AT)[0], strict=True))
+    assert (record["files_read"], record["files_failed"]) == (0, 0)
     assert metric_records([row], AT) == []
 
 
