@@ -236,6 +236,7 @@ def source_record(system: SourceSystem) -> dict[str, Any]:
         "domain": system.domain,
         "owner_email": system.owner,
         "source_kind": system.kind,
+        "run_as": system.run_as or None,
         "raw_volume": dict(system.raw_volume) or None,
         "foreign_catalog": system.foreign_catalog or None,
         "engine": system.engine or None,

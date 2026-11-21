@@ -5,8 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from test_pipeline_metrics import _Spark, dataflow, loaded, recorder, run
-from test_sources import FILE_SOURCE, _config, _Pipelines, _Spark as _SourceSpark, _volume_spec
 
 from lakeflow_framework import ConfigValidationError, build_pipeline
 from lakeflow_framework.config import config_from_document
@@ -18,12 +16,22 @@ from lakeflow_framework.pipeline_metrics import (
     read_arrivals,
     write_rows,
 )
+from test_pipeline_metrics import _Spark, dataflow, loaded, recorder, run
+from test_sources import FILE_SOURCE, _config, _Pipelines, _volume_spec
+from test_sources import _Spark as _SourceSpark
 
-SCHEDULED = FILE_SOURCE.replace("daily: {trigger: file_arrival}", 'daily: {schedule: "0 0 2 * * ?"}')
+SCHEDULED = FILE_SOURCE.replace(
+    "daily: {trigger: file_arrival}", 'daily: {schedule: "0 0 2 * * ?"}'
+)
 
 
 def config_for(tmp_path: Path, source: str = SCHEDULED, extra: str = ""):
-    return _config(tmp_path, source, "files_things.yaml", _volume_spec(source=extra or "  raw_path: things/\n  format: csv\n"))
+    return _config(
+        tmp_path,
+        source,
+        "files_things.yaml",
+        _volume_spec(source=extra or "  raw_path: things/\n  format: csv\n"),
+    )
 
 
 def test_a_table_in_a_scheduled_delivery_expects_a_file_by_default(tmp_path: Path) -> None:
@@ -64,7 +72,9 @@ def test_the_view_is_registered_with_a_listing_that_reads_no_file_content(tmp_pa
     spark = _SourceSpark()
     pipelines = _Pipelines(spark)
     build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config)
-    assert "files_things_inventory" in pipelines.names and "files_things_arrivals" in pipelines.names
+    assert (
+        "files_things_inventory" in pipelines.names and "files_things_arrivals" in pipelines.names
+    )
     assert pipelines.kinds["files_things_arrivals"] == "materialized_view"
     sql = arrivals_sql(config, "files_things_inventory", "files_things_files")
     # The previous run's start, not a backfill's, and a few minutes of slack for a file in flight.
@@ -93,7 +103,7 @@ def test_a_run_where_no_file_arrived_is_failed_but_says_why() -> None:
     row = apply_arrivals(make_row(), [])
     assert row["target_status"] == "FAILED"
     assert row["failure_reason"] == "no file arrived in /Volumes/c/s/v/ since the previous run"
-    assert (row["rows_read"], row["rows_written"], row["files_read"]) == (0, 0, 0)
+    assert (row["rows_read"], row["rows_inserted"], row["files_read"]) == (0, 0, 0)
 
 
 def test_files_that_arrived_and_were_already_recorded_do_not_count_as_new() -> None:
@@ -115,7 +125,11 @@ def test_a_file_with_no_rows_is_recorded_failed_and_the_others_are_left_alone() 
         "FAILED",
         EMPTY_FILE,
     )
-    assert (item["rows_read"], item["rows_loaded"], item["rows_blocked"]) == (0, 0, 0)  # never NULL
+    assert (
+        item["rows_read"],
+        item.get("rows_inserted") or item.get("rows_inserted"),
+        item.get("rows_dropped"),
+    ) == (0, 0, 0)  # never NULL
 
 
 def test_a_good_file_that_arrived_leaves_the_load_completed() -> None:
@@ -125,10 +139,9 @@ def test_a_good_file_that_arrived_leaves_the_load_completed() -> None:
             "src_file_name": "a.csv",
             "status": "PROCESSED",
             "rows_read": 5,
-            "rows_loaded": 5,
+            "rows_inserted": 5,
             "rows_quarantined": 0,
             "rows_dropped": 0,
-            "rows_blocked": 0,
         }
     ]
     row = make_row(files)
@@ -143,10 +156,9 @@ def test_an_empty_file_beside_a_blocked_one_keeps_both_reasons() -> None:
             "src_file_name": "b.csv",
             "status": "FAILED",
             "rows_read": 2,
-            "rows_loaded": 0,
+            "rows_inserted": 0,
             "rows_quarantined": 1,
-            "rows_dropped": 0,
-            "rows_blocked": 1,
+            "rows_dropped": 1,
             "blocking_rules": "amount_numeric",
         }
     ]
@@ -166,21 +178,43 @@ def test_the_arrivals_are_read_from_the_view_and_written_with_the_ledger() -> No
         def sql(self, statement: str):
             if "files_things_arrivals" in statement:
                 data = [
-                    {"file_path": "/v/e.csv", "file_name": "e.csv", "has_rows": False, "recorded_before": False}
+                    {
+                        "file_path": "/v/e.csv",
+                        "file_name": "e.csv",
+                        "has_rows": False,
+                        "recorded_before": False,
+                    }
                 ]
                 return type("R", (), {"collect": lambda _s: data})()
             return super().sql(statement)
 
     spark = Arrivals()
     (row,) = run(
-        recorder(dataflow(files="aal.framework_meta.files_things_files",
-                          arrivals="aal.framework_meta.files_things_arrivals", path="/v/")),
+        recorder(
+            dataflow(
+                files="aal.framework_meta.files_things_files",
+                arrivals="aal.framework_meta.files_things_arrivals",
+                path="/v/",
+            )
+        ),
         loaded(0, 0, 0),
     )
     row["batch_id"] = "batch-1"
     assert read_arrivals(spark, row)[0]["src_file_name"] == "e.csv"
     write_rows(spark, "aal_dev_fdh", [row])
-    saved = spark.saved["aal_dev_fdh.framework_meta.file_ledger"].data
-    assert len(saved) == 1 and saved[0][8] == "FAILED"
-    ledger = spark.saved["aal_dev_fdh.framework_meta.load_ledger"].data[0]
-    assert "FAILED" in ledger
+    from lakeflow_framework.pipeline_metrics import DETAIL_COLUMNS
+
+    saved = spark.saved["aal_dev_fdh.framework_meta.ledger_detail"].data
+    assert len(saved) == 1
+    detail = dict(zip(DETAIL_COLUMNS, saved[0], strict=True))
+    assert detail["status"] == "FAILED" and detail["src_file_name"] == "e.csv"
+    from lakeflow_framework.load_metrics import LEDGER_COLUMNS
+
+    ledger = dict(
+        zip(
+            LEDGER_COLUMNS,
+            spark.saved["aal_dev_fdh.framework_meta.load_ledger"].data[0],
+            strict=True,
+        )
+    )
+    assert ledger["target_status"] == "FAILED"

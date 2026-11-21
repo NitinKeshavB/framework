@@ -8,8 +8,10 @@ written in a single statement, so nothing re-reads the event log and nothing is 
 Counts, per dataflow:
 
 - ``rows_read``: rows the staged flow took from the source files (or source table);
-- ``rows_written`` / ``rows_upserted`` / ``rows_deleted``: what the bronze flow changed;
-- ``rows_quarantine``: rows the quarantine flow wrote.
+- ``rows_inserted`` / ``rows_updated`` / ``rows_deleted``: what the target flow changed
+  (append → inserted; CDC upsert metric → updated until the platform splits inserts);
+- ``rows_quarantined``: rows the quarantine flow wrote;
+- ``rows_dropped``: rows rejected by drop or fail-blocked rules (single bucket).
 
 Every count is a number. A flow that reported nothing (an update with no new files) is 0, and
 so is a flow that did not complete in a failed or canceled update. ``failure_reason`` carries the
@@ -26,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from lakeflow_framework.load_metrics import LEDGER, LEDGER_COLUMNS, METRIC_NAMES, METRIC_TABLE
+from lakeflow_framework.load_metrics import LEDGER, LEDGER_COLUMNS
 from lakeflow_framework.sqlnames import require_catalog, sql_string
 
 log = logging.getLogger(__name__)
@@ -42,11 +44,13 @@ _COLUMN_TYPES = {
     "ended_at": "TIMESTAMP",
     "duration_seconds": "DOUBLE",
     "rows_read": "BIGINT",
-    "rows_written": "BIGINT",
-    "rows_upserted": "BIGINT",
+    "rows_inserted": "BIGINT",
+    "rows_updated": "BIGINT",
     "rows_deleted": "BIGINT",
-    "rows_quarantine": "BIGINT",
-    "rows_processed": "BIGINT",
+    "rows_quarantined": "BIGINT",
+    "rows_dropped": "BIGINT",
+    "files_read": "BIGINT",
+    "files_failed": "BIGINT",
     "recorded_at": "TIMESTAMP",
 }
 _ROW_COLUMNS = tuple(column for column in LEDGER_COLUMNS if column != "recorded_at")
@@ -70,6 +74,8 @@ class Dataflow:
         ""  # the view of files that arrived since the last run; set when a file is expected
     )
     path: str = ""  # where the files land, for the message when none came
+    source_kind: str = ""  # sftp_files / sharepoint_files / database / …
+    run_as: str = ""  # configured service principal, empty when default
 
 
 @dataclass
@@ -93,7 +99,13 @@ class UpdateRecorder:
     """Fold a pipeline update's events into ledger rows. Pure Python: no Spark, no I/O."""
 
     def __init__(
-        self, job_name: str, layer: str, dataflows: list[Dataflow], batch_id: str | None = None
+        self,
+        job_name: str,
+        layer: str,
+        dataflows: list[Dataflow],
+        batch_id: str | None = None,
+        *,
+        load_kind: str = "regular",
     ):
         self.job_name = job_name
         self.layer = layer
@@ -101,6 +113,7 @@ class UpdateRecorder:
         # The id every bronze row of this run carries (_batch_id). The ledger keeps it beside the
         # real update id, because pipeline code cannot read the update id to stamp rows with it.
         self.batch_id = batch_id
+        self.load_kind = load_kind
         self._updates: dict[str, _Update] = {}
         self._done: set[str] = set()
 
@@ -226,6 +239,13 @@ class UpdateRecorder:
             else:
                 written = upserted + deleted
         quarantined = _count(quarantine, "num_output_rows") if counted["quarantine"] else 0
+        # Append → rows_inserted; CDC upsert metric → rows_updated (platform does not split inserts).
+        if flow.append and "num_output_rows" in (target.metrics if target else {}):
+            inserted, updated = written, 0
+        elif upserted:
+            inserted, updated = 0, upserted
+        else:
+            inserted, updated = written, 0
         target_status = _status(target, state, flow.build_error)
         quarantine_status = _status(quarantine, state, flow.build_error)
         failed = (
@@ -245,24 +265,25 @@ class UpdateRecorder:
             "dataflow": flow.pipeline_id,
             "owner_kind": flow.owner_kind,
             "owner": flow.owner,
+            "source_kind": flow.source_kind or "",
+            "run_as": flow.run_as or "",
+            "load_kind": self.load_kind,
             "target_table": flow.target or None,
             "quarantine_table": flow.quarantine or None,
             "started_at": started,
             "ended_at": ended,
             "duration_seconds": round(max((ended - started).total_seconds(), 0.0), 3),
             "rows_read": read,
-            "rows_written": written,
-            "rows_upserted": upserted,
+            "rows_inserted": inserted,
+            "rows_updated": updated,
             "rows_deleted": deleted,
-            "rows_quarantine": quarantined,
-            "rows_processed": written + quarantined,
+            "rows_quarantined": quarantined,
+            "rows_dropped": 0,
             "target_status": target_status,
             "quarantine_status": quarantine_status,
             "expectations": _expectations_json(staged) if counted["staged"] else None,
             "failure_reason": self._reason(update_id, update, state, flow) if failed else None,
             "batch_id": self.batch_id,
-            "rows_dropped": 0,
-            "rows_blocked": 0,
             "files_read": 0,
             "files_failed": 0,
             # Not ledger columns: where the per-file rows are read from, and what to wait for.
@@ -273,7 +294,7 @@ class UpdateRecorder:
         }
         if not flow.files and healthy and flow.append:
             # Not a file source, so no per-file counts: what was read and not kept was dropped.
-            row["rows_dropped"] = max(read - written - quarantined, 0)
+            row["rows_dropped"] = max(read - inserted - quarantined, 0)
         return row
 
     def _flow(self, update: _Update, table: str) -> _Flow | None:
@@ -303,85 +324,82 @@ class UpdateRecorder:
         return _clip("; ".join(parts))
 
 
-# Columns added after batch_id, in this order, to both load_ledger and its archive.
-EXTRA_LEDGER_COLUMNS = ("rows_dropped", "rows_blocked", "files_read", "files_failed")
-# The table's physical order: the columns of LEDGER_COLUMNS, then batch_id, then the extras.
-LEDGER_SCHEMA = (
-    ", ".join(f"{column} {_COLUMN_TYPES.get(column, 'STRING')}" for column in LEDGER_COLUMNS)
-    + ", batch_id STRING, "
-    + ", ".join(f"{column} BIGINT" for column in EXTRA_LEDGER_COLUMNS)
+LEDGER_SCHEMA = ", ".join(
+    f"{column} {_COLUMN_TYPES.get(column, 'STRING')}" for column in LEDGER_COLUMNS
 )
-METRIC_SCHEMA = (
-    "job_name STRING, layer STRING, update_id STRING, dataflow STRING, "
-    "recorded_at TIMESTAMP, metric_name STRING, metric_value BIGINT"
-)
-PIPELINE_METRIC_NAMES = (*METRIC_NAMES, *EXTRA_LEDGER_COLUMNS)
-FILE_LEDGER = "file_ledger"
-FILE_COLUMNS = (
+# Retired dual-write extras; kept so older tests importing these names still collect.
+EXTRA_LEDGER_COLUMNS: tuple[str, ...] = ()
+PIPELINE_METRIC_NAMES: tuple[str, ...] = ()
+
+
+def metric_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tuple]:
+    """Retired: load_metric dual-write is gone. Returns an empty list."""
+
+    return []
+
+
+LEDGER_DETAIL = "ledger_detail"
+FILE_LEDGER = LEDGER_DETAIL  # alias for older call sites / tests mid-refactor
+DETAIL_COLUMNS = (
     "job_name",
     "layer",
     "update_id",
     "batch_id",
     "dataflow",
     "target_table",
+    "detail_kind",
+    "src_object",
     "src_file_path",
     "src_file_name",
     "status",
     "rows_read",
-    "rows_loaded",
+    "rows_inserted",
     "rows_quarantined",
     "rows_dropped",
-    "rows_blocked",
     "failed_rules",
     "blocking_rules",
     "error_message",
     "load_kind",
     "recorded_at",
 )
-_FILE_NUMBERS = frozenset(
-    {"rows_read", "rows_loaded", "rows_quarantined", "rows_dropped", "rows_blocked"}
+_DETAIL_NUMBERS = frozenset({"rows_read", "rows_inserted", "rows_quarantined", "rows_dropped"})
+DETAIL_SCHEMA = ", ".join(
+    f"{column} {'BIGINT' if column in _DETAIL_NUMBERS else 'TIMESTAMP' if column == 'recorded_at' else 'STRING'}"
+    for column in DETAIL_COLUMNS
 )
-FILE_SCHEMA = ", ".join(
-    f"{column} {'BIGINT' if column in _FILE_NUMBERS else 'TIMESTAMP' if column == 'recorded_at' else 'STRING'}"
-    for column in FILE_COLUMNS
-)
+FILE_COLUMNS = DETAIL_COLUMNS  # alias
+FILE_SCHEMA = DETAIL_SCHEMA
 MAX_FILES_IN_REASON = 5
 
 
 def ledger_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tuple]:
     """The ledger rows as tuples in ``LEDGER_SCHEMA`` order. A count is never NULL."""
 
-    return [
-        (
-            *(row[column] for column in _ROW_COLUMNS),
-            recorded_at,
-            row["batch_id"],
-            *(int(row.get(column) or 0) for column in EXTRA_LEDGER_COLUMNS),
-        )
-        for row in rows
-    ]
-
-
-def metric_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tuple]:
-    """The same counts in the long shape: one tuple per dataflow and metric."""
-
-    return [
-        (
-            row["job_name"],
-            row["layer"],
-            row["update_id"],
-            row["dataflow"],
-            recorded_at,
-            name,
-            int(row.get(name) or 0),
-        )
-        for row in rows
-        for name in PIPELINE_METRIC_NAMES
-    ]
+    out: list[tuple] = []
+    for row in rows:
+        values: list[Any] = []
+        for column in LEDGER_COLUMNS:
+            if column == "recorded_at":
+                values.append(recorded_at)
+            elif column in {
+                "rows_read",
+                "rows_inserted",
+                "rows_updated",
+                "rows_deleted",
+                "rows_quarantined",
+                "rows_dropped",
+                "files_read",
+                "files_failed",
+            }:
+                values.append(int(row.get(column) or 0))
+            else:
+                values.append(row.get(column))
+        out.append(tuple(values))
+    return out
 
 
 def file_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tuple]:
-    """One tuple per file of each ledger row, in ``FILE_SCHEMA`` order."""
+    """One tuple per detail row (file or input) of each ledger row, in ``DETAIL_SCHEMA`` order."""
 
     return [
         (
@@ -391,18 +409,19 @@ def file_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tupl
             row["batch_id"],
             row["dataflow"],
             row["target_table"],
-            item["src_file_path"],
-            item["src_file_name"],
+            item.get("detail_kind") or "file",
+            item.get("src_object"),
+            item.get("src_file_path"),
+            item.get("src_file_name"),
             item["status"],
             int(item.get("rows_read") or 0),
-            int(item.get("rows_loaded") or 0),
+            int(item.get("rows_inserted") or item.get("rows_loaded") or 0),
             int(item.get("rows_quarantined") or 0),
-            int(item.get("rows_dropped") or 0),
-            int(item.get("rows_blocked") or 0),
+            int(item.get("rows_dropped") or 0) + int(item.get("rows_blocked") or 0),
             item.get("failed_rules") or "",
             item.get("blocking_rules") or "",
             item.get("error_message"),
-            item.get("load_kind") or "regular",
+            item.get("load_kind") or row.get("load_kind") or "regular",
             recorded_at,
         )
         for row in rows
@@ -430,11 +449,12 @@ def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
                 "src_file_path": data.get("_src_file_path"),
                 "src_file_name": data.get("_src_file_name"),
                 "status": data.get("file_status"),
+                "detail_kind": "file",
                 "rows_read": data.get("rows_read"),
-                "rows_loaded": data.get("rows_loaded"),
+                "rows_inserted": data.get("rows_loaded"),
                 "rows_quarantined": data.get("rows_quarantined"),
-                "rows_dropped": data.get("rows_dropped"),
-                "rows_blocked": data.get("rows_blocked"),
+                "rows_dropped": int(data.get("rows_dropped") or 0)
+                + int(data.get("rows_blocked") or 0),
                 "failed_rules": data.get("failed_rules"),
                 "blocking_rules": data.get("blocking_rules"),
             }
@@ -487,14 +507,14 @@ def apply_arrivals(row: dict[str, Any], arrivals: list[dict[str, Any]] | None) -
     for item in empty:
         files.append(
             {
+                "detail_kind": "file",
                 "src_file_path": item["src_file_path"],
                 "src_file_name": item["src_file_name"],
                 "status": "FAILED",
                 "rows_read": 0,
-                "rows_loaded": 0,
+                "rows_inserted": 0,
                 "rows_quarantined": 0,
                 "rows_dropped": 0,
-                "rows_blocked": 0,
                 "failed_rules": "",
                 "blocking_rules": "",
                 "error_message": EMPTY_FILE,
@@ -540,8 +560,9 @@ def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, A
         )
     row["files_read"] = len(files)
     row["files_failed"] = len(failed)
-    row["rows_dropped"] = sum(int(item.get("rows_dropped") or 0) for item in files)
-    row["rows_blocked"] = sum(int(item.get("rows_blocked") or 0) for item in files)
+    row["rows_dropped"] = sum(
+        int(item.get("rows_dropped") or 0) + int(item.get("rows_blocked") or 0) for item in files
+    )
     if failed:
         shown = ", ".join(
             f"{item['src_file_name']} ({item.get('blocking_rules')})"
@@ -557,20 +578,19 @@ def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, A
     read = int(row.get("rows_read") or 0)
     accounted = sum(
         int(row.get(column) or 0)
-        for column in ("rows_written", "rows_quarantine", "rows_dropped", "rows_blocked")
+        for column in ("rows_inserted", "rows_quarantined", "rows_dropped")
     )
     if row.get("_append") and read != accounted:
         log.warning(
-            "%s update %s: read %d rows but %d are accounted for (written %d, quarantined %d, "
-            "dropped %d, blocked %d)",
+            "%s update %s: read %d rows but %d are accounted for (inserted %d, quarantined %d, "
+            "dropped %d)",
             row.get("dataflow"),
             row.get("update_id"),
             read,
             accounted,
-            row.get("rows_written", 0),
-            row.get("rows_quarantine", 0),
+            row.get("rows_inserted", 0),
+            row.get("rows_quarantined", 0),
             row.get("rows_dropped", 0),
-            row.get("rows_blocked", 0),
         )
     return row
 
@@ -589,10 +609,11 @@ def recorded_dataflows(spark: Any, catalog: str, row: dict[str, Any]) -> set[str
 def write_rows(
     spark: Any, catalog: str, rows: list[dict[str, Any]], *, replay: bool = False
 ) -> int:
-    """Append an update's rows to load_ledger and load_metric. Returns how many ledger rows.
+    """Append an update's rows to load_ledger and ledger_detail. Returns how many ledger rows.
 
     A pipeline's ``spark.sql`` accepts only SELECT, SHOW, DESCRIBE, and USE, so the rows are
     written with the DataFrame writer. Rows already recorded for the update are left out.
+    ``replay=True`` (hourly catch-up) stamps ``load_kind=catchup`` when not already backfill.
     """
 
     if not rows:
@@ -603,6 +624,8 @@ def write_rows(
     if not fresh:
         return 0
     for row in fresh:
+        if replay and row.get("load_kind") != "backfill":
+            row["load_kind"] = "catchup"
         if "_files" not in row:
             try:
                 apply_files(row, read_files(spark, row))
@@ -623,12 +646,9 @@ def write_rows(
     def append(records: list[tuple], schema: str, table: str) -> None:
         spark.createDataFrame(records, schema).write.mode("append").saveAsTable(f"{meta}.{table}")
 
-    writes = [
-        (ledger_records(fresh, at), LEDGER_SCHEMA, LEDGER),
-        (metric_records(fresh, at), METRIC_SCHEMA, METRIC_TABLE),
-    ]
+    writes = [(ledger_records(fresh, at), LEDGER_SCHEMA, LEDGER)]
     if files:
-        writes.append((files, FILE_SCHEMA, FILE_LEDGER))
+        writes.append((files, DETAIL_SCHEMA, LEDGER_DETAIL))
     # One write per table, at the same time. When an update fails the pipeline shuts down within
     # seconds and cancels a write still running, so the writes must not queue behind each other.
     # A cut-off update has no ledger row and the hourly catch-up writes it from the event log.
@@ -642,15 +662,18 @@ def write_rows(
 def _unrecorded_files(
     spark: Any, meta: str, rows: list[dict[str, Any]], files: list[tuple]
 ) -> list[tuple]:
-    """The file rows an update has not already written, for a replay of one that was cut off."""
+    """The file rows an update has not already written, for a catch-up of one that was cut off."""
 
     update_id = rows[0]["update_id"]
     found = spark.sql(
-        f"SELECT src_file_path FROM {meta}.{FILE_LEDGER} WHERE update_id = {sql_string(update_id)}"
+        f"SELECT src_file_path FROM {meta}.{LEDGER_DETAIL} "
+        f"WHERE update_id = {sql_string(update_id)} AND src_file_path IS NOT NULL"
     ).collect()
     done = {str(item["src_file_path"]) for item in found}
-    path = FILE_COLUMNS.index("src_file_path")
-    return [record for record in files if str(record[path]) not in done]
+    path = DETAIL_COLUMNS.index("src_file_path")
+    return [
+        record for record in files if record[path] is not None and str(record[path]) not in done
+    ]
 
 
 def install(

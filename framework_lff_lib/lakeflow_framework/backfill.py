@@ -8,7 +8,7 @@ Modes:
 
 - ``files``: the named files.
 - ``dates``: files that arrived (were last modified) between ``date_from`` and ``date_to``.
-- ``failed``: files whose latest ``file_ledger`` status is FAILED, to try them again.
+- ``failed``: files whose latest ``ledger_detail`` status is FAILED, to try them again.
 - ``full_refresh``: every file again, by refreshing the table's own pipeline with a full refresh.
 
 With none of ``files``, ``dates`` or ``failed``, the selector is empty, which means every file in the
@@ -191,7 +191,11 @@ def plan_files(spark: Any, config: PipelineConfig, selection: Selection) -> list
 
     if selection.mode == "failed":
         return _failed_files(spark, config)
-    after = datetime.fromisoformat(_stamp(selection.date_from)).replace(tzinfo=UTC) if selection.date_from else None
+    after = (
+        datetime.fromisoformat(_stamp(selection.date_from)).replace(tzinfo=UTC)
+        if selection.date_from
+        else None
+    )
     before = (
         datetime.fromisoformat(_stamp(selection.date_to, end=True)).replace(tzinfo=UTC)
         if selection.date_to
@@ -220,7 +224,7 @@ def _plain_path(path: str) -> str:
 def _failed_files(spark: Any, config: PipelineConfig) -> list[dict[str, Any]]:
     meta = f"{require_catalog(config.catalog)}.framework_meta"
     rows = spark.sql(
-        f"SELECT src_file_path AS path FROM {meta}.file_ledger "
+        f"SELECT src_file_path AS path FROM {meta}.ledger_detail "
         f"WHERE dataflow = {sql_string(config.pipeline_id)} "
         "QUALIFY row_number() OVER (PARTITION BY src_file_path ORDER BY recorded_at DESC) = 1 "
         "AND status = 'FAILED' ORDER BY src_file_path"
@@ -269,7 +273,7 @@ def run_backfill(
         # processes, which cannot hand numbers back through memory.
         result.rows_replaced = _count_existing(spark, result.planned, config.table_name("bronze"))
         _load(spark, config, selection, result, batch=batch, update_id=update_id)
-        # Each micro-batch wrote its files to file_ledger as it went.
+        # Each micro-batch wrote its files to ledger_detail as it went.
         result.files = _recorded_files(spark, config, update_id)
         recorded = {item["src_file_path"] for item in result.files}
         result.empty = [path for path in result.planned if path not in recorded]
@@ -285,7 +289,9 @@ def run_backfill(
             + ", ".join(path.rsplit("/", 1)[-1] for path in result.empty[:MAX_LISTED])
         )
     if result.missing:
-        result.warnings.append(f"{len(result.missing)} file(s) not found: " + ", ".join(result.missing))
+        result.warnings.append(
+            f"{len(result.missing)} file(s) not found: " + ", ".join(result.missing)
+        )
     if result.none_found:
         result.warnings.append(f"no file found for this request in {config.path}")
     _record(spark, config, result, started=started, update_id=update_id, batch=batch)
@@ -336,6 +342,7 @@ def _load(
         "batch_id": batch,
         "dataflow": config.pipeline_id,
         "target_table": bronze,
+        "load_kind": "backfill",
     }
     ledger = f"{require_catalog(config.catalog)}.framework_meta.{FILE_LEDGER}"
 
@@ -352,9 +359,9 @@ def _load(
         _remove(session, paths, bronze, quarantine)
         blocked = [item["src_file_path"] for item in files if item["status"] == FILE_FAILED]
         marked = apply_files(dict(stub), files)["_files"]
-        session.createDataFrame(file_records([{**stub, "_files": marked}], _now()), FILE_SCHEMA).write.mode(
-            "append"
-        ).saveAsTable(ledger)
+        session.createDataFrame(
+            file_records([{**stub, "_files": marked}], _now()), FILE_SCHEMA
+        ).write.mode("append").saveAsTable(ledger)
         good = frame.filter(f"{DQ_RESULT} = 'pass'")
         if blocked:
             keep = session.createDataFrame([(path,) for path in blocked], f"{SRC_FILE_PATH} STRING")
@@ -393,7 +400,7 @@ def _count_existing(spark: Any, paths: list[str], table: str) -> int:
 
 
 def _recorded_files(spark: Any, config: PipelineConfig, update_id: str) -> list[dict[str, Any]]:
-    """The files this backfill wrote to file_ledger, in the shape ``apply_files`` takes."""
+    """The files this backfill wrote to ledger_detail, in the shape ``apply_files`` takes."""
 
     meta = f"{require_catalog(config.catalog)}.framework_meta"
     rows = spark.sql(
@@ -413,15 +420,16 @@ def blocked_files(result: Result) -> list[dict[str, Any]]:
 
 def _as_file(row: Any) -> dict[str, Any]:
     data = row.asDict() if hasattr(row, "asDict") else dict(row)
+    dropped = int(data.get("rows_dropped") or 0) + int(data.get("rows_blocked") or 0)
     return {
+        "detail_kind": "file",
         "src_file_path": data[SRC_FILE_PATH],
         "src_file_name": data[SRC_FILE_NAME],
         "status": data[FILE_STATUS],
         "rows_read": data["rows_read"],
-        "rows_loaded": data["rows_loaded"],
+        "rows_inserted": data.get("rows_loaded") or data.get("rows_inserted") or 0,
         "rows_quarantined": data["rows_quarantined"],
-        "rows_dropped": data["rows_dropped"],
-        "rows_blocked": data["rows_blocked"],
+        "rows_dropped": dropped,
         "failed_rules": data["failed_rules"],
         "blocking_rules": data["blocking_rules"],
         "load_kind": "backfill",
@@ -474,24 +482,25 @@ def _record(
         "dataflow": config.pipeline_id,
         "owner_kind": config.owner_kind,
         "owner": config.owner,
+        "source_kind": config.source_kind or "",
+        "run_as": config.run_as or "",
+        "load_kind": "backfill",
         "target_table": config.table_name("bronze"),
         "quarantine_table": config.table_name("quarantine"),
         "started_at": started,
         "ended_at": ended,
         "duration_seconds": round(max((ended - started).total_seconds(), 0.0), 3),
         "rows_read": read,
-        "rows_written": written,
-        "rows_upserted": 0,
+        "rows_inserted": written,
+        "rows_updated": 0,
         "rows_deleted": result.rows_replaced,
-        "rows_quarantine": quarantined,
-        "rows_processed": written + quarantined,
+        "rows_quarantined": quarantined,
+        "rows_dropped": 0,
         "target_status": "COMPLETED",
         "quarantine_status": "COMPLETED",
         "expectations": "[]",
         "failure_reason": None,
         "batch_id": batch,
-        "rows_dropped": 0,
-        "rows_blocked": 0,
         "files_read": 0,
         "files_failed": 0,
         "_append": True,
@@ -499,7 +508,7 @@ def _record(
     apply_files(row, files)
     if row["files_failed"]:
         row["failure_reason"] = "backfill: " + str(row["failure_reason"])
-    # The loaded files are already in file_ledger, written as each micro-batch finished. What is
+    # The loaded files are already in ledger_detail, written as each micro-batch finished. What is
     # written here is the files that left no row of their own: asked for and not there, or read and
     # empty. The job still succeeds; the ledger says it failed.
     row["_files"] = _problem_files(config, result)
@@ -518,14 +527,14 @@ def _problem_files(config: PipelineConfig, result: Result) -> list[dict[str, Any
 
     def failed(path: str, name: str, why: str) -> dict[str, Any]:
         return {
+            "detail_kind": "file",
             "src_file_path": path,
             "src_file_name": name,
             "status": FILE_FAILED,
             "rows_read": 0,
-            "rows_loaded": 0,
+            "rows_inserted": 0,
             "rows_quarantined": 0,
             "rows_dropped": 0,
-            "rows_blocked": 0,
             "failed_rules": "",
             "blocking_rules": "",
             "error_message": why,
@@ -554,7 +563,9 @@ def _full_refresh(spark: Any, config: PipelineConfig, result: Result, *, confirm
     ]
     if blocking_rules(compile_rules(config)):
         # The check is what fails the update when a file is blocked, so it is refreshed too.
-        result.planned.append(f"{config.catalog}.{PIPELINE_SCHEMA}.{config.pipeline_id}_blocked_check")
+        result.planned.append(
+            f"{config.catalog}.{PIPELINE_SCHEMA}.{config.pipeline_id}_blocked_check"
+        )
     if result.dry_run:
         return result
     pipeline_uuid = _pipeline_uuid(spark, config)

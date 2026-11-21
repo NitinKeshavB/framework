@@ -11,10 +11,11 @@
 -- asset_id is a stable SHA-256 of source coordinates (not the display full_name), so a rename
 -- is a new version of the same asset rather than an unrelated object.
 --
--- load_ledger is append-only recon. pipeline_id is the spec id (joins v_pipelines), the
--- Lakeflow pipeline UUID from the event log is update_pipeline_uuid. Metric values also land
--- in load_metric (long shape) so new metrics do not require a wide-column ALTER.
--- job_runs / job_task_runs are append-only, v_job_runs / v_job_task_runs keep latest per key.
+-- load_ledger is append-only recon (sole load-grain SoR). pipeline_id is the spec id
+-- (joins v_pipelines). update_pipeline_uuid is the Lakeflow pipeline UUID from events.
+-- ledger_detail holds file (bronze) or input (curated) child rows. load_metric is retired.
+-- Hot run/recon tables keep about 90 days. Forever archives use PARTITIONED BY archive_quarter.
+-- job_runs / job_task_runs are append-only. Views keep latest per key.
 -- ownership_refusals replaces the vestigial run_ledger / run_current step tables.
 --
 -- Constraints are informational PRIMARY KEY / FOREIGN KEY (Unity Catalog) plus enforced
@@ -207,6 +208,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs (
   termination_code STRING,
   failure_reason STRING,
   trigger_type STRING,
+  run_as STRING,
   setup_seconds DOUBLE,
   queue_seconds DOUBLE,
   execution_seconds DOUBLE,
@@ -255,6 +257,7 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates (
   ended_at TIMESTAMP,
   state STRING,
   status STRING NOT NULL,
+  run_as STRING,
   recorded_at TIMESTAMP NOT NULL
 )
 CLUSTER BY (job_name, started_at)
@@ -266,6 +269,7 @@ ALTER TABLE ${catalog}.framework_meta.pipeline_updates DROP CONSTRAINT IF EXISTS
 ALTER TABLE ${catalog}.framework_meta.pipeline_updates ADD CONSTRAINT pipeline_updates_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED'));
 
 -- Append-only recon. pipeline_id = spec id, update_pipeline_uuid = Lakeflow UUID from events.
+-- Hot ~90 days. forever archive is PARTITIONED BY archive_quarter (Hive. not liquid clustered).
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
   job_name STRING NOT NULL,
   layer STRING NOT NULL,
@@ -277,22 +281,28 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
   dataflow STRING NOT NULL,
   owner_kind STRING NOT NULL,
   owner STRING NOT NULL,
+  source_kind STRING,
+  run_as STRING,
+  load_kind STRING NOT NULL,
   target_table STRING,
   quarantine_table STRING,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
   duration_seconds DOUBLE,
   rows_read BIGINT,
-  rows_written BIGINT,
-  rows_upserted BIGINT,
+  rows_inserted BIGINT,
+  rows_updated BIGINT,
   rows_deleted BIGINT,
-  rows_quarantine BIGINT,
-  rows_processed BIGINT,
+  rows_quarantined BIGINT,
+  rows_dropped BIGINT,
   target_status STRING,
   quarantine_status STRING,
   expectations STRING,
   failure_reason STRING,
-  recorded_at TIMESTAMP NOT NULL
+  recorded_at TIMESTAMP NOT NULL,
+  batch_id STRING,
+  files_read BIGINT,
+  files_failed BIGINT
 )
 CLUSTER BY (layer, job_name, started_at)
 TBLPROPERTIES (
@@ -303,27 +313,8 @@ ALTER TABLE ${catalog}.framework_meta.load_ledger DROP CONSTRAINT IF EXISTS load
 ALTER TABLE ${catalog}.framework_meta.load_ledger ADD CONSTRAINT load_ledger_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged'));
 ALTER TABLE ${catalog}.framework_meta.load_ledger DROP CONSTRAINT IF EXISTS load_ledger_owner_kind;
 ALTER TABLE ${catalog}.framework_meta.load_ledger ADD CONSTRAINT load_ledger_owner_kind CHECK (owner_kind IN ('source_system', 'project'));
-
--- Long-shape recon metrics (canonical for new metrics). Wide columns on load_ledger stay for
--- the frozen v_loads API, writers dual-write here.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_metric (
-  job_name STRING NOT NULL,
-  layer STRING NOT NULL,
-  update_id STRING NOT NULL,
-  dataflow STRING NOT NULL,
-  recorded_at TIMESTAMP NOT NULL,
-  metric_name STRING NOT NULL,
-  metric_value BIGINT
-)
-CLUSTER BY (job_name, layer, recorded_at)
-TBLPROPERTIES (
-  'delta.autoOptimize.optimizeWrite' = 'true',
-  'delta.autoOptimize.autoCompact' = 'true'
-);
-ALTER TABLE ${catalog}.framework_meta.load_metric DROP CONSTRAINT IF EXISTS load_metric_layer;
-ALTER TABLE ${catalog}.framework_meta.load_metric ADD CONSTRAINT load_metric_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged'));
-ALTER TABLE ${catalog}.framework_meta.load_metric DROP CONSTRAINT IF EXISTS load_metric_name;
-ALTER TABLE ${catalog}.framework_meta.load_metric ADD CONSTRAINT load_metric_name CHECK (metric_name IN ('rows_read', 'rows_written', 'rows_upserted', 'rows_deleted', 'rows_quarantine', 'rows_processed', 'rows_dropped', 'rows_blocked', 'files_read', 'files_failed'));
+ALTER TABLE ${catalog}.framework_meta.load_ledger DROP CONSTRAINT IF EXISTS load_ledger_load_kind;
+ALTER TABLE ${catalog}.framework_meta.load_ledger ADD CONSTRAINT load_ledger_load_kind CHECK (load_kind IN ('regular', 'backfill', 'catchup'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
   job_name STRING NOT NULL,
@@ -336,71 +327,58 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
   dataflow STRING NOT NULL,
   owner_kind STRING NOT NULL,
   owner STRING NOT NULL,
+  source_kind STRING,
+  run_as STRING,
+  load_kind STRING NOT NULL,
   target_table STRING,
   quarantine_table STRING,
   started_at TIMESTAMP,
   ended_at TIMESTAMP,
   duration_seconds DOUBLE,
   rows_read BIGINT,
-  rows_written BIGINT,
-  rows_upserted BIGINT,
+  rows_inserted BIGINT,
+  rows_updated BIGINT,
   rows_deleted BIGINT,
-  rows_quarantine BIGINT,
-  rows_processed BIGINT,
+  rows_quarantined BIGINT,
+  rows_dropped BIGINT,
   target_status STRING,
   quarantine_status STRING,
   expectations STRING,
   failure_reason STRING,
   recorded_at TIMESTAMP NOT NULL,
-  archived_at TIMESTAMP NOT NULL
+  batch_id STRING,
+  files_read BIGINT,
+  files_failed BIGINT,
+  archived_at TIMESTAMP NOT NULL,
+  archive_quarter STRING NOT NULL
 )
-CLUSTER BY (layer, job_name, started_at)
+PARTITIONED BY (archive_quarter)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- batch_id is the _batch_id the pipeline stamped on every bronze row of that run, so a row
--- joins to its load. It sits right after recorded_at in both tables because the archive move
--- copies by position (h.*, then archived_at). A repeat is skipped by apply_ddl.
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN batch_id STRING AFTER recorded_at;
-ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN batch_id STRING AFTER recorded_at;
-
--- Counts for rows a rule dropped or a blocked file kept out, and for files. They follow batch_id,
--- in the same order in both tables, for the same reason. A count is never NULL: the pipeline
--- writes 0 for a load that failed or read nothing.
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN rows_dropped BIGINT AFTER batch_id;
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN rows_blocked BIGINT AFTER rows_dropped;
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN files_read BIGINT AFTER rows_blocked;
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD COLUMN files_failed BIGINT AFTER files_read;
-ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN rows_dropped BIGINT AFTER batch_id;
-ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN rows_blocked BIGINT AFTER rows_dropped;
-ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN files_read BIGINT AFTER rows_blocked;
-ALTER TABLE ${catalog}.framework_meta.load_ledger_archive ADD COLUMN files_failed BIGINT AFTER files_read;
-
--- Scratch space for a backfill's Auto Loader state (schema and checkpoint). It is apart from every
--- source volume, so the pipelines never read it as a new file.
+-- Scratch space for a backfill's Auto Loader state (schema and checkpoint).
 CREATE VOLUME IF NOT EXISTS ${catalog}.framework_meta.backfill_state
 COMMENT 'Checkpoints of framework_backfill runs. Safe to delete a run folder once it has finished.';
 
--- One row per file per load of a file source: the file, its counts, its status, and why it failed.
--- status: PROCESSED (all rows kept), WARNING (some rows quarantined or dropped), FAILED (a fail rule
--- blocked it: none of its rows loaded to bronze). load_kind: regular or backfill.
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.file_ledger (
+-- Child unit-of-work rows: detail_kind=file (bronze paths) or input (curated upstream FQN).
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail (
   job_name STRING NOT NULL,
   layer STRING NOT NULL,
   update_id STRING NOT NULL,
   batch_id STRING,
   dataflow STRING NOT NULL,
   target_table STRING,
-  src_file_path STRING NOT NULL,
+  detail_kind STRING NOT NULL,
+  src_object STRING,
+  src_file_path STRING,
   src_file_name STRING,
   status STRING NOT NULL,
   rows_read BIGINT,
-  rows_loaded BIGINT,
+  rows_inserted BIGINT,
   rows_quarantined BIGINT,
   rows_dropped BIGINT,
-  rows_blocked BIGINT,
   failed_rules STRING,
   blocking_rules STRING,
   error_message STRING,
@@ -412,20 +390,36 @@ TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.file_ledger DROP CONSTRAINT IF EXISTS file_ledger_status;
-ALTER TABLE ${catalog}.framework_meta.file_ledger ADD CONSTRAINT file_ledger_status CHECK (status IN ('PROCESSED', 'WARNING', 'FAILED'));
+ALTER TABLE ${catalog}.framework_meta.ledger_detail DROP CONSTRAINT IF EXISTS ledger_detail_status;
+ALTER TABLE ${catalog}.framework_meta.ledger_detail ADD CONSTRAINT ledger_detail_status CHECK (status IN ('PROCESSED', 'WARNING', 'FAILED'));
+ALTER TABLE ${catalog}.framework_meta.ledger_detail DROP CONSTRAINT IF EXISTS ledger_detail_kind;
+ALTER TABLE ${catalog}.framework_meta.ledger_detail ADD CONSTRAINT ledger_detail_kind CHECK (detail_kind IN ('file', 'input'));
 
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_metric_archive (
+CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail_archive (
   job_name STRING NOT NULL,
   layer STRING NOT NULL,
   update_id STRING NOT NULL,
+  batch_id STRING,
   dataflow STRING NOT NULL,
+  target_table STRING,
+  detail_kind STRING NOT NULL,
+  src_object STRING,
+  src_file_path STRING,
+  src_file_name STRING,
+  status STRING NOT NULL,
+  rows_read BIGINT,
+  rows_inserted BIGINT,
+  rows_quarantined BIGINT,
+  rows_dropped BIGINT,
+  failed_rules STRING,
+  blocking_rules STRING,
+  error_message STRING,
+  load_kind STRING,
   recorded_at TIMESTAMP NOT NULL,
-  metric_name STRING NOT NULL,
-  metric_value BIGINT,
-  archived_at TIMESTAMP NOT NULL
+  archived_at TIMESTAMP NOT NULL,
+  archive_quarter STRING NOT NULL
 )
-CLUSTER BY (job_name, layer, recorded_at)
+PARTITIONED BY (archive_quarter)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
@@ -445,15 +439,17 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs_archive (
   termination_code STRING,
   failure_reason STRING,
   trigger_type STRING,
+  run_as STRING,
   setup_seconds DOUBLE,
   queue_seconds DOUBLE,
   execution_seconds DOUBLE,
   run_seconds DOUBLE,
   run_page_url STRING,
   recorded_at TIMESTAMP NOT NULL,
-  archived_at TIMESTAMP NOT NULL
+  archived_at TIMESTAMP NOT NULL,
+  archive_quarter STRING NOT NULL
 )
-CLUSTER BY (job_name, started_at)
+PARTITIONED BY (archive_quarter)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
@@ -474,9 +470,10 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs_archive (
   termination_code STRING,
   failure_reason STRING,
   recorded_at TIMESTAMP NOT NULL,
-  archived_at TIMESTAMP NOT NULL
+  archived_at TIMESTAMP NOT NULL,
+  archive_quarter STRING NOT NULL
 )
-CLUSTER BY (job_name, started_at)
+PARTITIONED BY (archive_quarter)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
@@ -491,10 +488,12 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates_archive (
   ended_at TIMESTAMP,
   state STRING,
   status STRING NOT NULL,
+  run_as STRING,
   recorded_at TIMESTAMP NOT NULL,
-  archived_at TIMESTAMP NOT NULL
+  archived_at TIMESTAMP NOT NULL,
+  archive_quarter STRING NOT NULL
 )
-CLUSTER BY (job_name, started_at)
+PARTITIONED BY (archive_quarter)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
@@ -762,15 +761,6 @@ SELECT
 FROM ${catalog}.framework_meta.v_asset_registry_history
 WHERE object_kind = 'column';
 
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_bronze_tables AS
-SELECT DISTINCT
-  config:table::STRING AS table_name,
-  owner_kind,
-  owner
-FROM ${catalog}.framework_meta.asset_registry_current
-WHERE object_kind = 'flow'
-  AND config:layer::STRING = 'bronze';
-
 -- Tags are parked (unity.APPLY_TAGS = False). Flip drift_enabled.on to true when tags apply.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_metadata_drift AS
 WITH drift_enabled AS (
@@ -938,6 +928,7 @@ SELECT
   run.termination_code,
   run.failure_reason,
   run.trigger_type,
+  run.run_as,
   run.setup_seconds,
   run.queue_seconds,
   run.execution_seconds,
@@ -1015,7 +1006,8 @@ SELECT
   pu.ended_at,
   (unix_millis(pu.ended_at) - unix_millis(pu.started_at)) / 1000.0 AS duration_seconds,
   pu.state,
-  pu.status
+  pu.status,
+  pu.run_as
 FROM ${catalog}.framework_meta.pipeline_updates pu
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;
 
@@ -1031,25 +1023,26 @@ SELECT
   dataflow,
   owner_kind,
   owner,
+  source_kind,
+  run_as,
+  load_kind,
   target_table,
   quarantine_table,
   started_at,
   ended_at,
   duration_seconds,
   rows_read,
-  rows_written,
-  rows_upserted,
+  rows_inserted,
+  rows_updated,
   rows_deleted,
-  rows_quarantine,
-  rows_processed,
+  rows_quarantined,
+  coalesce(rows_dropped, 0) AS rows_dropped,
   target_status,
   quarantine_status,
   expectations,
   failure_reason,
   recorded_at,
   batch_id,
-  coalesce(rows_dropped, 0) AS rows_dropped,
-  coalesce(rows_blocked, 0) AS rows_blocked,
   coalesce(files_read, 0) AS files_read,
   coalesce(files_failed, 0) AS files_failed
 FROM ${catalog}.framework_meta.load_ledger
@@ -1058,51 +1051,32 @@ QUALIFY row_number() OVER (
   ORDER BY recorded_at DESC
 ) = 1;
 
--- Long-shape recon for BI / new metrics without wide-column ALTERs.
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_load_metrics AS
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ledger_detail AS
 SELECT
   job_name,
   layer,
   update_id,
+  batch_id,
   dataflow,
-  recorded_at,
-  metric_name,
-  metric_value
-FROM ${catalog}.framework_meta.load_metric
+  target_table,
+  detail_kind,
+  src_object,
+  src_file_path,
+  src_file_name,
+  status,
+  rows_read,
+  rows_inserted,
+  rows_quarantined,
+  rows_dropped,
+  failed_rules,
+  blocking_rules,
+  error_message,
+  load_kind,
+  recorded_at
+FROM ${catalog}.framework_meta.ledger_detail
 QUALIFY row_number() OVER (
-  PARTITION BY job_name, layer, update_id, dataflow, metric_name
-  ORDER BY recorded_at DESC
-) = 1;
-
-CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads_90d AS
-WITH combined AS (
-  SELECT
-    job_name, layer, job_run_id, pipeline_id, update_pipeline_uuid, pipeline_name, update_id,
-    dataflow, owner_kind, owner,
-    target_table, quarantine_table, started_at, ended_at, duration_seconds,
-    rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
-    target_status, quarantine_status, expectations, failure_reason, recorded_at, batch_id,
-    rows_dropped, rows_blocked, files_read, files_failed,
-    CAST(NULL AS TIMESTAMP) AS archived_at
-  FROM ${catalog}.framework_meta.v_loads
-  WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
-  UNION ALL
-  SELECT
-    job_name, layer, job_run_id, pipeline_id, update_pipeline_uuid, pipeline_name, update_id,
-    dataflow, owner_kind, owner,
-    target_table, quarantine_table, started_at, ended_at, duration_seconds,
-    rows_read, rows_written, rows_upserted, rows_deleted, rows_quarantine, rows_processed,
-    target_status, quarantine_status, expectations, failure_reason, recorded_at, batch_id,
-    coalesce(rows_dropped, 0), coalesce(rows_blocked, 0), coalesce(files_read, 0),
-    coalesce(files_failed, 0),
-    archived_at
-  FROM ${catalog}.framework_meta.load_ledger_archive
-  WHERE coalesce(started_at, recorded_at) >= current_timestamp() - INTERVAL 90 DAYS
-)
-SELECT *
-FROM combined
-QUALIFY row_number() OVER (
-  PARTITION BY job_name, layer, update_id, dataflow
+  PARTITION BY job_name, layer, update_id, dataflow, detail_kind,
+    coalesce(src_file_path, ''), coalesce(src_object, '')
   ORDER BY recorded_at DESC
 ) = 1;
 
@@ -1110,6 +1084,9 @@ CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_load_failures AS
 SELECT
   l.job_name,
   l.layer,
+  l.source_kind,
+  l.run_as,
+  l.load_kind,
   l.dataflow,
   l.target_table,
   l.update_id,
@@ -1119,12 +1096,11 @@ SELECT
   l.quarantine_status,
   l.failure_reason AS load_failure_reason,
   l.rows_read,
-  l.rows_written,
-  l.rows_upserted,
+  l.rows_inserted,
+  l.rows_updated,
   l.rows_deleted,
-  l.rows_quarantine,
+  l.rows_quarantined,
   l.rows_dropped,
-  l.rows_blocked,
   l.files_read,
   l.files_failed,
   l.started_at AS load_started_at,
@@ -1135,6 +1111,7 @@ SELECT
   j.result_state AS job_result_state,
   j.termination_code,
   j.failure_reason AS job_failure_reason,
+  j.run_as AS job_run_as,
   j.run_page_url,
   j.started_at AS job_started_at,
   t.task_key,

@@ -26,9 +26,9 @@ Rules of different actions mix in one table. A row that fails a `quarantine` rul
 
 **What `fail` does, for a table loaded from files.** One row that breaks a `fail` rule blocks its **whole file**:
 
-- None of that file's rows reach bronze. Its bad rows go to quarantine, so you can see what was wrong. Its good rows are not kept anywhere, and are counted as `rows_blocked`.
+- None of that file's rows reach bronze. Its bad rows go to quarantine, so you can see what was wrong. Its good rows are not kept anywhere, and are counted in `rows_dropped` on the ledger.
 - The other files of the run load normally. With 100 files and 3 bad ones, 97 load, 3 are blocked, and all 3 are named.
-- The pipeline update, and so the job, **fails**, with the file names and rules in the error. The run is `FAILED` in `load_ledger` with `files_failed` set, and each blocked file is `FAILED` in `file_ledger`.
+- The pipeline update, and so the job, **fails**, with the file names and rules in the error. The run is `FAILED` in `load_ledger` with `files_failed` set, and each blocked file is `FAILED` in `ledger_detail`.
 - **The file is marked as read.** The next run does not pick it up, so it does not fail again. To load a blocked file you fix the data or the rule and run a backfill (below). A retry of the same update never succeeds by skipping the file: automatic retry of a failed update is turned off for these pipelines for that reason (`pipelines.numUpdateRetryAttempts` is 0).
 - **A rule change applies from the next run.** What a row's rules mean is decided once, when the file is read, and stored. Files already read are never judged again by a changed rule, unless you backfill them.
 
@@ -44,7 +44,7 @@ Not available yet: a limit such as "fail only when more than 5% of rows are bad"
 
 A scheduled delivery runs whether or not a file arrived, so a table in one **expects a file with rows each run** (`source.expect_file`, on by default for a scheduled delivery, off for one fired by a file arriving; set it per table to change that). The job always **succeeds**; the ledger says what the data did:
 
-| What happened | `load_ledger` | `file_ledger` |
+| What happened | `load_ledger` | `ledger_detail` |
 | --- | --- | --- |
 | No file arrived since the previous run | `FAILED`, reason `no file arrived in <folder> since the previous run`; every count is 0 | no row (there is no file to name) |
 | A file arrived and has no rows (0 bytes, or a header and nothing else) | `FAILED`, reason `N file(s) arrived with no rows: <names>`; `files_failed` counts them | one row per file: `FAILED`, `file has no rows`, counts 0 |
@@ -72,13 +72,13 @@ One job, `framework_backfill` (in `framework_bundle`), reloads any table. It loa
 - `full_refresh` refreshes the table's own pipeline with a full refresh of that table: it deletes the table's data and reads every file again under the current rules. It also resets the table's change feed history, so a silver table that reads it must be rebuilt. Blocked files are judged again, and fail again unless the rule or the file changed.
 - Not supported by file: tables that keep history by key (`scd1`, `scd2`) and tables loaded from a database. Use `full_refresh` for those.
 
-Each run's ledger row shows `rows_read = rows_written + rows_quarantine + rows_dropped + rows_blocked`; a warning is logged if it does not.
+Each run's ledger row shows `rows_read ≈ rows_inserted + rows_quarantined + rows_dropped` (blocked good rows fold into `rows_dropped`); a warning is logged if it does not.
 
 ## How a rule behaves
 
 - **One rule, one condition.** The rule must be **true** for a good row. Anything else fails it, **including NULL**. A column that may be empty must say so: `phone IS NULL OR phone rlike '...'`.
 - **Every rule runs on every row.** The row does not stop at the first failure. It carries the names of all the rules it failed in `failed_rules`, so name each rule for what it checks.
-- **By default a failing rule does not fail the load.** The good rows load, the bad rows go to `<bronze table>_qrntn`, and the run shows `COMPLETED` with `rows_quarantine` set. Change that with `on_bad_rows` and `on_fail` (above).
+- **By default a failing rule does not fail the load.** The good rows load, the bad rows go to `<bronze table>_qrntn`, and the run shows `COMPLETED` with `rows_quarantined` set. Change that with `on_bad_rows` and `on_fail` (above).
 - **A row is in bronze or in quarantine, never both.**
 - **Rules are about one row.** They can look at that row's columns and nothing else (see "What a rule cannot do").
 

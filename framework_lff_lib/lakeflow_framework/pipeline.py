@@ -368,6 +368,8 @@ def _install_recorder(
                     else ""
                 ),
                 path=config.path if is_file_load(config) else "",
+                source_kind=config.source_kind,
+                run_as=config.run_as,
             )
         )
     recorder = UpdateRecorder(
@@ -459,7 +461,7 @@ def arrivals_sql(config: PipelineConfig, inventory: str, files: str) -> str:
         f"f.{SRC_FILE_PATH} IS NOT NULL AS has_rows, l.src_file_path IS NOT NULL AS recorded_before "
         f"FROM {inventory} i "
         f"LEFT JOIN {files} f ON f.{SRC_FILE_PATH} = i.file_path "
-        f"LEFT JOIN (SELECT DISTINCT src_file_path FROM {PIPELINE_SCHEMA}.file_ledger "
+        f"LEFT JOIN (SELECT DISTINCT src_file_path FROM {PIPELINE_SCHEMA}.ledger_detail "
         f"WHERE dataflow = {pid}) l ON l.src_file_path = i.file_path "
         "WHERE i.arrived_at > coalesce(("
         f"SELECT max(started_at) FROM {ledger} WHERE dataflow = {pid} "

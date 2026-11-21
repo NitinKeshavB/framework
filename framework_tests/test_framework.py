@@ -552,8 +552,8 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "PRIMARY KEY" in text
     assert "ref_object_kind" in text
     assert "update_pipeline_uuid" in text
-    assert "v_load_metrics" in text
-    assert "load_metric" in text
+    assert "v_load_metrics" not in text
+    assert "CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_metric " not in text
     assert "drift_enabled" in text and "false AS enabled" in text
     # ``project`` appears only as an owner_kind enum value, not as a remnant object_kind.
     assert "object_kind = 'project'" not in text
@@ -581,7 +581,10 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "get_json_object" not in text
     assert "config:pipeline_ids::ARRAY<STRING>" in text
     assert "framework_meta.table_health" not in text
-    assert "v_bronze_tables" in text
+    assert "v_bronze_tables" not in text
+    assert "ledger_detail" in text
+    assert "v_ledger_detail" in text
+    assert "archive_quarter" in text
     history = text.split("v_asset_registry_history", 1)[1]
     assert "is_deleted" in history.split(";")[0] and "LEAD(" not in history.split(";")[0]
     assert "CREATE BLOOMFILTER INDEX" not in text

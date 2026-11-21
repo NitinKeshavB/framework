@@ -158,7 +158,7 @@ resources:
             python_file: ../src/archive_hot.py
             parameters:
               - ${var.catalog}
-              - "7"
+              - "90"
       environments:
         - environment_key: framework_env
           spec:
@@ -166,4 +166,4 @@ resources:
             dependencies:
               - ../../framework_lff_lib/dist/*.whl
 
-    # Recon is load_ledger / file_ledger / v_loads, written by each pipeline's event hook.
+    # Recon is load_ledger / ledger_detail / v_loads, written by each pipeline's event hook.

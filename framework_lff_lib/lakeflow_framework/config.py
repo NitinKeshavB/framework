@@ -234,6 +234,8 @@ class PipelineConfig:
     source_table: str = ""
     source_mode: str = ""
     delivery: str = ""
+    source_kind: str = ""  # sftp_files / sharepoint_files / database / …
+    run_as: str = ""  # service principal from source.yaml; empty = deployer default
     source_options: SourceOptions | None = None
 
     @property
@@ -702,6 +704,8 @@ def compose_document(
     else:
         kinds = ", ".join([*FILE_KINDS, DATABASE_KIND])
         return spec, [f"{label}: {source_file} kind must be one of {kinds} for a source section"]
+    document["source_kind"] = kind
+    document["run_as"] = str(source.get("run_as") or "").strip()
     return document, []
 
 
@@ -897,6 +901,8 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         pipeline_id=pipeline_id,
         requested_by=requested_by,
         source_system=source_system,
+        source_kind=str(document.get("source_kind") or ""),
+        run_as=str(document.get("run_as") or "").strip(),
         table=bronze_table,
         load_method=load_method,
         file_format=file_format,

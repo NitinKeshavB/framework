@@ -92,8 +92,8 @@ Query `<catalog>.framework_meta`:
 | `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
 | `v_lineage` | Links from a pipeline to its tables |
 | `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` (written by the hourly `framework_runs` job, which also records runs that never reached the pipeline) |
-| `v_loads`, `v_load_failures` | Per-load recon and failures, written by the pipeline itself once per update (an event hook): rows read, written, upserted, deleted, quarantined, dropped and blocked, files read and failed, status, and the error. Counts are never NULL. `batch_id` joins a row to its load. A job can succeed while its load is `FAILED` (a file did not come, or came empty) |
-| `file_ledger` | One row per file per load: status (`PROCESSED`, `WARNING`, `FAILED`), its counts, the rules that blocked it, and why it failed. `load_kind` says whether a regular load or a backfill wrote it |
+| `v_loads`, `v_load_failures` | Per-load recon and failures, written by the pipeline itself once per update (an event hook): `source_kind`, `run_as`, `load_kind`; rows read/inserted/updated/deleted/quarantined/dropped; files read and failed; status and error. Counts are never NULL. A job can succeed while its load is `FAILED` (a file did not come, or came empty) |
+| `v_ledger_detail` | Child file/input rows: status (`PROCESSED`, `WARNING`, `FAILED`), counts, rules, and why it failed. `detail_kind` is `file` or `input`; `load_kind` is regular, backfill, or catchup |
 | `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
 | `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
 | `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations (recorded hourly) |
@@ -101,7 +101,7 @@ Query `<catalog>.framework_meta`:
 | `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
 | `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source. Only when `system_views` is `true` |
 
-Filter by `owner`. Definitions are SCD Type 2: a changed spec closes its old version, a removed spec gets a deletion version, and nothing is deleted. Events (`run_ledger`, `load_ledger`) are insert-only.
+Filter by `owner`. Definitions are SCD Type 2: a changed spec closes its old version, a removed spec gets a deletion version, and nothing is deleted. Events (`load_ledger`, `ledger_detail`, `job_runs`) are insert-only.
 
 ```sql
 -- latest status for every job owned by billing

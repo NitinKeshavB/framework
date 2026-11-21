@@ -95,7 +95,7 @@ raw_to_bronze:
 
 ## Quality rules and quarantine
 
-`raw_to_bronze.rules` holds SQL conditions every good row must meet. By default, a row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantine` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.
+`raw_to_bronze.rules` holds SQL conditions every good row must meet. By default, a row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantined` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.
 
 ```yaml
 raw_to_bronze:
@@ -165,18 +165,19 @@ The pipeline records its own load, once per update, in `framework_meta.load_ledg
 | Column | Meaning |
 | --- | --- |
 | `rows_read` | Rows taken from the source files or table |
-| `rows_written`, `rows_upserted`, `rows_deleted` | What happened in the bronze table |
-| `rows_quarantine` | Rows that failed a rule |
+| `rows_inserted`, `rows_updated`, `rows_deleted` | What happened in the target table |
+| `rows_quarantined`, `rows_dropped` | Rows that failed a rule (quarantine vs drop/block) |
+| `source_kind`, `run_as`, `load_kind` | Source type, identity, and regular / backfill / catchup |
 | `target_status`, `quarantine_status` | `COMPLETED`, `FAILED`, or `CANCELED` |
 | `failure_reason` | The error the run reported, or why the table could not register |
 | `batch_id`, `update_id` | The `_batch_id` on the rows, and the Databricks update |
 
-Counts are always numbers. A run with no new files records zeros. In a failed run, the counts of a step that did not finish are zero, and the error text is kept. A table whose spec cannot register is recorded `FAILED` with that error, and the other tables in the delivery still load.
+Counts are always numbers. A run with no new files records zeros. In a failed run, the counts of a step that did not finish are zero, and the error text is kept. A table whose spec cannot register is recorded `FAILED` with that error, and the other tables in the delivery still load. Child file/input rows land in `ledger_detail` (`v_ledger_detail`).
 
 The job has one task, the pipeline refresh. Job runs themselves are recorded hourly by `framework_runs` (it also catches runs that never reached the pipeline). The pipeline cannot see which job run started it, so `job_run_id` is empty in the ledger; `v_load_failures` joins to the run by time.
 
 ```sql
-SELECT dataflow, target_table, rows_read, rows_written, rows_quarantine, target_status, failure_reason
+SELECT dataflow, target_table, load_kind, rows_read, rows_inserted, rows_quarantined, target_status, failure_reason
 FROM <catalog>.framework_meta.v_loads WHERE job_name = 'abs_daily' ORDER BY started_at DESC;
 ```
 

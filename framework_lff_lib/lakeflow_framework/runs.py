@@ -42,6 +42,7 @@ JOB_RUN_COLUMNS = (
     "termination_code",
     "failure_reason",
     "trigger_type",
+    "run_as",
     "setup_seconds",
     "queue_seconds",
     "execution_seconds",
@@ -74,6 +75,7 @@ PIPELINE_UPDATE_COLUMNS = (
     "ended_at",
     "state",
     "status",
+    "run_as",
     "recorded_at",
 )
 _TIMESTAMPS = {"started_at", "ended_at", "recorded_at"}
@@ -113,12 +115,18 @@ def job_run_rows(
     deployed_name: str,
     workspace_id: str,
     recorded_at: datetime,
+    run_as: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """One job_runs row and its job_task_runs rows, from a Jobs API run as a dict."""
 
     life, result, code = _state(run)
     job_id = _text(run.get("job_id"))
     run_id = _text(run.get("run_id"))
+    # Prefer explicit arg (registry); fall back to Jobs API run_as when present.
+    api_run_as = ""
+    raw_run_as = run.get("run_as")
+    if isinstance(raw_run_as, Mapping):
+        api_run_as = _text(raw_run_as.get("service_principal_name") or raw_run_as.get("user_name"))
     row = {
         "job_name": job_name,
         "deployed_name": deployed_name,
@@ -133,6 +141,7 @@ def job_run_rows(
         "termination_code": code,
         "failure_reason": _failure_reason(run),
         "trigger_type": _text(run.get("trigger")),
+        "run_as": run_as or api_run_as or "",
         "setup_seconds": _seconds(run.get("setup_duration")),
         "queue_seconds": _seconds(run.get("queue_duration")),
         "execution_seconds": _seconds(run.get("execution_duration")),
@@ -262,7 +271,14 @@ def job_runs_from_system_sql(meta: str, since: datetime, recorded: datetime) -> 
     tag = WORKFLOW_TAG
     return f"""
 WITH workflows AS (
-  SELECT job_name FROM {meta}.v_workflows
+  SELECT
+    w.full_name AS job_name,
+    coalesce(s.config:run_as::STRING, '') AS run_as
+  FROM {meta}.asset_registry_current w
+  LEFT JOIN {meta}.asset_registry_current s
+    ON s.object_kind = 'source_system'
+   AND s.full_name = w.config:source_system::STRING
+  WHERE w.object_kind = 'workflow'
 ),
 jobs AS (
   SELECT workspace_id, job_id, name AS deployed_name, tags['{tag}'] AS job_name
@@ -307,31 +323,33 @@ runs AS (
   GROUP BY j.job_name, j.deployed_name, t.workspace_id, t.job_id, t.run_id
 )
 SELECT
-  job_name,
-  deployed_name,
-  workspace_id,
-  job_id,
-  run_id,
-  started_at,
-  CASE WHEN result_state IS NULL THEN CAST(NULL AS TIMESTAMP) ELSE ended_at END AS ended_at,
+  r.job_name,
+  r.deployed_name,
+  r.workspace_id,
+  r.job_id,
+  r.run_id,
+  r.started_at,
+  CASE WHEN r.result_state IS NULL THEN CAST(NULL AS TIMESTAMP) ELSE r.ended_at END AS ended_at,
   CASE
-    WHEN result_state IS NULL THEN 'RUNNING'
-    WHEN result_state = 'SUCCEEDED' THEN 'SUCCEEDED'
-    WHEN result_state IN ('SKIPPED', 'BLOCKED') THEN 'SKIPPED'
+    WHEN r.result_state IS NULL THEN 'RUNNING'
+    WHEN r.result_state = 'SUCCEEDED' THEN 'SUCCEEDED'
+    WHEN r.result_state IN ('SKIPPED', 'BLOCKED') THEN 'SKIPPED'
     ELSE 'FAILED'
   END AS status,
-  CASE WHEN result_state IS NULL THEN 'RUNNING' ELSE 'TERMINATED' END AS life_cycle_state,
-  result_state,
-  termination_code,
+  CASE WHEN r.result_state IS NULL THEN 'RUNNING' ELSE 'TERMINATED' END AS life_cycle_state,
+  r.result_state,
+  r.termination_code,
   CAST(NULL AS STRING) AS failure_reason,
-  trigger_type,
-  CAST(setup_seconds AS DOUBLE) AS setup_seconds,
-  CAST(queue_seconds AS DOUBLE) AS queue_seconds,
-  CAST(execution_seconds AS DOUBLE) AS execution_seconds,
-  CAST(run_seconds AS DOUBLE) AS run_seconds,
+  r.trigger_type,
+  coalesce(w.run_as, '') AS run_as,
+  CAST(r.setup_seconds AS DOUBLE) AS setup_seconds,
+  CAST(r.queue_seconds AS DOUBLE) AS queue_seconds,
+  CAST(r.execution_seconds AS DOUBLE) AS execution_seconds,
+  CAST(r.run_seconds AS DOUBLE) AS run_seconds,
   CAST(NULL AS STRING) AS run_page_url,
   TIMESTAMP '{stamped}' AS recorded_at
-FROM runs
+FROM runs r
+LEFT JOIN workflows w ON w.job_name = r.job_name
 """
 
 

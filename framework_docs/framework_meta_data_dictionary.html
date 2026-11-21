@@ -106,7 +106,7 @@
   <main>
     <section class="intro">
       <p><strong>How to use:</strong> filter tables and views below, open a card for purpose and grain, then download this page as a standalone HTML file for offline sharing. Physical relationships are in the <a href="https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit" target="_blank" rel="noopener">Lucidchart ER diagram</a>.</p>
-      <p>Schema: <code>&lt;catalog&gt;.framework_meta</code> (frozen — see <code>META_MODEL_REVIEW.md</code>). Per-delivery event logs (<code>&lt;job&gt;_event_log</code>) are created by pipelines. Each pipeline writes its own recon (<code>load_ledger</code>, <code>file_ledger</code>, <code>load_metric</code>) with an event hook; hourly <code>framework_runs</code> records job runs and pipeline updates, and writes the ledger row of an update whose hook was cut off.</p>
+      <p>Schema: <code>&lt;catalog&gt;.framework_meta</code> (frozen — see <code>META_MODEL_REVIEW.md</code>). Per-delivery event logs (<code>&lt;job&gt;_event_log</code>) are created by pipelines. Each pipeline writes its own recon (<code>load_ledger</code>, <code>ledger_detail</code>) with an event hook; hourly <code>framework_runs</code> records job runs and pipeline updates, and writes the ledger row of an update whose hook was cut off.</p>
     </section>
 
     <div class="filters" id="filters">
@@ -147,8 +147,8 @@
       {
         kind: "table", name: "job_runs",
         writtenBy: "framework_runs (hourly)", grain: "One Jobs API run of a framework job",
-        purpose: "Append-only run events for delivery and framework jobs tagged lakeflow_framework_workflow. Recorded hourly, preferring system.lakeflow (Jobs API fallback). v_job_runs keeps latest recorded_at per (job_id, run_id). Hot ~7 days; older rows move to job_runs_archive.",
-        columns: ["job_name", "deployed_name", "job_id", "run_id", "started_at", "ended_at", "status", "result_state", "termination_code", "failure_reason", "run_seconds", "run_page_url", "recorded_at"]
+        purpose: "Append-only run events for delivery and framework jobs tagged lakeflow_framework_workflow. Recorded hourly, preferring system.lakeflow (Jobs API fallback). v_job_runs keeps latest recorded_at per (job_id, run_id). Hot ~90 days; older rows move to job_runs_archive.",
+        columns: ["job_name", "deployed_name", "job_id", "run_id", "started_at", "ended_at", "status", "result_state", "termination_code", "failure_reason", "trigger_type", "run_as", "run_seconds", "run_page_url", "recorded_at"]
       },
       {
         kind: "table", name: "job_task_runs",
@@ -160,31 +160,37 @@
         kind: "table", name: "pipeline_updates",
         writtenBy: "framework_runs (hourly)", grain: "One Lakeflow pipeline update",
         purpose: "Update start/end/state from each delivery pipeline's published event log (update_progress events).",
-        columns: ["job_name", "pipeline_id", "pipeline_name", "update_id", "started_at", "ended_at", "state", "status", "recorded_at"]
+        columns: ["job_name", "pipeline_id", "pipeline_name", "update_id", "started_at", "ended_at", "state", "status", "run_as", "recorded_at"]
       },
       {
         kind: "table", name: "load_ledger",
-        writtenBy: "the pipeline's event hook · framework_backfill · framework_runs (an update whose hook was cut off)", grain: "One load of one table in one update",
-        purpose: "Sole recon SoR: append-only counts — one row per registered dataflow per update. Every count is a number (0 for a load that failed or read nothing). FAILED when the table failed or could not register, a file broke a fail rule, a table that expects a file got none, or a file arrived with no rows (the job can still succeed). rows_read = rows_written + rows_quarantine + rows_dropped + rows_blocked for an append load. batch_id is the _batch_id stamped on the rows of that run. A backfill has update_id starting backfill-. No MERGE. Hot ~7 days; older rows move to load_ledger_archive.",
-        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_id", "dataflow", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "rows_quarantine", "rows_processed", "target_status", "expectations", "failure_reason", "recorded_at", "batch_id", "rows_dropped", "rows_blocked", "files_read", "files_failed"]
+        writtenBy: "the pipeline's event hook · framework_backfill · framework_runs (catch-up)", grain: "One load of one table in one update",
+        purpose: "Unified recon SoR for all layers: append-only one row per registered dataflow per update. Keys include source_kind, run_as, load_kind (regular|backfill|catchup). Counts are numbers (0 when failed/empty): rows_read/inserted/updated/deleted/quarantined/dropped plus files_read/files_failed. FAILED when the table failed or could not register, a file broke a fail rule, expected file missing/empty. Hot ~90 days; older rows move to load_ledger_archive PARTITIONED BY archive_quarter. Query v_loads / v_load_failures.",
+        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_pipeline_uuid", "pipeline_name", "update_id", "dataflow", "owner_kind", "owner", "source_kind", "run_as", "load_kind", "target_table", "quarantine_table", "started_at", "ended_at", "duration_seconds", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined", "rows_dropped", "target_status", "quarantine_status", "expectations", "failure_reason", "recorded_at", "batch_id", "files_read", "files_failed"]
       },
       {
-        kind: "table", name: "file_ledger",
-        writtenBy: "the pipeline's event hook · framework_backfill · framework_runs", grain: "One file in one load",
-        purpose: "What happened to each file: PROCESSED, WARNING (some rows quarantined or dropped), or FAILED (a fail rule blocked it, it has no rows, or a backfill could not find it). Counts are numbers, 0 for a blocked, empty or missing file. blocking_rules names the fail rules that blocked it; error_message says why it failed. load_kind is regular or backfill. Join to load_ledger on update_id and dataflow.",
-        columns: ["job_name", "layer", "update_id", "batch_id", "dataflow", "target_table", "src_file_path", "src_file_name", "status", "rows_read", "rows_loaded", "rows_quarantined", "rows_dropped", "rows_blocked", "failed_rules", "blocking_rules", "error_message", "load_kind", "recorded_at"]
+        kind: "table", name: "ledger_detail",
+        writtenBy: "the pipeline's event hook · framework_backfill · framework_runs", grain: "One file or curated input in one load",
+        purpose: "Child unit-of-work rows. detail_kind=file (bronze path) or input (curated upstream FQN). Status PROCESSED|WARNING|FAILED. Join load_ledger on update_id+dataflow. Hot ~90d → ledger_detail_archive (archive_quarter). Query v_ledger_detail.",
+        columns: ["job_name", "layer", "update_id", "batch_id", "dataflow", "target_table", "detail_kind", "src_object", "src_file_path", "src_file_name", "status", "rows_read", "rows_inserted", "rows_quarantined", "rows_dropped", "failed_rules", "blocking_rules", "error_message", "load_kind", "recorded_at"]
       },
       {
         kind: "table", name: "load_ledger_archive",
         writtenBy: "framework_optimize · archive_hot", grain: "Same as load_ledger after move",
-        purpose: "Forever archive of load_ledger rows older than 7 days. Queried via v_loads_90d with hot.",
-        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_id", "dataflow", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "failure_reason", "recorded_at", "archived_at"]
+        purpose: "Forever archive of load_ledger rows older than 90 days. PARTITIONED BY archive_quarter. Queried via v_loads with hot.",
+        columns: ["(same as load_ledger)", "archived_at", "archive_quarter"]
+      },
+      {
+        kind: "table", name: "ledger_detail_archive",
+        writtenBy: "framework_optimize · archive_hot", grain: "Same as ledger_detail after move",
+        purpose: "Forever archive of ledger_detail rows older than 90 days. PARTITIONED BY archive_quarter. Queried via v_ledger_detail.",
+        columns: ["(same as ledger_detail)", "archived_at", "archive_quarter"]
       },
       {
         kind: "table", name: "job_runs_archive",
         writtenBy: "framework_optimize · archive_hot", grain: "Same as job_runs after move",
-        purpose: "Forever archive of job_runs older than 7 days.",
-        columns: ["job_name", "job_id", "run_id", "status", "failure_reason", "recorded_at", "archived_at"]
+        purpose: "Forever archive of job_runs older than 90 days. PARTITIONED BY archive_quarter.",
+        columns: ["(same as job_runs)", "archived_at", "archive_quarter"]
       },
       {
         kind: "table", name: "ddl_applied",
@@ -270,13 +276,7 @@
         purpose: "Declared pipeline→table write/reject edges from asset_registry_current link rows.",
         columns: ["full_name", "parent_full_name", "relation", "config"]
       },
-      {
-        kind: "view", name: "v_bronze_tables",
-        writtenBy: "framework_meta.sql", grain: "Distinct bronze table names",
-        purpose: "Distinct bronze tables and owners from asset_registry_current (discovery / dashboards).",
-        columns: ["table_name", "owner_kind", "owner"]
-      },
-      {
+            {
         kind: "view", name: "v_ownership_refusals",
         writtenBy: "framework_meta.sql", grain: "One ownership_refusals row",
         purpose: "Definitions registry_sync refused because another owner holds the name.",
@@ -320,15 +320,21 @@
       },
       {
         kind: "view", name: "v_loads",
-        writtenBy: "framework_meta.sql", grain: "Latest ledger row per job, layer, update, dataflow",
-        purpose: "Sole recon SoR read API for per-load row counts across bronze, silver, gold, and product (including FAILED rows when a registered dataflow had no progress). Keeps the latest row when a write repeats.",
-        columns: ["job_name", "layer", "job_run_id", "target_table", "quarantine_table", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "rows_quarantine", "rows_processed", "target_status", "failure_reason", "started_at", "batch_id", "rows_dropped", "rows_blocked", "files_read", "files_failed"]
+        writtenBy: "framework_meta.sql", grain: "Latest ledger row per job, layer, update, dataflow (hot ∪ archive)",
+        purpose: "Sole recon SoR read API across bronze→product. Includes source_kind, run_as, load_kind and reshaped counts. Keeps latest recorded_at when a write repeats.",
+        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_id", "dataflow", "source_kind", "run_as", "load_kind", "target_table", "quarantine_table", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined", "rows_dropped", "target_status", "failure_reason", "started_at", "batch_id", "files_read", "files_failed", "recorded_at"]
       },
       {
-        kind: "view", name: "v_loads_90d",
+        kind: "view", name: "v_loads",
         writtenBy: "framework_meta.sql", grain: "Latest load across hot + archive",
-        purpose: "Dashboard window: unions 7-day hot load_ledger with forever load_ledger_archive, then latest per key.",
-        columns: ["job_name", "layer", "job_run_id", "target_table", "rows_read", "rows_written", "rows_upserted", "rows_deleted", "failure_reason", "recorded_at"]
+        purpose: "Dashboard window: unions 90-day hot load_ledger with forever load_ledger_archive, then latest per key.",
+        columns: ["job_name", "layer", "job_run_id", "target_table", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "failure_reason", "recorded_at"]
+      },
+      {
+        kind: "view", name: "v_ledger_detail",
+        writtenBy: "framework_meta.sql", grain: "Latest child file/input row (hot ∪ archive)",
+        purpose: "Drill-down from a load: detail_kind file|input with status, counts, rules, and load_kind.",
+        columns: ["job_name", "layer", "update_id", "dataflow", "detail_kind", "src_object", "src_file_path", "status", "rows_read", "rows_inserted", "rows_quarantined", "rows_dropped", "load_kind", "recorded_at"]
       },
       {
         kind: "view", name: "v_load_failures",

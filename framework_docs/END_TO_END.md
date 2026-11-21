@@ -38,7 +38,7 @@ Every framework job task writes timestamped log lines to its run's output: the a
 
 ## What a delivery job does
 
-A delivery job has one task, **refresh_pipeline**. The pipeline records its own loads: an event hook inside it writes, once per update, one `load_ledger` row per registered dataflow (`layer = bronze`), one `file_ledger` row per file, and the long-shape `load_metric` rows, from that update's events (AUTO CDC upserts/deletes when `num_output_rows` is absent). A table with no progress, or one whose spec could not be registered, is **FAILED** with the error. Every count is a number: a load that failed or read nothing has 0, never NULL. If the pipeline is shut down before the hook finishes, the hourly `framework_runs` writes the missing update from the event log. All of it is insert-only (no MERGE); `v_loads` / `v_job_runs` keep the latest `recorded_at` per key. Use `v_loads` for recon, `file_ledger` for what happened to each file, and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint, so **a file that was read is not read again**: to load a blocked file, fix it and run `./run.sh backfill`. The job does not write definitions to the registry.
+A delivery job has one task, **refresh_pipeline**. The pipeline records its own loads: an event hook inside it writes, once per update, one `load_ledger` row per registered dataflow and one `ledger_detail` row per file (or curated input), from that update's events (AUTO CDC upserts/deletes when `num_output_rows` is absent). A table with no progress, or one whose spec could not be registered, is **FAILED** with the error. Every count is a number: a load that failed or read nothing has 0, never NULL. If the pipeline is shut down before the hook finishes, the hourly `framework_runs` writes the missing update from the event log. All of it is insert-only (no MERGE); `v_loads` / `v_job_runs` keep the latest `recorded_at` per key. Use `v_loads` for recon, `ledger_detail` for what happened to each file, and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint, so **a file that was read is not read again**: to load a blocked file, fix it and run `./run.sh backfill`. The job does not write definitions to the registry.
 
 The pipeline reads its delivery from the deployed bundle. The generated pipeline sets `lff.manifest` to a compiled JSON under `.build/manifests/` (legacy `lff.specs` still works) and `lff.catalog` to the target catalog; `build_pipelines` validates with `validate_configs`. A pipeline id missing from the delivery is an error. A pipeline without either setting falls back to reading `framework_meta.v_asset_registry_current`.
 
@@ -135,8 +135,7 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
 | `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. Recorded hourly by `framework_runs`. |
 | `v_ownership_conflicts` | Names with more than one owner. Empty when the rules hold. |
-| `v_loads`, `v_load_failures` | Per-load recon, written by the pipeline's event hook once per update, and failure reasons for repair. |
-| `v_bronze_tables` | Every bronze table and its owner. |
+| `v_loads`, `v_ledger_detail`, `v_load_failures` | Per-load recon (with `source_kind` / `run_as` / `load_kind`), child file/input drill-down, and failure reasons for repair. |
 | `v_metadata_drift` | Each declared schema, table, or column tag, or column comment, that Unity Catalog (`<catalog>.information_schema`) lacks or holds differently. `securable` says which. Empty once `registry_sync` has run after the schemas and tables exist. |
 
 Example: the latest status for every billing job.
@@ -157,8 +156,8 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | Table or view | Built by | What it holds |
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
-| `load_ledger`, `v_loads`, `v_loads_90d` | The pipeline's event hook (`pipeline_metrics`), once per update; `framework_backfill`; hourly `framework_runs` for an update whose hook was cut off | Central recon SoR: one row per registered dataflow, counts always numbers (`rows_read`, `rows_written`, `rows_quarantine`, `rows_dropped`, `rows_blocked`, `files_read`, `files_failed`), FAILED with the error when a table fails, cannot register, has a blocked file, got no file, or got an empty file. `v_loads_90d` unions 7-day hot with forever archive for dashboards |
-| `file_ledger` | The same writers | One row per file per load: status (`PROCESSED`, `WARNING`, `FAILED`), its counts, the rules that blocked it, `error_message` (`blocked by fail rule(s): ...`, `file has no rows`, `file not found`), and `load_kind` (`regular` or `backfill`) |
+| `load_ledger`, `v_loads` | The pipeline's event hook (`pipeline_metrics`), once per update; `framework_backfill`; hourly `framework_runs` for an update whose hook was cut off | Central recon SoR: one row per registered dataflow; `source_kind`, `run_as`, `load_kind` (regular\|backfill\|catchup); counts always numbers (`rows_read`, `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_quarantined`, `rows_dropped`, `files_read`, `files_failed`); FAILED with the error when a table fails, cannot register, has a blocked file, got no file, or got an empty file. `v_loads` unions 90-day hot with forever quarterly archive |
+| `ledger_detail`, `v_ledger_detail` | The same writers | Child unit-of-work (`detail_kind=file` or `input`): status (`PROCESSED`, `WARNING`, `FAILED`), counts, rules, `error_message` (`blocked by fail rule(s): ...`, `file has no rows`, `file not found`), and `load_kind` |
 | `v_load_failures` | Views over loads + job/task runs | What failed and why (`failure_reason`, task, run page) for repair |
 | `job_runs`, `v_job_runs`, `v_job_status` | The hourly `framework_runs` job | Append-only run events; `v_job_runs` keeps latest per `(job_id, run_id)` |
 | `job_task_runs`, `v_job_task_runs` | Hourly `framework_runs` | Append-only task events; view keeps latest per `(job_run_id, task_run_id)` |
@@ -178,8 +177,8 @@ Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] `
 
 ```sql
 -- rows read and loaded for any layer (append-only ledger, not a table scan)
-SELECT job_name, layer, target_table, quarantine_table, started_at,
-       rows_read, rows_written, rows_quarantine, rows_processed, expectations
+SELECT job_name, layer, target_table, quarantine_table, load_kind, started_at,
+       rows_read, rows_inserted, rows_updated, rows_quarantined, rows_dropped, expectations
 FROM framework_meta.v_loads
 WHERE target_table ILIKE '%finance_abs'
 ORDER BY started_at DESC;

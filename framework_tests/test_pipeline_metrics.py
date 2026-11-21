@@ -13,7 +13,6 @@ from lakeflow_framework.config import config_from_document
 from lakeflow_framework.load_metrics import LEDGER_COLUMNS
 from lakeflow_framework.pipeline import _configs_from_manifest, _install_recorder
 from lakeflow_framework.pipeline_metrics import (
-    EXTRA_LEDGER_COLUMNS,
     LEDGER_SCHEMA,
     Dataflow,
     UpdateRecorder,
@@ -29,7 +28,7 @@ UPDATE = "u-1"
 STAGED = "aal.framework_meta.abs_accounting_staged"
 BRONZE = "aal.abs_bronze.finance_abs"
 QUARANTINE = "aal.abs_bronze.finance_abs_qrntn"
-COUNTS = ("rows_read", "rows_written", "rows_upserted", "rows_deleted", "rows_quarantine")
+COUNTS = ("rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined")
 
 
 def dataflow(**overrides: Any) -> Dataflow:
@@ -101,8 +100,8 @@ def loaded(read: int, written: int, quarantined: int) -> list[dict]:
 def test_a_load_records_read_written_and_quarantined_once() -> None:
     rec = recorder()
     (row,) = run(rec, loaded(read=100, written=90, quarantined=10))
-    assert (row["rows_read"], row["rows_written"], row["rows_quarantine"]) == (100, 90, 10)
-    assert (row["rows_upserted"], row["rows_deleted"], row["rows_processed"]) == (0, 0, 100)
+    assert (row["rows_read"], row["rows_inserted"], row["rows_quarantined"]) == (100, 90, 10)
+    assert (row["rows_updated"], row["rows_deleted"]) == (0, 0)
     assert (row["target_status"], row["quarantine_status"]) == ("COMPLETED", "COMPLETED")
     assert row["failure_reason"] is None
     # From the first flow starting (not the update waiting for compute) to the last flow finishing.
@@ -172,7 +171,7 @@ def test_an_update_with_no_new_files_records_zeros_not_nulls() -> None:
     ]
     (row,) = run(recorder(), events)
     assert [row[count] for count in COUNTS] == [0, 0, 0, 0, 0]
-    assert row["rows_processed"] == 0 and row["target_status"] == "COMPLETED"
+    assert row["target_status"] == "COMPLETED"
     assert row["failure_reason"] is None
 
 
@@ -207,8 +206,8 @@ def test_a_failed_update_keeps_what_finished_zeroes_the_rest_and_says_why() -> N
     ]
     (row,) = run(recorder(), events)
     assert row["rows_read"] == 100  # the staged flow finished before the failure
-    assert (row["rows_written"], row["rows_quarantine"], row["rows_processed"]) == (0, 0, 0)
-    assert (row["rows_upserted"], row["rows_deleted"]) == (0, 0)
+    assert (row["rows_inserted"], row["rows_quarantined"]) == (0, 0)
+    assert (row["rows_updated"], row["rows_deleted"]) == (0, 0)
     assert row["target_status"] == "FAILED"
     assert "AnalysisException: [DELTA_FAILED_TO_MERGE_FIELDS] x" in row["failure_reason"]
     assert "Flow 'finance_abs' has FAILED" in row["failure_reason"]
@@ -228,7 +227,7 @@ def test_a_canceled_update_is_canceled_with_zero_counts() -> None:
         update_state("CANCELED", 2),
     ]
     (row,) = run(recorder(), events)
-    assert (row["target_status"], row["rows_written"]) == ("CANCELED", 0)
+    assert (row["target_status"], row["rows_inserted"]) == ("CANCELED", 0)
     assert "ended CANCELED" in row["failure_reason"]
 
 
@@ -267,8 +266,8 @@ def test_auto_cdc_counts_upserts_and_deletes() -> None:
         update_state("COMPLETED", 5),
     ]
     (row,) = run(recorder(dataflow(append=False)), events)
-    assert (row["rows_read"], row["rows_upserted"], row["rows_deleted"]) == (12, 8, 3)
-    assert row["rows_written"] == 11 and row["rows_processed"] == 11
+    assert (row["rows_read"], row["rows_updated"], row["rows_deleted"]) == (12, 8, 3)
+    assert row["rows_inserted"] == 0
 
 
 def test_a_spec_that_could_not_register_is_failed_with_its_error() -> None:
@@ -282,7 +281,7 @@ def test_a_spec_that_could_not_register_is_failed_with_its_error() -> None:
         build_error="invalid spec: path must be a /Volumes path",
     )
     good, bad = run(recorder(dataflow(), broken), loaded(10, 10, 0))
-    assert good["failure_reason"] is None and good["rows_written"] == 10
+    assert good["failure_reason"] is None and good["rows_inserted"] == 10
     assert bad["target_status"] == "FAILED"
     assert bad["failure_reason"] == "invalid spec: path must be a /Volumes path"
     assert [bad[count] for count in COUNTS] == [0, 0, 0, 0, 0]
@@ -366,11 +365,11 @@ def test_ledger_records_match_the_ledger_columns_with_zeros_not_nulls() -> None:
     records = ledger_records(rows, at)
     columns = [part.split()[0] for part in LEDGER_SCHEMA.split(", ")]
     # The table's order: LEDGER_COLUMNS, then batch_id and the later counts that ALTER TABLE added.
-    assert columns == [*LEDGER_COLUMNS, "batch_id", *EXTRA_LEDGER_COLUMNS] and len(records) == 2
-    assert all(value is not None for record in records for value in record[-4:])
+    assert columns == list(LEDGER_COLUMNS) and len(records) == 2
     first = dict(zip(columns, records[0], strict=True))
-    assert (first["rows_read"], first["rows_written"], first["rows_quarantine"]) == (5, 5, 0)
-    assert (first["rows_upserted"], first["rows_deleted"]) == (0, 0)
+    assert (first["rows_read"], first["rows_inserted"], first["rows_quarantined"]) == (5, 5, 0)
+    assert (first["rows_updated"], first["rows_deleted"]) == (0, 0)
+    assert (first["files_read"], first["files_failed"]) == (0, 0)
     assert first["job_run_id"] is None  # not known inside the pipeline; the job views join on time
     assert first["recorded_at"] == at
     assert "rows_read BIGINT" in LEDGER_SCHEMA and "recorded_at TIMESTAMP" in LEDGER_SCHEMA
@@ -379,22 +378,7 @@ def test_ledger_records_match_the_ledger_columns_with_zeros_not_nulls() -> None:
 def test_metric_records_have_every_metric_for_every_dataflow() -> None:
     (row,) = run(recorder(), loaded(100, 90, 10))
     at = datetime(2026, 11, 19, tzinfo=UTC)
-    records = metric_records([row], at)
-    assert {name: value for *_, name, value in records} == {
-        "rows_read": 100,
-        "rows_written": 90,
-        "rows_upserted": 0,
-        "rows_deleted": 0,
-        "rows_quarantine": 10,
-        "rows_processed": 100,
-        "rows_dropped": 0,
-        "rows_blocked": 0,
-        "files_read": 0,
-        "files_failed": 0,
-    }
-    assert all(
-        record[:4] == ("abs_daily", "bronze", UPDATE, "abs_accounting") for record in records
-    )
+    assert metric_records([row], at) == []
 
 
 def test_write_rows_appends_with_the_dataframe_writer_not_sql() -> None:
@@ -403,9 +387,9 @@ def test_write_rows_appends_with_the_dataframe_writer_not_sql() -> None:
     (row,) = run(recorder(), loaded(1, 1, 0))
     assert write_rows(spark, "aal_dev_fdh", [row]) == 1
     ledger = spark.saved["aal_dev_fdh.framework_meta.load_ledger"]
-    metric = spark.saved["aal_dev_fdh.framework_meta.load_metric"]
-    assert (ledger.save_mode, metric.save_mode) == ("append", "append")
-    assert len(ledger.data) == 1 and len(metric.data) == 10
+    assert ledger.save_mode == "append"
+    assert len(ledger.data) == 1
+    assert "aal_dev_fdh.framework_meta.load_metric" not in spark.saved
     assert ledger.schema == LEDGER_SCHEMA
 
 
@@ -520,12 +504,9 @@ def test_the_pipeline_installs_a_recorder_for_every_table_in_the_delivery() -> N
     ]:
         hooks.callback(event)
     assert bronze == "aal_dev_fdh.abs_bronze.finance_abs"
-    assert set(spark.saved) == {
-        "aal_dev_fdh.framework_meta.load_ledger",
-        "aal_dev_fdh.framework_meta.load_metric",
-    }
+    assert set(spark.saved) == {"aal_dev_fdh.framework_meta.load_ledger"}
     # One row for the table that loaded and one for the table whose spec failed to register.
-    columns = [*LEDGER_COLUMNS, "batch_id", *EXTRA_LEDGER_COLUMNS]
+    columns = list(LEDGER_COLUMNS)
     loaded_row, broken_row = (
         dict(zip(columns, record, strict=True))
         for record in spark.saved["aal_dev_fdh.framework_meta.load_ledger"].data
@@ -534,12 +515,12 @@ def test_the_pipeline_installs_a_recorder_for_every_table_in_the_delivery() -> N
 
     # The ledger keeps the _batch_id the bronze rows of this run carry, beside the update id.
     assert loaded_row["batch_id"] == broken_row["batch_id"] == batch_id()
-    assert (loaded_row["rows_read"], loaded_row["rows_written"]) == (20, 18)
-    assert (loaded_row["rows_quarantine"], loaded_row["failure_reason"]) == (2, None)
+    assert (loaded_row["rows_read"], loaded_row["rows_inserted"]) == (20, 18)
+    assert (loaded_row["rows_quarantined"], loaded_row["failure_reason"]) == (2, None)
     assert broken_row["dataflow"] == "abs_broken" and broken_row["target_status"] == "FAILED"
     assert broken_row["failure_reason"] == "failed to register: ValueError: bad rule"
-    assert broken_row["rows_read"] == broken_row["rows_written"] == 0
-    assert len(spark.saved["aal_dev_fdh.framework_meta.load_metric"].data) == 20
+    assert broken_row["rows_read"] == broken_row["rows_inserted"] == 0
+    assert "aal_dev_fdh.framework_meta.load_metric" not in spark.saved
 
 
 def test_manifest_problems_name_the_spec_and_the_delivery(tmp_path) -> None:
