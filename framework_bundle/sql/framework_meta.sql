@@ -13,14 +13,15 @@
 --
 -- load_ledger is append-only recon (sole load-grain SoR). pipeline_id is the spec id
 -- (joins v_pipelines). update_pipeline_uuid is the Lakeflow pipeline UUID from events.
--- ledger_detail holds file (bronze) or input (curated) child rows. load_metric is retired.
+-- ledger_detail holds file (bronze) or input (curated) child rows.
 -- Hot run/recon tables keep about 90 days. Forever archives use PARTITIONED BY archive_quarter.
 -- job_runs / job_task_runs are append-only. Views keep latest per key.
 -- ownership_refusals replaces the vestigial run_ledger / run_current step tables.
 --
--- Constraints are informational PRIMARY KEY / FOREIGN KEY (Unity Catalog) plus enforced
--- CHECK on enumerations where Delta supports them. Until go-live, DROP SCHEMA … CASCADE
--- and recreate, after go-live, add ALTER statements instead of editing CREATE shapes.
+-- Constraints are informational PRIMARY KEY (Unity Catalog) plus enforced CHECK on
+-- enumerations, declared in CREATE TABLE for a clean first deploy. After a full
+-- framework_meta wipe, deploy this file as-is (CREATE IF NOT EXISTS + seed INSERTs +
+-- CREATE OR REPLACE VIEW). Do not keep DROP/ADD CONSTRAINT migration pairs here.
 
 CREATE SCHEMA IF NOT EXISTS ${catalog}.framework_meta;
 
@@ -91,21 +92,6 @@ SELECT layer FROM (VALUES
 ) AS v(layer)
 WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.framework_meta.ref_layer r WHERE r.layer = v.layer);
 
-CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ref_metric_name (
-  metric_name STRING NOT NULL,
-  CONSTRAINT ref_metric_name_pk PRIMARY KEY (metric_name)
-);
-INSERT INTO ${catalog}.framework_meta.ref_metric_name (metric_name)
-SELECT metric_name FROM (VALUES
-  ('rows_read'),
-  ('rows_written'),
-  ('rows_upserted'),
-  ('rows_deleted'),
-  ('rows_quarantine'),
-  ('rows_processed')
-) AS v(metric_name)
-WHERE NOT EXISTS (SELECT 1 FROM ${catalog}.framework_meta.ref_metric_name r WHERE r.metric_name = v.metric_name);
-
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry (
   asset_id STRING NOT NULL,
   object_kind STRING NOT NULL,
@@ -126,19 +112,16 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry (
   valid_to TIMESTAMP,
   is_current BOOLEAN NOT NULL,
   is_deleted BOOLEAN NOT NULL,
-  CONSTRAINT asset_registry_pk PRIMARY KEY (object_kind, full_name, valid_from)
+  CONSTRAINT asset_registry_pk PRIMARY KEY (object_kind, full_name, valid_from),
+  CONSTRAINT asset_registry_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link')),
+  CONSTRAINT asset_registry_owner_kind CHECK (owner_kind IN ('source_system', 'project')),
+  CONSTRAINT asset_registry_relation CHECK (relation IS NULL OR relation IN ('owns', 'contains', 'reads', 'writes', 'rejects_to', 'column_of'))
 )
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.asset_registry DROP CONSTRAINT IF EXISTS asset_registry_object_kind;
-ALTER TABLE ${catalog}.framework_meta.asset_registry ADD CONSTRAINT asset_registry_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link'));
-ALTER TABLE ${catalog}.framework_meta.asset_registry DROP CONSTRAINT IF EXISTS asset_registry_owner_kind;
-ALTER TABLE ${catalog}.framework_meta.asset_registry ADD CONSTRAINT asset_registry_owner_kind CHECK (owner_kind IN ('source_system', 'project'));
-ALTER TABLE ${catalog}.framework_meta.asset_registry DROP CONSTRAINT IF EXISTS asset_registry_relation;
-ALTER TABLE ${catalog}.framework_meta.asset_registry ADD CONSTRAINT asset_registry_relation CHECK (relation IS NULL OR relation IN ('owns', 'contains', 'reads', 'writes', 'rejects_to', 'column_of'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry_current (
   asset_id STRING NOT NULL,
@@ -156,19 +139,16 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.asset_registry_current (
   bundle_id STRING,
   recorded_at TIMESTAMP NOT NULL,
   config VARIANT,
-  CONSTRAINT asset_registry_current_pk PRIMARY KEY (object_kind, full_name)
+  CONSTRAINT asset_registry_current_pk PRIMARY KEY (object_kind, full_name),
+  CONSTRAINT asset_registry_current_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link')),
+  CONSTRAINT asset_registry_current_owner_kind CHECK (owner_kind IN ('source_system', 'project')),
+  CONSTRAINT asset_registry_current_relation CHECK (relation IS NULL OR relation IN ('owns', 'contains', 'reads', 'writes', 'rejects_to', 'column_of'))
 )
 CLUSTER BY (owner, object_kind, full_name)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.asset_registry_current DROP CONSTRAINT IF EXISTS asset_registry_current_object_kind;
-ALTER TABLE ${catalog}.framework_meta.asset_registry_current ADD CONSTRAINT asset_registry_current_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link'));
-ALTER TABLE ${catalog}.framework_meta.asset_registry_current DROP CONSTRAINT IF EXISTS asset_registry_current_owner_kind;
-ALTER TABLE ${catalog}.framework_meta.asset_registry_current ADD CONSTRAINT asset_registry_current_owner_kind CHECK (owner_kind IN ('source_system', 'project'));
-ALTER TABLE ${catalog}.framework_meta.asset_registry_current DROP CONSTRAINT IF EXISTS asset_registry_current_relation;
-ALTER TABLE ${catalog}.framework_meta.asset_registry_current ADD CONSTRAINT asset_registry_current_relation CHECK (relation IS NULL OR relation IN ('owns', 'contains', 'reads', 'writes', 'rejects_to', 'column_of'));
 
 -- Ownership refusals only (replaces run_ledger / run_current step tables).
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ownership_refusals (
@@ -180,19 +160,16 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ownership_refusals (
   holder_owner STRING NOT NULL,
   failure_reason STRING NOT NULL,
   content_hash STRING NOT NULL,
-  recorded_at TIMESTAMP NOT NULL
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT ownership_refusals_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link')),
+  CONSTRAINT ownership_refusals_refused_owner_kind CHECK (refused_owner_kind IN ('source_system', 'project')),
+  CONSTRAINT ownership_refusals_holder_owner_kind CHECK (holder_owner_kind IN ('source_system', 'project'))
 )
 CLUSTER BY (full_name, recorded_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.ownership_refusals DROP CONSTRAINT IF EXISTS ownership_refusals_object_kind;
-ALTER TABLE ${catalog}.framework_meta.ownership_refusals ADD CONSTRAINT ownership_refusals_object_kind CHECK (object_kind IN ('source_system', 'schema', 'workflow', 'pipeline', 'dataflow', 'flow', 'table', 'streaming_table', 'materialized_view', 'column', 'link'));
-ALTER TABLE ${catalog}.framework_meta.ownership_refusals DROP CONSTRAINT IF EXISTS ownership_refusals_refused_owner_kind;
-ALTER TABLE ${catalog}.framework_meta.ownership_refusals ADD CONSTRAINT ownership_refusals_refused_owner_kind CHECK (refused_owner_kind IN ('source_system', 'project'));
-ALTER TABLE ${catalog}.framework_meta.ownership_refusals DROP CONSTRAINT IF EXISTS ownership_refusals_holder_owner_kind;
-ALTER TABLE ${catalog}.framework_meta.ownership_refusals ADD CONSTRAINT ownership_refusals_holder_owner_kind CHECK (holder_owner_kind IN ('source_system', 'project'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs (
   job_name STRING NOT NULL,
@@ -214,15 +191,14 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_runs (
   execution_seconds DOUBLE,
   run_seconds DOUBLE,
   run_page_url STRING,
-  recorded_at TIMESTAMP NOT NULL
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT job_runs_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'SKIPPED', 'FAILED'))
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.job_runs DROP CONSTRAINT IF EXISTS job_runs_status;
-ALTER TABLE ${catalog}.framework_meta.job_runs ADD CONSTRAINT job_runs_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'SKIPPED', 'FAILED'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs (
   job_name STRING NOT NULL,
@@ -238,15 +214,14 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.job_task_runs (
   result_state STRING,
   termination_code STRING,
   failure_reason STRING,
-  recorded_at TIMESTAMP NOT NULL
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT job_task_runs_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'SKIPPED', 'FAILED'))
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.job_task_runs DROP CONSTRAINT IF EXISTS job_task_runs_status;
-ALTER TABLE ${catalog}.framework_meta.job_task_runs ADD CONSTRAINT job_task_runs_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'SKIPPED', 'FAILED'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates (
   job_name STRING NOT NULL,
@@ -258,15 +233,14 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.pipeline_updates (
   state STRING,
   status STRING NOT NULL,
   run_as STRING,
-  recorded_at TIMESTAMP NOT NULL
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT pipeline_updates_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED'))
 )
 CLUSTER BY (job_name, started_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.pipeline_updates DROP CONSTRAINT IF EXISTS pipeline_updates_status;
-ALTER TABLE ${catalog}.framework_meta.pipeline_updates ADD CONSTRAINT pipeline_updates_status CHECK (status IN ('RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED'));
 
 -- Append-only recon. pipeline_id = spec id, update_pipeline_uuid = Lakeflow UUID from events.
 -- Hot ~90 days. forever archive is PARTITIONED BY archive_quarter (Hive. not liquid clustered).
@@ -302,19 +276,16 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
   recorded_at TIMESTAMP NOT NULL,
   batch_id STRING,
   files_read BIGINT,
-  files_failed BIGINT
+  files_failed BIGINT,
+  CONSTRAINT load_ledger_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged')),
+  CONSTRAINT load_ledger_owner_kind CHECK (owner_kind IN ('source_system', 'project')),
+  CONSTRAINT load_ledger_load_kind CHECK (load_kind IN ('regular', 'backfill', 'catchup'))
 )
 CLUSTER BY (layer, job_name, started_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.load_ledger DROP CONSTRAINT IF EXISTS load_ledger_layer;
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD CONSTRAINT load_ledger_layer CHECK (layer IN ('raw', 'bronze', 'quarantine', 'silver', 'gold', 'product', 'staged'));
-ALTER TABLE ${catalog}.framework_meta.load_ledger DROP CONSTRAINT IF EXISTS load_ledger_owner_kind;
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD CONSTRAINT load_ledger_owner_kind CHECK (owner_kind IN ('source_system', 'project'));
-ALTER TABLE ${catalog}.framework_meta.load_ledger DROP CONSTRAINT IF EXISTS load_ledger_load_kind;
-ALTER TABLE ${catalog}.framework_meta.load_ledger ADD CONSTRAINT load_ledger_load_kind CHECK (load_kind IN ('regular', 'backfill', 'catchup'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger_archive (
   job_name STRING NOT NULL,
@@ -383,17 +354,15 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail (
   blocking_rules STRING,
   error_message STRING,
   load_kind STRING,
-  recorded_at TIMESTAMP NOT NULL
+  recorded_at TIMESTAMP NOT NULL,
+  CONSTRAINT ledger_detail_status CHECK (status IN ('PROCESSED', 'WARNING', 'FAILED')),
+  CONSTRAINT ledger_detail_kind CHECK (detail_kind IN ('file', 'input'))
 )
 CLUSTER BY (dataflow, recorded_at)
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact' = 'true'
 );
-ALTER TABLE ${catalog}.framework_meta.ledger_detail DROP CONSTRAINT IF EXISTS ledger_detail_status;
-ALTER TABLE ${catalog}.framework_meta.ledger_detail ADD CONSTRAINT ledger_detail_status CHECK (status IN ('PROCESSED', 'WARNING', 'FAILED'));
-ALTER TABLE ${catalog}.framework_meta.ledger_detail DROP CONSTRAINT IF EXISTS ledger_detail_kind;
-ALTER TABLE ${catalog}.framework_meta.ledger_detail ADD CONSTRAINT ledger_detail_kind CHECK (detail_kind IN ('file', 'input'));
 
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail_archive (
   job_name STRING NOT NULL,

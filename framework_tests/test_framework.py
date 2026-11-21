@@ -535,15 +535,10 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     ]
     assert keys and all(len(key.split(",")) <= 4 for key in keys)
     assert "'delta.autoOptimize.autoCompact' = 'false'" not in text
-    # Every statement can run again. ADD COLUMN has no IF NOT EXISTS, so apply_ddl skips it when
-    # the column is already there; a constraint is dropped IF EXISTS before it is added.
-    alters = [statement for statement in statements if statement.upper().startswith("ALTER")]
-    assert alters and all(
-        " ADD COLUMN " in statement.upper()
-        or " DROP CONSTRAINT IF EXISTS " in statement.upper()
-        or " ADD CONSTRAINT " in statement.upper()
-        for statement in alters
-    )
+    # First-deploy DDL: no ALTER. CHECKs live in CREATE TABLE; views are CREATE OR REPLACE.
+    assert not any(statement.upper().startswith("ALTER") for statement in statements)
+    assert "CONSTRAINT load_ledger_load_kind CHECK" in text
+    assert "CONSTRAINT ledger_detail_kind CHECK" in text
     assert "VIEW framework_dev.framework_meta.v_ownership_refusals" in text
     assert "ownership_refusals" in text
     assert "run_ledger" not in text and "run_current" not in text
@@ -594,11 +589,8 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "valid_to" in text
     assert "is_current" in text
     # Fresh schema: CREATE tables/views plus idempotent INSERT seeds for enum refs.
-    assert {statement.split()[0].upper() for statement in statements} <= {
-        "CREATE",
-        "INSERT",
-        "ALTER",  # only ADD COLUMN, which apply_ddl skips when the column exists
-    }
+    assert {statement.split()[0].upper() for statement in statements} <= {"CREATE", "INSERT"}
+    assert "ref_metric_name" not in text
     assert _column_list(text, "asset_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
     assert _column_list(text, "ownership_refusals") == list(LEDGER_COLUMNS)
 

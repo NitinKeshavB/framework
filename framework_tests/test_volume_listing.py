@@ -24,7 +24,10 @@ def put(folder: Path, name: str, text: str = "id\n1\n", mtime: datetime | None =
 def test_a_file_with_no_bytes_is_listed(tmp_path: Path) -> None:
     put(tmp_path, "a.csv")
     put(tmp_path, "empty.csv", "")
-    found = {Path(item["file_path"]).name: item["file_bytes"] for item in list_volume_files(str(tmp_path))}
+    found = {
+        Path(item["file_path"]).name: item["file_bytes"]
+        for item in list_volume_files(str(tmp_path))
+    }
     assert found == {"a.csv": 5, "empty.csv": 0}
 
 
@@ -58,7 +61,9 @@ def test_a_backfill_plans_by_name_and_by_arrival_over_the_same_listing(
         return [Path(item["path"]).name for item in backfill.plan_files(None, config, selection)]
 
     assert names(parse_selection("files", "new.csv,missing.csv")) == ["new.csv"]
-    assert names(parse_selection("dates", date_from="2026-11-19 08:00", date_to="2026-11-19 08:10")) == [
+    assert names(
+        parse_selection("dates", date_from="2026-11-19 08:00", date_to="2026-11-19 08:10")
+    ) == [
         "empty.csv",
         "new.csv",
     ]

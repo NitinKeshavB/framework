@@ -17,9 +17,9 @@ def _flag(value: str) -> bool:
 
 
 def main() -> None:
-    catalog, table, mode, files, date_from, date_to, dry_run, confirm = (
-        (sys.argv[1:] + [""] * 8)[:8]
-    )
+    catalog, table, mode, files, date_from, date_to, dry_run, confirm = (sys.argv[1:] + [""] * 8)[
+        :8
+    ]
     log = job_logging(f"backfill.{table}")
     spark = SparkSession.builder.getOrCreate()
     try:

@@ -8,14 +8,16 @@ The registry `content_hash` is the config version. It is independent of the whee
 
 The registry DDL in `framework_bundle/sql/framework_meta.sql` runs on a `framework_bundle` deploy whenever the file has changed, so each statement must be safe to run again. Tables are `CREATE ... IF NOT EXISTS` and views `CREATE OR REPLACE VIEW`. The same file is shipped as package data (`lakeflow_framework/sql/framework_meta.sql`) so `metadata.ddl_text()` works from a wheel, not only a repo checkout.
 
-Until go-live, prefer `DROP SCHEMA … CASCADE` and recreate so DDL matches `LEDGER_COLUMNS`. After go-live, add a column to **both** a hot table and its `*_archive` twin in the same place: the archive move copies rows by position (`h.*`, then `archived_at` / `archive_quarter`), so column order must match. Keep `framework_bundle/sql/framework_meta.sql` and `framework_lff_lib/lakeflow_framework/sql/framework_meta.sql` identical.
+`framework_meta.sql` is first-deploy DDL: `CREATE TABLE IF NOT EXISTS` with inline PRIMARY KEY / CHECK constraints, seed `INSERT`s for `ref_*`, and `CREATE OR REPLACE VIEW`. There are no `ALTER TABLE … ADD COLUMN` or `DROP/ADD CONSTRAINT` migration pairs. After wiping `framework_meta` (and `framework_events` if needed), deploy this file as-is.
 
-Other tables are still edited in their `CREATE TABLE` while the catalog can be recreated: drop `<catalog>.framework_meta`, and deploy `framework_bundle` then `framework_ingestion` again; `registry_sync` writes the definitions back. Registry history, run history, and metrics start over.
+Keep `framework_bundle/sql/framework_meta.sql` and `framework_lff_lib/lakeflow_framework/sql/framework_meta.sql` identical. Edit shapes only in `CREATE TABLE`. When a hot table and its `*_archive` twin share columns, keep the same order through `archived_at` / `archive_quarter` so `archive_hot` can copy `h.*`.
 
-After go-live, add each change below the tables as a statement that is safe to repeat, and keep the `CREATE TABLE` up to date for a fresh catalog:
+Drop `<catalog>.framework_meta` (and recreate via deploy) when the CREATE shape changes; `registry_sync` writes definitions back. Registry history, run history, and recon start over.
 
-- A new column is `ALTER TABLE ... ADD COLUMNS`. It has no `IF NOT EXISTS`, so `apply_ddl` must skip it when the column is there.
-- A new clustering key is `ALTER TABLE ... CLUSTER BY`, at most three keys.
+After go-live, if you must evolve a live catalog without a wipe, add repeatable statements **below** the CREATEs and still keep CREATE up to date for a fresh catalog:
+
+- A new column is `ALTER TABLE ... ADD COLUMNS` (no `IF NOT EXISTS`; `apply_ddl` skips when the column exists).
+- A new clustering key is `ALTER TABLE ... CLUSTER BY`, at most four keys on liquid-clustered tables.
 - A backfill is an `UPDATE` whose `WHERE` matches only rows still missing the value. Never `UPDATE` the history tables.
 - A table property change is `ALTER TABLE ... SET TBLPROPERTIES`.
 - A retired view is `DROP VIEW IF EXISTS`.

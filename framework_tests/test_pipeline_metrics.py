@@ -364,7 +364,7 @@ def test_ledger_records_match_the_ledger_columns_with_zeros_not_nulls() -> None:
     at = datetime(2026, 11, 19, tzinfo=UTC)
     records = ledger_records(rows, at)
     columns = [part.split()[0] for part in LEDGER_SCHEMA.split(", ")]
-    # The table's order: LEDGER_COLUMNS, then batch_id and the later counts that ALTER TABLE added.
+    # CREATE TABLE column order matches LEDGER_COLUMNS (first-deploy shape; no ADD COLUMN lag).
     assert columns == list(LEDGER_COLUMNS) and len(records) == 2
     first = dict(zip(columns, records[0], strict=True))
     assert (first["rows_read"], first["rows_inserted"], first["rows_quarantined"]) == (5, 5, 0)

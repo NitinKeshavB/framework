@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from test_sources import FILE_SOURCE, _config, _Pipelines, _Spark, _volume_spec
 
 from lakeflow_framework import ConfigValidationError, build_pipeline
 from lakeflow_framework.config import config_from_document
@@ -17,10 +16,11 @@ from lakeflow_framework.quality import (
     quarantine_where,
     valid_where,
 )
+from test_sources import FILE_SOURCE, _config, _Pipelines, _Spark, _volume_spec
 
 RULES = (
     "  rules:\n"
-    "    - { name: id_present, expression: \"thing_id IS NOT NULL\" }\n"
+    '    - { name: id_present, expression: "thing_id IS NOT NULL" }\n'
     "    - { name: id_format, expression: \"thing_id rlike '^[A-Z]+$'\", on_fail: %s }\n"
 )
 
@@ -114,16 +114,18 @@ def test_quarantine_and_drop_and_warn_can_be_mixed_in_one_table(tmp_path: Path) 
     text = _volume_spec(
         extra=(
             "  rules:\n"
-            "    - { name: q, expression: \"thing_id IS NOT NULL\" }\n"
-            "    - { name: d, expression: \"length(thing_id) > 0\", on_fail: drop }\n"
-            "    - { name: w, expression: \"thing_id = upper(thing_id)\", on_fail: warn }\n"
+            '    - { name: q, expression: "thing_id IS NOT NULL" }\n'
+            '    - { name: d, expression: "length(thing_id) > 0", on_fail: drop }\n'
+            '    - { name: w, expression: "thing_id = upper(thing_id)", on_fail: warn }\n'
         )
     )
     rules = compile_rules(_config(tmp_path, FILE_SOURCE, "a.yaml", text))
     bronze, quarantine = valid_where(rules), quarantine_where(rules)
     # A row that broke only the warn rule loads. One that broke the quarantine or drop rule does not.
     assert "'q'" in bronze and "'d'" in bronze and "'w'" not in bronze
-    assert quarantine.startswith("arrays_overlap") and "'q'" in quarantine and "'d'" not in quarantine
+    assert (
+        quarantine.startswith("arrays_overlap") and "'q'" in quarantine and "'d'" not in quarantine
+    )
 
 
 def test_a_fail_rule_on_files_blocks_the_file_and_a_check_fails_the_update(tmp_path: Path) -> None:
@@ -133,7 +135,9 @@ def test_a_fail_rule_on_files_blocks_the_file_and_a_check_fails_the_update(tmp_p
     assert pipelines.fail_expectations == ["no_file_blocked_by_fail_rule"]
     # The rule itself still counts, like any other, in the event log.
     assert "id_format" in pipelines.expectations and "id_present" in pipelines.expectations
-    assert "files_things_blocked_check" in pipelines.names and "files_things_files" in pipelines.names
+    assert (
+        "files_things_blocked_check" in pipelines.names and "files_things_files" in pipelines.names
+    )
     assert config.on_bad_rows == "quarantine"
 
 
@@ -171,10 +175,10 @@ def test_the_result_of_a_row_is_decided_once_and_stored_with_it(tmp_path: Path) 
     text = _volume_spec(
         extra=(
             "  rules:\n"
-            "    - { name: f, expression: \"thing_id IS NOT NULL\", on_fail: fail }\n"
-            "    - { name: q, expression: \"length(thing_id) > 0\" }\n"
-            "    - { name: d, expression: \"thing_id = upper(thing_id)\", on_fail: drop }\n"
-            "    - { name: w, expression: \"length(thing_id) < 9\", on_fail: warn }\n"
+            '    - { name: f, expression: "thing_id IS NOT NULL", on_fail: fail }\n'
+            '    - { name: q, expression: "length(thing_id) > 0" }\n'
+            '    - { name: d, expression: "thing_id = upper(thing_id)", on_fail: drop }\n'
+            '    - { name: w, expression: "length(thing_id) < 9", on_fail: warn }\n'
         )
     )
     sql = result_sql(compile_rules(_config(tmp_path, FILE_SOURCE, "a.yaml", text)))
