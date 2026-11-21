@@ -2,6 +2,18 @@
 
 Each project owns its silver tables, gold tables, and data products. Bronze belongs to a source system in [framework_ingestion](../framework_ingestion/README.md), so a project reads bronze and never loads it.
 
+```mermaid
+flowchart TB
+  subgraph domain["Ingestion · source-owned"]
+    bronze["bronze tables"]
+  end
+  subgraph project["This project"]
+    silver["silver"] --> gold["gold"] --> product["products"]
+  end
+  bronze --> silver
+  other["other project · silver/product"] -.->|"reads · no wait"| gold
+```
+
 ```
 framework_curation/
   PROJECTS_INDEX.md                       generated: every project and what it reads from other projects
@@ -10,6 +22,8 @@ framework_curation/
     PROJECT_MAP.md                        generated: the map for this project
     databricks.yml                        the project's own bundle
 ```
+
+Team process (new-project → generate → deploy): [Lucid · Team process](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=ejCN3UfoKXOq#). Recon after bronze lands: [root README · views by usage](../README.md#query-views-by-usage).
 
 ## Ownership
 

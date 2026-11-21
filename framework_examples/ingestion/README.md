@@ -2,6 +2,17 @@
 
 Specs to copy when adding a source system. They are not deployed. The bundle that runs is [framework_ingestion](../../framework_ingestion/README.md).
 
+```mermaid
+flowchart LR
+  abs["abs · sftp_files"] --> vol["UC raw volume"]
+  policies["policies · sharepoint_files"] --> vol
+  claims["claims_db · database"] --> fed["foreign catalog"]
+  vol --> bronze["bronze + quarantine"]
+  fed --> bronze
+```
+
+Kinds & methods (NOW vs not): [Lucid · Ingestion kinds](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=zl5N7dpZT3ez#).
+
 The first folder is the source system. A project is a child folder and must match `requested_by`. A spec with no project sits next to `source.yaml` and omits `requested_by`.
 
 ```

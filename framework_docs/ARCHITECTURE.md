@@ -349,8 +349,6 @@ erDiagram
   event_log ||--o{ load_ledger : "event hook, once per update (hourly catch-up if cut off)"
   load_ledger ||--o{ ledger_detail : "update_id, dataflow"
   load_ledger ||--o| v_loads : "latest per job, layer, update, dataflow"
-  load_ledger ||--o| load_ledger_archive : "archive_hot after 90 days"
-  load_ledger_archive ||--o| v_loads : "hot union archive"
   pipeline_updates ||--o{ load_ledger : "pipeline_id, update_id"
   load_ledger {
     string job_name
@@ -391,6 +389,8 @@ erDiagram
     string load_kind
   }
 ```
+
+Archive tables are not shown: after ~90 days, load & recon (`load_ledger`, `ledger_detail`) and job/run tracking (`job_runs`, `job_task_runs`, `pipeline_updates`) move to matching `*_archive` tables (`PARTITIONED BY archive_quarter`). `v_loads` / `v_ledger_detail` / `v_job_runs` read hot ∪ archive.
 
 `job_name` comes from the event log's table name, `<job>_event_log`. `pipeline_id` is the Databricks pipeline id, which joins to `v_pipeline_updates` with `update_id`. `dataflow` is the spec's `pipeline_id`, which joins to the registry. Rule counts land on the ledger from staged `flow_progress` when present.
 

@@ -2,6 +2,19 @@
 
 Domain-owned ingestion into bronze. Projects do not own anything here. Any team can ask for a file or a table by adding a spec. Silver, gold, and data products belong to the project bundles in [framework_curation](../framework_curation/README.md).
 
+```mermaid
+flowchart LR
+  specs["source.yaml + specs"] --> generate
+  generate --> build[".build/ pipelines + jobs + manifests"]
+  generate --> map["SOURCE_MAP.md"]
+  build --> manifest["lff.manifest + lff.catalog"]
+  manifest --> staged["_staged"]
+  staged --> bronze
+  staged --> quarantine
+```
+
+Editable Lucid: [4. Ingestion kinds](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=zl5N7dpZT3ez#) · [5. Quarantine](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=zl5N9IbMke~5#) · [6. Backfill](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=zl5NVfZfteiD#).
+
 ## Three bundles
 
 | Bundle | Holds | Owner |
@@ -95,6 +108,15 @@ raw_to_bronze:
 
 ## Quality rules and quarantine
 
+```mermaid
+flowchart LR
+  src["Source once"] --> staged["_staged + rules"]
+  staged -->|pass| valid["_valid → bronze"]
+  staged -->|quarantine| qrntn["_qrntn + failed_rules"]
+  staged -->|drop| dropped["dropped"]
+  staged -->|fail file| blocked["_files / _blocked_check"]
+```
+
 `raw_to_bronze.rules` holds SQL conditions every good row must meet. By default, a row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantined` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.
 
 ```yaml
@@ -160,7 +182,16 @@ If bronze is rebuilt (a full refresh, a replace, a restore), the change feed can
 
 ## How a load is recorded
 
-The pipeline records its own load, once per update, in `framework_meta.load_ledger` (read it through `v_loads` and `v_load_failures`). There is one row per table per run:
+The pipeline records its own load, once per update, in `framework_meta.load_ledger` (read it through `v_loads` / `v_ledger_detail` / `v_load_failures` — see [root README · views by usage](../README.md#query-views-by-usage)). There is one row per table per run:
+
+```mermaid
+flowchart LR
+  fails["v_load_failures"] --> decide{"checkpoint OK?"}
+  decide -->|yes| repair["Jobs Repair"]
+  decide -->|reload| bf["./run.sh backfill · load_kind=backfill"]
+  bf --> stage["stage_frame + same rules"]
+  stage --> ledgers["load_ledger / ledger_detail"]
+```
 
 | Column | Meaning |
 | --- | --- |

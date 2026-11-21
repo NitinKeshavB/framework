@@ -8,7 +8,19 @@ The repository overview is [../README.md](../README.md). This page is every file
 | `<source_system>_<table>.yaml` | The project bringing it in, or the source itself | `sources/<source_system>/<project>/`, or next to `source.yaml` when there is no project |
 | `project.yaml` | The project | `framework_curation/<domain>/<project>/` |
 
-Check them without a cluster: `./run.sh generate` for ingestion, `./run.sh projects:generate` for curation. Both print every error in one pass. Job runs, statuses, and definition metadata live in frozen `framework_meta` (see [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md)); the views are listed in the [root README](../README.md#see-what-is-running).
+Check them without a cluster: `./run.sh generate` for ingestion, `./run.sh projects:generate` for curation. Both print every error in one pass. Job runs, statuses, and definition metadata live in frozen `framework_meta` (see [META_MODEL_REVIEW.md](META_MODEL_REVIEW.md)); views are grouped by usage in the [root README](../README.md#query-views-by-usage).
+
+```mermaid
+flowchart LR
+  yaml["YAML configs"] --> sync["registry_sync at deploy"]
+  sync --> hist["asset_registry SCD2"]
+  sync --> cur["asset_registry_current"]
+  sync --> refuse["ownership_refusals"]
+  sync --> comments["UC column comments"]
+  sync -.->|"tags parked · APPLY_TAGS=false"| drift["v_metadata_drift"]
+```
+
+Editable Lucid page: [7. Metadata via configs](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=zl5NbFTVBczy#).
 
 ## source.yaml
 

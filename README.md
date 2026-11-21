@@ -4,11 +4,32 @@ Config-driven ingestion and a metadata registry for Databricks Lakeflow. Teams a
 
 ## How it fits together
 
+```mermaid
+flowchart LR
+  subgraph domain["Source / domain team"]
+    yaml["source.yaml + table specs"] --> gen["./run.sh generate"]
+    gen --> build[".build/ pipelines · jobs · lff.manifest"]
+  end
+  subgraph platform["Platform · framework_bundle"]
+    ddl["framework_ddl → framework_meta"]
+    runs["framework_runs hourly"]
+    opt["framework_optimize daily"]
+  end
+  subgraph project["Project · framework_curation"]
+    proj["project.yaml"] --> pgen["projects:generate"]
+    pgen --> maps["PROJECT_MAP · jobs"]
+  end
+  build --> refresh["refresh_pipeline"]
+  refresh --> bronze["bronze + quarantine"]
+  refresh --> hook["event hook → load_ledger / ledger_detail"]
+  bronze --> maps
+  ddl --> registry["asset_registry"]
+  hook --> views["v_loads · v_load_failures"]
+  runs --> jobViews["v_job_status · v_job_runs"]
 ```
-source system ──delivery──▶ bronze ──▶ silver / gold / product
- (framework_ingestion)                 (framework_curation)
-        every definition and run is recorded in framework_meta (framework_bundle)
-```
+
+Config → generate (`.build/` + `lff.manifest`) → deploy (DDL / `registry_sync`) → run (`refresh_pipeline` + event-hook ledgers) → hourly `framework_runs` / daily archive. Editable diagrams: [Lucidchart](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit).
+
 
 | Folder | Role | Owner |
 | --- | --- | --- |
@@ -75,41 +96,180 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 `bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job refreshes its pipeline, which records its own load metrics: the pipeline reads its delivery from `lff.manifest`, and a run does not write the registry.
 
-## See what is running
+## `framework_meta` data model
 
-Query `<catalog>.framework_meta`:
+Editable Lucidchart: [framework_meta ERD](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit). Table/view catalog: [framework_meta_data_dictionary.html](framework_docs/framework_meta_data_dictionary.html).
 
-| View | What it answers |
+Archive note: after ~90 days, load & recon (`load_ledger`, `ledger_detail`) and job/run tracking (`job_runs`, `job_task_runs`, `pipeline_updates`) move to matching `*_archive` tables (`PARTITIONED BY archive_quarter`). Archive tables are not drawn below; query via `v_loads` / `v_ledger_detail` / `v_job_runs` (hot ∪ archive). Event logs live in `framework_events`.
+
+```mermaid
+erDiagram
+  asset_registry ||--|| asset_registry_current : "current version"
+  asset_registry_current ||--o{ ownership_refusals : "refused name"
+  job_runs ||--o{ job_task_runs : "job_run_id"
+  job_runs ||--o{ pipeline_updates : "job delivery"
+  pipeline_updates ||--o{ load_ledger : "pipeline_id, update_id"
+  load_ledger ||--o{ ledger_detail : "update_id, dataflow"
+
+  asset_registry {
+    string asset_id
+    string object_kind PK
+    string full_name PK
+    timestamp valid_from PK
+    string owner_kind
+    string owner
+    boolean is_current
+    boolean is_deleted
+  }
+  asset_registry_current {
+    string object_kind PK
+    string full_name PK
+    string owner_kind
+    string owner
+  }
+  ownership_refusals {
+    string object_kind
+    string full_name
+    string refused_owner
+    string holder_owner
+    timestamp recorded_at
+  }
+  job_runs {
+    string job_id PK
+    string run_id PK
+    string job_name
+    string status
+    string run_as
+    timestamp recorded_at
+  }
+  job_task_runs {
+    string job_run_id PK
+    string task_run_id PK
+    string task_key
+    string status
+  }
+  pipeline_updates {
+    string pipeline_id PK
+    string update_id PK
+    string job_name
+    string status
+    string run_as
+  }
+  load_ledger {
+    string update_id PK
+    string job_name
+    string layer
+    string dataflow
+    string source_kind
+    string run_as
+    string load_kind
+    bigint rows_read
+    bigint rows_inserted
+    bigint rows_updated
+    bigint rows_quarantined
+    bigint rows_dropped
+    string target_status
+    timestamp recorded_at
+  }
+  ledger_detail {
+    string update_id PK
+    string dataflow
+    string detail_kind
+    string src_file_path
+    string status
+    string load_kind
+    timestamp recorded_at
+  }
+  ddl_applied {
+    string sql_hash PK
+    timestamp applied_at
+  }
+  silver_progress {
+    string silver_table PK
+    string bronze_table PK
+    timestamp last_ingest_timestamp
+  }
+```
+
+## Query views by usage
+
+All live under `<catalog>.framework_meta`. Filter by `owner` where present. Definitions are SCD Type 2 (changed specs close the old version; removed specs get a deletion version). Events (`load_ledger`, `ledger_detail`, `job_runs`) are insert-only. A job can be green while its load is `FAILED` — watch recon, not only job status.
+
+### Load health and repair (recon SoR)
+
+Use these after a delivery run, before trusting bronze. Written by the pipeline event hook (near real time); not the job green light.
+
+| View | Use for |
 | --- | --- |
-| `v_asset_registry_current` | Current definitions for every object kind, with owner |
-| `v_workflows` | Each delivery job, its pipeline ids, and every requester |
-| `v_pipelines` | Source system, requesting team, delivery, domain, data domain, team, owner, and who is mailed |
-| `v_dataflows` | Raw path or table, bronze, and quarantine for each table load |
-| `v_flows` | Raw, bronze, and quarantine flows, with relation and path or table |
-| `v_tables` | Owner, requester, classification, and PII on each table |
-| `v_asset_registry_history` | Every version of a source system, schema, workflow, pipeline, flow, table, link, or column, with `valid_from`, `valid_to`, `is_current`, and `is_deleted` (SCD Type 2). Filter it to see the system at a moment. |
-| `v_source_systems`, `v_schemas` | Each source system as `source.yaml` declares it, and the schemas it uses with their tags. |
-| `v_columns`, `v_column_history` | Columns of raw, bronze, and quarantine: type, description, tags, and every past version |
-| `v_lineage` | Links from a pipeline to its tables |
-| `v_job_status` | Each job with its latest run: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED` (written by the hourly `framework_runs` job, which also records runs that never reached the pipeline) |
-| `v_loads`, `v_load_failures` | Per-load recon and failures, written by the pipeline itself once per update (an event hook): `source_kind`, `run_as`, `load_kind`; rows read/inserted/updated/deleted/quarantined/dropped; files read and failed; status and error. Counts are never NULL. A job can succeed while its load is `FAILED` (a file did not come, or came empty) |
-| `v_ledger_detail` | Child file/input rows: status (`PROCESSED`, `WARNING`, `FAILED`), counts, rules, and why it failed. `detail_kind` is `file` or `input`; `load_kind` is regular, backfill, or catchup |
-| `v_ownership_conflicts` | Tables claimed by two owners. Empty when the rules hold. |
-| `v_ownership_refusals` | Definitions a deploy refused because another owner holds the table or pipeline |
-| `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates` | Run and update state, termination code, and durations (recorded hourly) |
-| `v_job_costs`, `v_pipeline_costs` | DBUs and list cost per run and update. Only when `system_views` is `true` |
-| `v_metadata_drift` | Declared tags and column comments that Unity Catalog does not hold, or holds differently |
-| `v_observed_lineage` | Sources Unity Catalog saw each bronze and quarantine table read, against the declared source. Only when `system_views` is `true` |
+| `v_loads` | Latest load per job / layer / update / dataflow: `source_kind`, `run_as`, `load_kind`, counts (read / inserted / updated / deleted / quarantined / dropped), files, status, error |
+| `v_ledger_detail` | Drill into each file or curated input (`detail_kind=file\|input`): status, rules, counts, `load_kind` |
+| `v_load_failures` | What failed and why: load + job/task `failure_reason`, task key, run page — start repair / backfill from here |
 
-Filter by `owner`. Definitions are SCD Type 2: a changed spec closes its old version, a removed spec gets a deletion version, and nothing is deleted. Events (`load_ledger`, `ledger_detail`, `job_runs`) are insert-only.
+```mermaid
+flowchart LR
+  fails["v_load_failures"] --> decide{"checkpoint OK?"}
+  decide -->|yes| repair["Jobs Repair"]
+  decide -->|reload / refresh| bf["framework_backfill · load_kind=backfill"]
+  bf --> stage["same stage_frame + rules"]
+  stage --> ledgers["load_ledger / ledger_detail"]
+```
+
+### Job and pipeline run status
+
+Recorded hourly by `framework_runs` (Jobs API / `system.lakeflow` + event logs). Lag up to ~1h for run status; recon does not wait on this.
+
+| View | Use for |
+| --- | --- |
+| `v_job_status` | Each workflow’s latest run: `RUNNING` / `SUCCEEDED` / `FAILED` / `SKIPPED`, termination code, run page |
+| `v_job_runs` | Append-only job run history (latest per job/run via the view) |
+| `v_job_task_runs` | Per-task outcomes (e.g. `refresh_pipeline`) and task `failure_reason` |
+| `v_pipeline_updates` | Lakeflow update start/end/state/status + `run_as` |
+
+### Definitions and ownership
+
+Written only by `registry_sync` at deploy. Look up what is supposed to exist and who owns it.
+
+| View | Use for |
+| --- | --- |
+| `v_asset_registry_current` | Current definition for every object kind, with owner |
+| `v_asset_registry_history` | SCD2 time travel: `valid_from` / `valid_to` / `is_current` / `is_deleted` |
+| `v_source_systems`, `v_schemas` | Source.yaml declaration and schemas/tags |
+| `v_workflows` | Delivery jobs, pipeline ids, requesters |
+| `v_pipelines` | Domain, team, technical owner, notify lists |
+| `v_dataflows` | Raw path/table, bronze, quarantine per table load |
+| `v_flows` | Per-layer flow with relation, path, or table |
+| `v_tables` | Owner, requester, classification, PII, load method |
+| `v_ownership_conflicts` | Names with more than one owner — should stay empty |
+| `v_ownership_refusals` | Deploys refused because another owner holds the name |
+
+### Columns and declared lineage
+
+| View | Use for |
+| --- | --- |
+| `v_columns`, `v_column_history` | Current and past columns: type, description, tags |
+| `v_lineage` | Declared pipeline → table write/reject edges |
+
+### Optional (needs `system_views: true` or UC compare)
+
+| View | Use for |
+| --- | --- |
+| `v_metadata_drift` | Declared tags/comments vs Unity Catalog `information_schema` |
+| `v_job_costs`, `v_pipeline_costs` | DBUs / list cost per run or update (`system.billing`) |
+| `v_observed_lineage` | Declared vs UC-observed sources (`system.access.table_lineage`) |
 
 ```sql
--- latest status for every job owned by billing
+-- load health for a delivery (recon, not job green)
+SELECT dataflow, target_table, load_kind, target_status, rows_read, rows_inserted, failure_reason
+FROM aal_dev_fdh.framework_meta.v_loads
+WHERE job_name = 'abs_daily'
+ORDER BY started_at DESC;
+
+-- latest job status for every billing-owned workflow
 SELECT job_name, status, termination_code, run_id, started_at
 FROM aal_dev_fdh.framework_meta.v_job_status
 WHERE owner = 'billing';
 
--- what a delivery job loads
+-- what a delivery job is supposed to load
 SELECT job_name, pipeline_ids, requesters, delivery
 FROM aal_dev_fdh.framework_meta.v_workflows
 WHERE owner = 'billing';
@@ -133,7 +293,7 @@ source venv/bin/activate        # or set PYTHON to a venv's python
 
 ## Read next
 
-- [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, `project.yaml`
+- [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, `project.yaml` (and [query views by usage](#query-views-by-usage))
 - [framework_docs/END_TO_END.md](framework_docs/END_TO_END.md) for the run path, quality rules, and the registry
 - [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the flows, the data model of every table the framework writes, the module boundaries, and the design choices
 - [framework_docs/META_MODEL_REVIEW.md](framework_docs/META_MODEL_REVIEW.md) for the frozen `framework_meta` schema, who writes what and when, and removed objects
