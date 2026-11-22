@@ -242,9 +242,9 @@ TBLPROPERTIES (
   'delta.autoOptimize.autoCompact' = 'true'
 );
 
--- Append-only recon. dataflow = spec id. update_pipeline_uuid = Lakeflow UUID from events.
--- Hot ~90 days (liquid CLUSTER BY). Forever archive PARTITIONED BY archive_quarter (Hive).
--- Child ledger_detail joins on (update_id, dataflow). batch_id bridges to row _batch_id only.
+-- Ops recon: did each table load succeed this run (counts, status, failure reason).
+-- One row per table per update. Child ledger_detail = which file/input failed.
+-- Hot ~90 days; older rows move to load_ledger_archive for audit.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.load_ledger (
   layer STRING NOT NULL,
   job_name STRING NOT NULL,
@@ -319,7 +319,7 @@ TBLPROPERTIES (
 CREATE VOLUME IF NOT EXISTS ${catalog}.framework_meta.backfill_state
 COMMENT 'Checkpoints of framework_backfill runs. Safe to delete a run folder once it has finished.';
 
--- Child unit-of-work: detail_kind=file|input. Join parent on (update_id, dataflow). No batch_id.
+-- Ops drill-down: which files or upstream inputs were processed, warned, or blocked in a load.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ledger_detail (
   update_id STRING NOT NULL,
   dataflow STRING NOT NULL,
@@ -459,8 +459,8 @@ CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.ddl_applied (
   applied_at TIMESTAMP NOT NULL
 );
 
--- Append-only flow checkpoint (incremental watermark for any flow: JDBC bronze, read_new, …).
--- Effective mark: v_flow_checkpoint (latest SUCCEEDED). Never MERGE/UPDATE the physical table.
+-- Ops checkpoint: how far a job has safely read its source (next run only takes new data).
+-- Written only after the target write succeeds. Current mark: v_flow_checkpoint.
 CREATE TABLE IF NOT EXISTS ${catalog}.framework_meta.flow_checkpoint (
   reader_table STRING NOT NULL,
   source_table STRING NOT NULL,

@@ -101,7 +101,7 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 Editable Lucidchart (source of truth): [framework_meta ERD + taxonomy](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit).  
 Pages: [1 · ERD](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=page1#) · [2 · table/view lookup](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit?page=ejCNub9Z7cfa#). Offline catalog: [framework_meta_data_dictionary.html](framework_docs/framework_meta_data_dictionary.html).
 
-**Archive note:** after ~90 days, load & recon (`load_ledger`, `ledger_detail`) and job/run tracking move to `*_archive` (`PARTITIONED BY archive_quarter`). Hot recon uses liquid `CLUSTER BY` (not day Hive partitions). Query via `v_loads` / `v_ledger_detail` / `v_job_runs`. Event logs live in `framework_events`. Incremental watermarks: `flow_checkpoint` / `v_flow_checkpoint` (append-only; not folded into the ledger).
+**How ops use this:** `v_loads` / `v_load_failures` = did last night’s tables load? `v_ledger_detail` = which file blocked? `v_flow_checkpoint` = how far has this job safely read its source? Raw facts stay in `load_ledger` / `ledger_detail` / `flow_checkpoint` / `job_runs`. After ~90 days, older load and job history moves to `*_archive` (kept for audit). Event logs live in `framework_events`.
 
 ```mermaid
 erDiagram
@@ -185,9 +185,10 @@ Use these after a delivery run, before trusting bronze. Written by the pipeline 
 
 | View | Use for |
 | --- | --- |
-| `v_loads` | Latest load per job / layer / update / dataflow: `source_kind`, `run_as`, `load_kind`, counts (read / inserted / updated / deleted / quarantined / dropped), files, status, error |
-| `v_ledger_detail` | Drill into each file or curated input (`detail_kind=file\|input`): status, rules, counts, `load_kind` |
-| `v_load_failures` | What failed and why: load + job/task `failure_reason`, task key, run page — start repair / backfill from here |
+| `v_loads` | Latest outcome per table load — counts, status, error (dashboards / “what failed?”) |
+| `v_flow_checkpoint` | How far each incremental job has safely read its source — next run starts here |
+| `v_ledger_detail` | Which file or input failed in that load — drill from a failed row in `v_loads` |
+| `v_load_failures` | Failed loads joined to job/task reasons — repair work queue |
 
 ```mermaid
 flowchart LR
