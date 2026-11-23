@@ -31,19 +31,19 @@ raw_to_bronze:
 
 Rules of different actions mix in one table. A row that fails a `quarantine` rule is quarantined even if it also failed a `warn` rule; a row that fails only `drop` and `warn` rules is dropped; a row that fails only `warn` rules loads.
 
-**What `fail` does, for a table loaded from files.** One row that breaks a `fail` rule blocks its **whole file**:
+**What `fail` does, for a table loaded from files.** A row that breaks a `fail` rule is kept out of bronze and the load is recorded `FAILED`, but the pipeline and the job do **not** fail:
 
-- None of that file's rows reach bronze. Its bad rows go to quarantine, so you can see what was wrong. Its good rows are not kept anywhere, and are counted in `rows_dropped` on the ledger.
-- The other files of the run load normally. With 100 files and 3 bad ones, 97 load, 3 are blocked, and all 3 are named.
-- The pipeline update, and so the job, **fails**, with the file names and rules in the error. The run is `FAILED` in `load_ledger` with `files_failed` set, and each blocked file is `FAILED` in `ledger_detail`.
-- **The file is marked as read.** The next run does not pick it up, so it does not fail again. To load a blocked file you fix the data or the rule and run a backfill (below). A retry of the same update never succeeds by skipping the file: automatic retry of a failed update is turned off for these pipelines for that reason (`pipelines.numUpdateRetryAttempts` is 0).
+- The bad row goes to quarantine, so you can see what was wrong. The **rest of its file loads** to bronze, as does every other file of the run.
+- The file is `FAILED` in `ledger_detail` (`error_message`: `rows broke fail rule(s): <rules>`) and the table's `load_ledger` row is `FAILED` with `files_failed` set and the files and rules named. Watch `v_load_failures`, not only the job status.
+- A table with no quarantine table keeps those rows nowhere. Its `load_ledger` row is still `FAILED`, naming the rule and the number of rows, but no file is marked in `ledger_detail`.
+- **The file is marked as read.** The next run does not pick it up. To load its bad rows you fix the data or the rule and run a backfill (below).
 - **A rule change applies from the next run.** What a row's rules mean is decided once, when the file is read, and stored. Files already read are never judged again by a changed rule, unless you backfill them.
 
-This was run on a real pipeline: a file with one bad row was blocked, the run and the job ended `FAILED`, bronze kept only the good files, and the next run left the blocked file alone.
+**This changed.** A `fail` rule used to block its whole file (no row of it reached bronze) and fail the update and the job. It no longer does, because holding back a file's good rows needed a working table per pipeline.
 
 A table loaded from a **database** has no files, so `fail` there stops the whole run: no row of the run, good ones included, reaches bronze.
 
-The checks the framework adds itself (`schema_conformance`, `cast_<column>`, `not_null_<key>`) follow `raw_to_bronze.on_fail`, or quarantine when it is not set (drop, when the table has no quarantine). With `on_fail: fail` on `raw_to_bronze`, a value that does not fit its column, or an empty key, also blocks the file.
+The checks the framework adds itself (`schema_conformance`, `cast_<column>`, `not_null_<key>`) follow `raw_to_bronze.on_fail`, or quarantine when it is not set (drop, when the table has no quarantine). With `on_fail: fail` on `raw_to_bronze`, a value that does not fit its column, or an empty key, is treated as a `fail` row.
 
 Not available yet: a limit such as "fail only when more than 5% of rows are bad".
 
@@ -75,11 +75,11 @@ One job, `framework_backfill` (in `framework_bundle`), reloads any table. It loa
 - With no files and no dates it reloads **every** file in the directory, and needs `confirm=true`.
 - A reloaded file's earlier rows are removed from bronze and quarantine first, so a reload never leaves a duplicate. Running the same backfill twice gives the same data.
 - A backfill records these as `FAILED` too, and the job still succeeds with a `WARNING:` line: a **file name that is not in the folder** (`file not found`), a file that was read and **has no rows** (`file has no rows`), and a **date range or folder with no file at all**. The files that do exist still load. (`mode=failed` with nothing failed is not an error: there is nothing to retry.) Give several names with commas: `files=a.csv,b.csv`.
-- A file that still breaks a `fail` rule is blocked again: recorded `FAILED`, bad rows to quarantine, none of its good rows loaded. The backfill **goes on with the next file** and the job ends **successfully, with a `WARNING:` line** naming the blocked files. The ledger row of the backfill is `FAILED`. A job has no "succeeded with warning" status, so look at the task output or `v_load_failures`.
-- `full_refresh` refreshes the table's own pipeline with a full refresh of that table: it deletes the table's data and reads every file again under the current rules. It also resets the table's change feed history, so a silver table that reads it must be rebuilt. Blocked files are judged again, and fail again unless the rule or the file changed.
+- A file that still breaks a `fail` rule is recorded `FAILED` again: its bad rows go to quarantine and its good rows load. The backfill **goes on with the next file** and the job ends **successfully, with a `WARNING:` line** naming those files. The ledger row of the backfill is `FAILED`. A job has no "succeeded with warning" status, so look at the task output or `v_load_failures`.
+- `full_refresh` refreshes the table's own pipeline with a full refresh of that table: it deletes the table's data and reads every file again under the current rules. It also resets the table's change feed history, so a silver table that reads it must be rebuilt. Files with `fail` rows are judged again, and fail again unless the rule or the file changed.
 - Not supported by file: tables that keep history by key (`scd1`, `scd2`) and tables loaded from a database. Use `full_refresh` for those.
 
-Each run's ledger row shows `rows_read ≈ rows_inserted + rows_quarantined + rows_dropped` (blocked good rows fold into `rows_dropped`); a warning is logged if it does not.
+Each run's ledger row shows `rows_read ≈ rows_inserted + rows_quarantined + rows_dropped` (a backfill counts `rows_dropped` per file; a pipeline run takes it from the table's flows); a warning is logged if it does not.
 
 ## How a rule behaves
 

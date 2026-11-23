@@ -8,7 +8,7 @@ import pytest
 
 from lakeflow_framework import ConfigValidationError, build_pipeline
 from lakeflow_framework.config import config_from_document
-from lakeflow_framework.pipeline import ARRIVAL_SLACK_MINUTES, arrivals_sql, assemble
+from lakeflow_framework.pipeline import assemble
 from lakeflow_framework.pipeline_metrics import (
     EMPTY_FILE,
     apply_arrivals,
@@ -61,25 +61,56 @@ def test_the_setting_survives_the_registry_round_trip(tmp_path: Path) -> None:
     assert "expect_file" not in plain.canonical()["source_to_raw"]["source"]
 
 
-def test_only_a_table_that_expects_a_file_gets_the_arrivals_view(tmp_path: Path) -> None:
-    kinds = [dataset.kind for dataset in assemble(config_for(tmp_path)).datasets]
-    assert "arrivals" in kinds
-    assert "arrivals" not in [d.kind for d in assemble(config_for(tmp_path, FILE_SOURCE)).datasets]
-
-
-def test_the_view_is_registered_with_a_listing_that_reads_no_file_content(tmp_path: Path) -> None:
-    config = config_for(tmp_path)
+def test_no_table_is_added_for_the_check_whether_or_not_a_file_is_expected(tmp_path: Path) -> None:
+    for source in (SCHEDULED, FILE_SOURCE):
+        kinds = [dataset.kind for dataset in assemble(config_for(tmp_path, source)).datasets]
+        assert not {"arrivals", "files", "blocked_check"} & set(kinds)
     spark = _SourceSpark()
     pipelines = _Pipelines(spark)
-    build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config)
-    assert (
-        "files_things_inventory" in pipelines.names and "files_things_arrivals" in pipelines.names
-    )
-    assert pipelines.kinds["files_things_arrivals"] == "materialized_view"
-    sql = arrivals_sql(config, "files_things_inventory", "files_things_files")
-    # The previous run's start, not a backfill's, and a few minutes of slack for a file in flight.
-    assert "update_id NOT LIKE 'backfill-%'" in sql
-    assert f"INTERVAL {ARRIVAL_SLACK_MINUTES} MINUTES" in sql
+    build_pipeline("files_things", spark=spark, pipelines=pipelines, config=config_for(tmp_path))
+    assert not [n for n in pipelines.names if n.endswith(("_arrivals", "_inventory", "_files"))]
+
+
+def test_the_check_lists_the_volume_and_reads_only_the_ledger_tables(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from lakeflow_framework import pipeline_metrics
+
+    listed = [
+        {
+            "file_path": "/v/old.csv",
+            "file_bytes": 1,
+            "arrived_at": datetime(2026, 11, 1, tzinfo=UTC),
+        },
+        {
+            "file_path": "/v/new.csv",
+            "file_bytes": 0,
+            "arrived_at": datetime(2026, 11, 19, tzinfo=UTC),
+        },
+    ]
+    monkeypatch.setattr(pipeline_metrics, "list_volume_files", lambda _path, _glob=None: listed)
+
+    class Ledger(_Spark):
+        def sql(self, statement: str):
+            self.queries.append(statement)
+            if "max(started_at)" in statement:
+                since = datetime(2026, 11, 18, tzinfo=UTC).timestamp()
+                return type("R", (), {"collect": lambda _s: [{"since": since}]})()
+            return type("R", (), {"collect": lambda _s: []})()
+
+    spark = Ledger()
+    (row,) = run(recorder(dataflow(expect_file=True, path="/v/")), loaded(0, 0, 0))
+    row["batch_id"] = "batch-1"
+    arrivals = read_arrivals(spark, "aal_dev_fdh", row, [])
+    # Only what arrived after the previous regular run (less a few minutes) is new.
+    assert [item["src_file_name"] for item in arrivals] == ["new.csv"]
+    assert arrivals[0]["has_rows"] is False and arrivals[0]["recorded_before"] is False
+    ledger_query = next(q for q in spark.queries if "max(started_at)" in q)
+    assert "update_id NOT LIKE 'backfill-%'" in ledger_query  # a backfill does not move it
+    assert all("framework_meta.load_ledger" in q or "ledger_detail" in q for q in spark.queries)
+    assert read_arrivals(spark, "aal_dev_fdh", {**row, "_expect_file": False}, []) is None
 
 
 def _arrival(name: str, *, has_rows: bool, recorded_before: bool = False) -> dict:
@@ -164,7 +195,7 @@ def test_an_empty_file_beside_a_blocked_one_keeps_both_reasons() -> None:
     ]
     row = make_row(blocked)
     apply_arrivals(row, [_arrival("b.csv", has_rows=True), _arrival("e.csv", has_rows=False)])
-    assert "blocked by fail rules" in row["failure_reason"] and "e.csv" in row["failure_reason"]
+    assert "broke fail rules" in row["failure_reason"] and "e.csv" in row["failure_reason"]
     assert (row["files_read"], row["files_failed"]) == (2, 2)
 
 
@@ -173,34 +204,25 @@ def test_a_table_that_expects_no_file_is_not_touched() -> None:
     assert apply_arrivals(row, None)["target_status"] == "COMPLETED"
 
 
-def test_the_arrivals_are_read_from_the_view_and_written_with_the_ledger() -> None:
-    class Arrivals(_Spark):
-        def sql(self, statement: str):
-            if "files_things_arrivals" in statement:
-                data = [
-                    {
-                        "file_path": "/v/e.csv",
-                        "file_name": "e.csv",
-                        "has_rows": False,
-                        "recorded_before": False,
-                    }
-                ]
-                return type("R", (), {"collect": lambda _s: data})()
-            return super().sql(statement)
+def test_an_empty_file_found_by_the_check_is_written_with_the_ledger(monkeypatch) -> None:
+    from datetime import UTC, datetime
 
-    spark = Arrivals()
-    (row,) = run(
-        recorder(
-            dataflow(
-                files="aal.framework_meta.files_things_files",
-                arrivals="aal.framework_meta.files_things_arrivals",
-                path="/v/",
-            )
-        ),
-        loaded(0, 0, 0),
+    from lakeflow_framework import pipeline_metrics
+
+    monkeypatch.setattr(
+        pipeline_metrics,
+        "list_volume_files",
+        lambda _path, _glob=None: [
+            {
+                "file_path": "/v/e.csv",
+                "file_bytes": 0,
+                "arrived_at": datetime(2026, 11, 19, tzinfo=UTC),
+            }
+        ],
     )
+    spark = _Spark()
+    (row,) = run(recorder(dataflow(expect_file=True, path="/v/")), loaded(0, 0, 0))
     row["batch_id"] = "batch-1"
-    assert read_arrivals(spark, row)[0]["src_file_name"] == "e.csv"
     write_rows(spark, "aal_dev_fdh", [row])
     from lakeflow_framework.pipeline_metrics import DETAIL_COLUMNS
 

@@ -94,9 +94,9 @@ def test_on_fail_with_rules_creates_the_quarantine_table(tmp_path: Path, action:
     assert config_from_document(config.canonical()).has_quarantine
 
 
-def test_a_blocked_files_bad_rows_count_as_dropped_when_there_is_no_quarantine() -> None:
-    kept = files_sql("staged", ["id_present"], this_run=False)
-    lost = files_sql("staged", ["id_present"], this_run=False, quarantine=False)
+def test_a_failed_files_bad_rows_count_as_dropped_when_there_is_no_quarantine() -> None:
+    kept = files_sql("staged", ["id_present"])
+    lost = files_sql("staged", ["id_present"], quarantine=False)
     assert "IN ('fail', 'quarantine')) AS rows_quarantined" in kept
     assert "IN ('drop')) AS rows_dropped" in kept
     assert "IN ('quarantine')) AS rows_quarantined" in lost

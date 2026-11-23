@@ -91,30 +91,28 @@ flowchart TD
   trigger --> jobsApi[(Jobs API run history)]
 ```
 
-The job has one task, **refresh_pipeline**. (Frozen `cloud_files` methods add **batch_load** before it.) There is no recording task after it. The pipeline records its own loads: an **event hook** inside the pipeline folds the update's events into one `load_ledger` row per table and one `ledger_detail` row per file (or curated input), and writes both at the same time. Every count is a number, and a table that failed or could not register is `FAILED` with the error. The hook starts as soon as every flow of the delivery has finished, because serverless can shut the pipeline down within seconds of a failure and cancel a write still running. If a write is cut off anyway, the update has no `load_ledger` row, and the hourly `framework_runs` finds it from the event log and writes it through the same recorder (that path does not run the missing-file check below). Insert only; no MERGE; no scan of target tables. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry for specs. **A pipeline's own restart of a failed update is turned off** (`pipelines.numUpdateRetryAttempts` is `0` in the generated pipeline): a file blocked by a `fail` rule fails the update on purpose, and a restart would find the file already read and finish, hiding the failure.
+The job has one task, **refresh_pipeline**. (Frozen `cloud_files` methods add **batch_load** before it.) There is no recording task after it. The pipeline records its own loads: an **event hook** inside the pipeline folds the update's events into one `load_ledger` row per table and one `ledger_detail` row per file (or curated input), and writes both at the same time. Every count is a number, and a table that failed or could not register is `FAILED` with the error. The hook starts as soon as every flow of the delivery has finished, because serverless can shut the pipeline down within seconds of a failure and cancel a write still running. If a write is cut off anyway, the update has no `load_ledger` row, and the hourly `framework_runs` finds it from the event log and writes it through the same recorder (that path does not run the missing-file check below). Insert only; no MERGE; no scan of target tables. The pipeline validates its deployed spec files itself, so a run neither writes nor waits on the registry for specs. **A pipeline's own restart of a failed update is turned off** (`pipelines.numUpdateRetryAttempts` is `0` in the generated pipeline): a restart would find the files already read and finish, hiding a failure the first attempt had.
 
 ### Inside one pipeline: source to bronze and quarantine
 
 ```mermaid
 flowchart LR
   source[raw volume files or foreign table] -->|read once| staged["&lt;pipeline_id&gt;_staged (private)"]
-  staged -->|"_dq_result = pass, file not blocked"| valid["&lt;pipeline_id&gt;_valid (temporary view)"]
+  staged -->|"_dq_result = pass"| valid["&lt;pipeline_id&gt;_valid (temporary view)"]
   valid --> bronze[bronze table]
   staged -->|"_dq_result = fail or quarantine"| quarantine["quarantine table (_qrntn)"]
-  staged -->|"one row per file"| files["&lt;pipeline_id&gt;_files (view)"]
-  files -->|"blocked files"| valid
-  files -->|"blocked files"| check["&lt;pipeline_id&gt;_blocked_check (fails the update)"]
-  listing[volume listing] --> arrivals["&lt;pipeline_id&gt;_arrivals (view)"]
-  files --> arrivals
+  bronze -.->|"counted by _batch_id"| hook["event hook"]
+  quarantine -.->|"counted by _batch_id"| hook
+  hook --> ledger[("load_ledger + ledger_detail")]
 ```
 
 The staging table computes `_dq_failed_rules` once per row, and from it `_dq_result` (`fail`, `quarantine`, `drop` or `pass`; a row that broke only warn rules passes). Both are stored with the row, so a rule changed later never reclassifies a file already read. It carries one warn expectation per rule, so pass and fail counts reach the event log. Bronze is an append streaming table, an Auto CDC streaming table (`dedup: true`, or database `merge`), or a materialized view (database `snapshot`). The frozen `cloud_files` methods add a raw table before the staging table.
 
-A table loaded from **files** has three more datasets, all in the pipeline's own schema (`framework_meta`), not beside bronze:
+A table loaded from **files** adds no dataset of its own. The per-file rows of `ledger_detail` are built by the event hook, from the tables the run already wrote:
 
-- **`<pipeline_id>_files`** is a materialized view with one row per file of this run: rows read, loaded, quarantined, dropped and blocked, and a status (`PROCESSED`, `WARNING`, or `FAILED` when a `fail` rule blocked it). It reads only this run's rows of the staging table (found by `_batch_id` and the load time the staging table is clustered on). The ledger is written from it, and the valid view uses it to keep a blocked file's good rows out of bronze (a left anti-join on the blocked files).
-- **`<pipeline_id>_blocked_check`**, only when a rule has `on_fail: fail`, is a materialized view over the blocked files with an `expect_all_or_fail`. It runs after bronze and quarantine have finished, so the file is already marked read when it fails the update. This is the only way to fail the run and still consume the file: a failing load flow would leave Auto Loader's checkpoint behind, and the next run would read the file again.
-- **`<pipeline_id>_arrivals`**, only when the table expects a file each run (`source.expect_file`), lists the files that arrived since the previous regular run and says whether this run read rows from each. The hook uses it to record a run with no file, or a file with no rows, as `FAILED` while the job still succeeds.
+- **Per-file counts.** The hook counts the run's rows in bronze and in quarantine by `_batch_id` (with a bound on the load time both tables are clustered on), grouped by `_src_file_path`. A file's loaded rows are its bronze rows and its quarantined rows are its quarantine rows, so `rows_read` per file is their sum. A row dropped by a `drop` rule is kept nowhere, so no file shows it: the table's `rows_dropped` (`rows_read - rows_inserted - rows_quarantined`, from the event log) has it, and a file's own `rows_dropped` is 0. For a table that keeps history by key (Auto CDC), bronze holds the latest row per key, so a file's loaded count is the rows of the run that are still there.
+- **`fail` rules.** A row that breaks a `fail` rule goes to quarantine, and the file's other rows load. The file is `FAILED` in `ledger_detail` when a quarantine row of it lists a `fail` rule in `failed_rules`, and the table's `load_ledger` row is `FAILED` with the files and rules named, while the pipeline update and the job succeed. A table with no quarantine table keeps those rows nowhere, so no file shows them; the table's `load_ledger` row is still `FAILED`, from the staged flow's own expectation counts in the event log, naming the rule and the number of rows. Nothing fails the update, because a failing load flow would leave Auto Loader's checkpoint behind and the next run would read the file again.
+- **Expected files.** When the table expects a file each run (`source.expect_file`), the hook lists the volume (names, sizes and arrival times only), keeps the files that arrived after the previous regular run started (less five minutes), and compares them with the run's per-file counts and with `ledger_detail`. A run with no file, or a file with no rows, is `FAILED` while the job still succeeds. A replay by the hourly catch-up counts files from bronze and quarantine but does not run this check, and cannot tell a `fail` rule from any other because the registry does not carry the rules.
 
 A database source has no files, so a `fail` rule there is a run-level `expect_all_or_fail` on the staging table.
 
@@ -165,7 +163,6 @@ Editable Lucidchart ([Lakeflow framework_meta](https://lucid.app/lucidchart/4713
 | `load_ledger_archive` / `ledger_detail_archive` / `job_runs_archive` / `job_task_runs_archive` / `pipeline_updates_archive` | `framework_meta` | `framework_optimize` `archive_hot` | Rows moved off hot after 90 days; `PARTITIONED BY archive_quarter` | Delta, forever |
 | `ddl_applied` | `framework_meta` | `framework_ddl` / `apply_ddl` | One SQL file hash per successful apply | Delta, insert-only |
 | `<pipeline_id>_staged` | none (private) | ingestion pipeline | One source row | Private streaming table or materialized view |
-| `<pipeline_id>_files`, `_blocked_check`, `_arrivals` | `framework_meta` | ingestion pipeline (file sources) | The latest run's files; the blocked files of that run; the files that arrived since the previous run | Materialized views (see "Inside one pipeline") |
 | `backfill_state` | `framework_meta` (a volume) | `framework_backfill` | The Auto Loader schema and checkpoint of one backfill run | Volume; a finished run's folder can be deleted |
 | bronze, `<schema>.<table>` | `<source>_bronze` | ingestion pipeline | One passing row, or one row per key with Auto CDC | Streaming table or materialized view |
 | quarantine, `<table>_qrntn` (only with `rules` or a `quarantine` block) | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |
@@ -329,8 +326,8 @@ What each table the pipeline writes holds, beyond the spec's `columns`:
 | Table | Extra columns | Rows |
 | --- | --- | --- |
 | `<pipeline_id>_staged` | `_src_file_path`, `_src_file_name` (files), `_src_row_hash`, `_ingest_timestamp`, `_rescued_data` (Auto Loader on CSV, delimited, JSON, text), `_dq_failed_rules`, `_dq_result` (files); `_batch_id` is added when the row is staged | Every source row |
-| bronze | The same lineage columns, without `_dq_failed_rules` and `_dq_result` | Rows that passed, from files that were not blocked; with Auto CDC, the latest row per key by the watermark |
-| quarantine | The same lineage columns and `failed_rules` | Rows that broke a `quarantine` or `fail` rule, including the bad rows of a blocked file |
+| bronze | The same lineage columns, without `_dq_failed_rules` and `_dq_result` | Rows that passed, including the good rows of a file that had a `fail` row; with Auto CDC, the latest row per key by the watermark |
+| quarantine | The same lineage columns and `failed_rules` | Rows that broke a `quarantine` or `fail` rule |
 
 Every published table gets a comment, `table_properties` (`quality` = its layer, and `lakeflow_framework.pipeline_id`), and liquid clustering. At deploy, `registry_sync` sets these Unity Catalog tags:
 
@@ -403,13 +400,13 @@ Archive tables are not shown: after ~90 days, load & recon (`load_ledger`, `ledg
 
 **Per-load counts.** `v_loads` (or `load_ledger`) is the sole recon SoR for bronze, silver, gold, and product. The pipeline's event hook writes one row per registered dataflow per update; a table with no progress, or one that failed to register, is `FAILED` with the error, so partial delivery failures stay visible. Never MERGE. Filter on `layer` for one medallion layer (`WHERE layer = 'bronze'` for bronze only). `v_loads` unions 90-day hot with forever archive for dashboards. `v_load_failures` joins loads to job/task `failure_reason` for repair.
 
-**What the counts mean.** For an append load, `rows_read ≈ rows_inserted + rows_quarantined + rows_dropped` (blocked good rows of a fail-ruled file are folded into `rows_dropped`); the hook logs a warning when the identity does not hold. `rows_inserted` / `rows_updated` / `rows_deleted` are what the target flow changed. A load that failed or read nothing has every count 0, never NULL. `files_read` counts the files of the run and `files_failed` those recorded `FAILED`.
+**What the counts mean.** For an append load, `rows_read ≈ rows_inserted + rows_quarantined + rows_dropped` (`rows_dropped` is what that identity leaves, from the table's flows; a file's own `rows_dropped` is 0); the hook logs a warning when the identity does not hold. `rows_inserted` / `rows_updated` / `rows_deleted` are what the target flow changed. A load that failed or read nothing has every count 0, never NULL. `files_read` counts the files of the run and `files_failed` those recorded `FAILED`.
 
 **When a load is `FAILED` though the job succeeded.** Three things set `target_status` to `FAILED`, and the first also fails the job:
 
 | Cause | Job | Ledger reason |
 | --- | --- | --- |
-| A file broke a `fail` rule (a table loaded from files) | **Fails** | `N of M file(s) blocked by fail rules, none of their rows loaded to <bronze>: <file> (<rule>)` |
+| A row broke a `fail` rule (a table loaded from files) | **Fails** (the load in `load_ledger`; the job succeeds) | `N of M file(s) had rows that broke fail rules; those rows were kept out of <bronze>: <file> (<rule>)` |
 | A table that expects a file got none | Succeeds | `no file arrived in <folder> since the previous run` |
 | A file arrived with no rows (0 bytes, or a header only) | Succeeds | `N file(s) arrived with no rows: <names>`, and a `ledger_detail` row `FAILED` for each |
 

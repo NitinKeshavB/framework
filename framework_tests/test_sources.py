@@ -208,12 +208,11 @@ def test_volume_spec_reads_the_raw_volume_and_has_no_raw_table(tmp_path: Path) -
     assert [dataset.kind for dataset in graph.datasets] == [
         "staged",
         "valid",
-        "files",
         "bronze",
         "quarantine",
     ]
     assert graph.datasets[0].detail["source"] == config.path
-    assert graph.datasets[4].detail == {
+    assert graph.datasets[3].detail == {
         "source": "files_things_staged",
         "where": "_dq_result IN ('fail', 'quarantine')",
     }
@@ -523,7 +522,6 @@ def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path
     assert pipelines.kinds == {
         staged: "table",
         "files_things_valid": "view",
-        "files_things_files": "materialized_view",
         bronze: "table",
         quarantine: "table",
     }
@@ -531,7 +529,6 @@ def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path
     assert spark.reads == [
         (staged, "files", config.path),
         ("files_things_valid", "table", staged),
-        ("files_things_files", "sql", None),
         (bronze, "table", "files_things_valid"),
         (quarantine, "table", staged),
     ]

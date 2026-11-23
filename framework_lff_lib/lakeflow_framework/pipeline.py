@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +54,6 @@ from lakeflow_framework.quality import (
     valid_where,
 )
 from lakeflow_framework.sqlnames import require_catalog, sql_string
-from lakeflow_framework.volume_listing import list_volume_files
 
 log = logging.getLogger(__name__)
 
@@ -357,18 +356,11 @@ def _install_recorder(
                 quarantine=config.table_name("quarantine") if config.has_quarantine else "",
                 append=not config.uses_auto_cdc,
                 build_error=error,
-                files=_sibling(config, files_name(config)) if is_file_load(config) else "",
-                blocked_check=(
-                    _sibling(config, f"{pipeline_id}_blocked_check")
-                    if is_file_load(config) and _has_fail_rule(config)
-                    else ""
-                ),
-                arrivals=(
-                    _sibling(config, arrivals_name(config))
-                    if is_file_load(config) and config.expect_file
-                    else ""
-                ),
+                file_load=is_file_load(config),
+                expect_file=is_file_load(config) and config.expect_file,
+                fail_rules=tuple(blocking_rules(compile_rules(config))),
                 path=config.path if is_file_load(config) else "",
+                path_glob=(config.path_glob or "") if is_file_load(config) else "",
                 source_kind=config.source_kind,
                 run_as=config.run_as,
             )
@@ -382,16 +374,6 @@ def _install_recorder(
 # The schema a generated pipeline publishes its own working tables to (staged, files, checks).
 # Bronze and quarantine are named explicitly, so only these land here.
 PIPELINE_SCHEMA = "framework_meta"
-
-
-def _sibling(config: PipelineConfig, name: str) -> str:
-    """The full name of a working table the pipeline publishes in its own schema."""
-
-    return f"{config.catalog}.{PIPELINE_SCHEMA}.{name}"
-
-
-def _has_fail_rule(config: PipelineConfig) -> bool:
-    return bool(blocking_rules(compile_rules(config)))
 
 
 def _conf(spark: Any, key: str) -> str | None:
@@ -431,44 +413,6 @@ def is_file_load(config: PipelineConfig) -> bool:
     """True when the source is files, where one file is the unit that is read, counted and blocked."""
 
     return config.load_method in {"autoloader", "volume_files"}
-
-
-def files_name(config: PipelineConfig) -> str:
-    return f"{config.pipeline_id}_files"
-
-
-def arrivals_name(config: PipelineConfig) -> str:
-    return f"{config.pipeline_id}_arrivals"
-
-
-# A file that landed a moment before the previous run started still belongs to that run.
-ARRIVAL_SLACK_MINUTES = 5
-
-
-def arrivals_sql(config: PipelineConfig, inventory: str, files: str) -> str:
-    """Files that arrived since the previous regular run: where they are, and whether this run read
-    rows from them (``has_rows``) or an earlier load already recorded them (``recorded_before``).
-
-    A file that arrived, was not read and was never recorded is an empty one: Auto Loader read
-    it and found no rows, so it never shows in the per-file view. ``since`` is the start of the
-    previous regular run, so a backfill (which also writes to the ledger) does not move it.
-    """
-
-    pid = sql_string(config.pipeline_id)
-    ledger = f"{PIPELINE_SCHEMA}.load_ledger"
-    return (
-        f"SELECT i.file_path, regexp_extract(i.file_path, '[^/]+$', 0) AS file_name, "
-        "i.file_bytes, i.arrived_at, "
-        f"f.{SRC_FILE_PATH} IS NOT NULL AS has_rows, l.src_file_path IS NOT NULL AS recorded_before "
-        f"FROM {inventory} i "
-        f"LEFT JOIN {files} f ON f.{SRC_FILE_PATH} = i.file_path "
-        f"LEFT JOIN (SELECT DISTINCT src_file_path FROM {PIPELINE_SCHEMA}.ledger_detail "
-        f"WHERE dataflow = {pid}) l ON l.src_file_path = i.file_path "
-        "WHERE i.arrived_at > coalesce(("
-        f"SELECT max(started_at) FROM {ledger} WHERE dataflow = {pid} "
-        "AND update_id NOT LIKE 'backfill-%'"
-        f") - INTERVAL {ARRIVAL_SLACK_MINUTES} MINUTES, TIMESTAMP '1970-01-01')"
-    )
 
 
 def assemble(config: PipelineConfig) -> Graph:
@@ -519,40 +463,9 @@ def assemble(config: PipelineConfig) -> Graph:
             detail={
                 "source": staged_name,
                 "where": valid_where(rules, files=files),
-                "blocked_by": files_name(config) if blocking_rules(rules) and files else None,
             },
         )
     )
-    if files:
-        # One row per file of this run, with its counts and status. The ledger is written from it,
-        # and a file with a ``fail`` rule broken is kept out of bronze through it.
-        datasets.append(
-            Dataset(
-                kind="files",
-                name=files_name(config),
-                relation="materialized_view",
-                detail={"source": staged_name, "blocking": blocking_rules(rules)},
-            )
-        )
-        if config.expect_file:
-            # Every file that arrived since the last run, with whether this run read rows from it.
-            datasets.append(
-                Dataset(
-                    kind="arrivals",
-                    name=arrivals_name(config),
-                    relation="materialized_view",
-                    detail={"path": config.path, "files": files_name(config)},
-                )
-            )
-        if blocking_rules(rules):
-            datasets.append(
-                Dataset(
-                    kind="blocked_check",
-                    name=f"{config.pipeline_id}_blocked_check",
-                    relation="materialized_view",
-                    detail={"source": files_name(config)},
-                )
-            )
     auto_cdc = None
     if config.uses_auto_cdc:
         datasets.append(
@@ -705,14 +618,11 @@ CHANGE_FEED_RETENTION = "interval 30 days"
 # Columns the pipeline stamps on every load. An SCD2 table must not open a version because of them.
 UNTRACKED_COLUMNS = (SRC_FILE_PATH, SRC_FILE_NAME, BATCH_ID, INGEST_TIMESTAMP)
 _BATCH_ID: str | None = None
-_BATCH_STARTED: datetime | None = None
-# The per-file status of a file of this run. FAILED means a ``fail`` rule blocked the file.
+# The per-file status of a file. FAILED means a row of it broke a ``fail`` rule.
 FILE_STATUS = "file_status"
 FILE_FAILED = "FAILED"
 FILE_WARNING = "WARNING"
 FILE_PROCESSED = "PROCESSED"
-# A clock that runs a little behind the cluster's must not hide rows of this run.
-_CLOCK_SLACK = timedelta(minutes=5)
 
 
 def batch_id() -> str:
@@ -723,32 +633,22 @@ def batch_id() -> str:
     the same process, writes it to ``load_ledger.batch_id`` beside the real update id.
     """
 
-    global _BATCH_ID, _BATCH_STARTED
+    global _BATCH_ID
     if _BATCH_ID is None:
         _BATCH_ID = str(uuid.uuid4())
-        _BATCH_STARTED = datetime.now(UTC)
     return _BATCH_ID
 
 
-def files_sql(
-    staged: str, blocking: list[str], *, this_run: bool = True, quarantine: bool = True
-) -> str:
-    """One row per file of this run: counts and status, from the staged rows of this run only.
+def files_sql(staged: str, blocking: list[str], *, quarantine: bool = True) -> str:
+    """One row per file of a backfill micro-batch: counts and status, from the rows in ``staged``.
 
-    The run is found by ``_batch_id`` and, so Delta can skip older files, by the load time the
-    staged table is clustered on. A backfill passes ``this_run=False`` for a view that holds
-    nothing but the rows it is counting. With ``quarantine=False`` (a table without one) the bad
-    rows of a blocked file are kept nowhere, so they count as dropped, not quarantined.
+    Only a backfill uses this: it holds the staged rows in memory and has no table to count from.
+    A regular run counts its files from bronze and quarantine (``pipeline_metrics.read_files``).
+    A file with a row that broke a ``fail`` rule is ``FAILED``; its good rows still load and the
+    bad ones go to quarantine. With ``quarantine=False`` (a table without one) those bad rows are
+    kept nowhere, so they count as dropped, not quarantined.
     """
 
-    run = batch_id()
-    since = (_BATCH_STARTED or datetime.now(UTC)) - _CLOCK_SLACK
-    scope = (
-        f"WHERE {BATCH_ID} = {sql_string(run)} "
-        f"AND {INGEST_TIMESTAMP} >= TIMESTAMP '{since.strftime('%Y-%m-%d %H:%M:%S')}+00:00' "
-        if this_run
-        else ""
-    )
     names = ", ".join(sql_string(name) for name in blocking)
     blockers = (
         f"array_join(array_intersect(array_distinct(flatten(collect_list({DQ_COLUMN}))), "
@@ -761,19 +661,16 @@ def files_sql(
     return (
         f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, {BATCH_ID}, "
         "count(*) AS rows_read, "
-        f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN 0 "
-        f"ELSE count_if({DQ_RESULT} = 'pass') END AS rows_loaded, "
+        f"count_if({DQ_RESULT} = 'pass') AS rows_loaded, "
         f"count_if({DQ_RESULT} IN {kept_bad}) AS rows_quarantined, "
         f"count_if({DQ_RESULT} IN {lost_bad}) AS rows_dropped, "
-        f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 "
-        f"THEN count_if({DQ_RESULT} = 'pass') ELSE 0 END AS rows_blocked, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN '{FILE_FAILED}' "
         f"WHEN count_if({DQ_RESULT} <> 'pass') > 0 THEN '{FILE_WARNING}' "
         f"ELSE '{FILE_PROCESSED}' END AS {FILE_STATUS}, "
         f"{blockers} AS blocking_rules, "
         f"array_join(array_sort(array_distinct(flatten(collect_list({DQ_COLUMN})))), ', ') "
         "AS failed_rules "
-        f"FROM {staged} {scope}"
+        f"FROM {staged} "
         f"GROUP BY {SRC_FILE_PATH}, {SRC_FILE_NAME}, {BATCH_ID}"
     )
 
@@ -797,21 +694,9 @@ def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
             "lakeflow_framework.pipeline_id": config.pipeline_id,
         },
     }
-    if layer == "files":
-        options["comment"] = (
-            f"One row per file of the latest run of {config.pipeline_id}: counts and status."
-        )
-        return options
-    if layer == "arrivals":
-        options["comment"] = (
-            f"Files that arrived for {config.pipeline_id} since its previous run, and whether "
-            "the run read rows from each. A file with none is empty."
-        )
-        return options
     if layer == "staged":
         options["private"] = True
         if is_file_load(config):
-            # The per-file view reads only the rows of this run, found by load time.
             options["cluster_by"] = [INGEST_TIMESTAMP]
         return options
     if layer in {"bronze", "quarantine"}:
@@ -927,71 +812,14 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
         registered = pipelines.expect_all_or_fail(dict(graph.fail_expectations))(registered)
     persisted(name=staged.name, **_table_options(config, "staged"))(registered)
 
-    files_dataset = by_kind.get("files")
-    internal = f"{DQ_COLUMN}, {DQ_RESULT}" if files_dataset else DQ_COLUMN
+    internal = f"{DQ_COLUMN}, {DQ_RESULT}" if is_file_load(config) else DQ_COLUMN
 
     @pipelines.temporary_view(name=valid.name)
     def _valid() -> Any:
         frame = _filtered(_reader().table(staged.name), valid.detail["where"])
-        if valid.detail.get("blocked_by"):
-            # The files this run blocked. A file is read once, so a blocked file is never retried:
-            # its good rows stay out of bronze by this join while its bad rows go to quarantine.
-            blocked = (
-                spark.read.table(valid.detail["blocked_by"])
-                .filter(f"{FILE_STATUS} = '{FILE_FAILED}'")
-                .select(SRC_FILE_PATH, BATCH_ID)
-            )
-            frame = frame.join(blocked, [SRC_FILE_PATH, BATCH_ID], "left_anti")
         if hasattr(frame, "selectExpr"):
             frame = frame.selectExpr(f"* EXCEPT ({internal})")
         return _typed_sequence(frame, config)
-
-    if files_dataset is not None:
-
-        @pipelines.materialized_view(name=files_dataset.name, **_table_options(config, "files"))
-        def _files() -> Any:
-            return spark.sql(
-                files_sql(
-                    staged.name,
-                    files_dataset.detail["blocking"],
-                    quarantine=config.has_quarantine,
-                )
-            )
-
-        arrivals_dataset = by_kind.get("arrivals")
-        if arrivals_dataset is not None:
-            inventory = f"{config.pipeline_id}_inventory"
-
-            @pipelines.temporary_view(name=inventory)
-            def _inventory() -> Any:
-                # Names, sizes and arrival times only: the content of a file is not read, and a
-                # file with no bytes is listed too.
-                return spark.createDataFrame(
-                    [
-                        (item["file_path"], item["file_bytes"], item["arrived_at"])
-                        for item in list_volume_files(config.path, config.path_glob)
-                    ],
-                    "file_path STRING, file_bytes BIGINT, arrived_at TIMESTAMP",
-                )
-
-            @pipelines.materialized_view(
-                name=arrivals_dataset.name, **_table_options(config, "arrivals")
-            )
-            def _arrivals() -> Any:
-                return spark.sql(arrivals_sql(config, inventory, files_dataset.name))
-
-        checked_files = by_kind.get("blocked_check")
-        if checked_files is not None:
-            # Runs after bronze and quarantine have finished, so the files are already read when
-            # it fails the update. Only this run's blocked files are in the files view.
-            @pipelines.expect_all_or_fail({"no_file_blocked_by_fail_rule": "1 = 0"})
-            @pipelines.materialized_view(name=checked_files.name)
-            def _blocked_check() -> Any:
-                return spark.sql(
-                    f"SELECT {SRC_FILE_NAME}, rows_read, rows_quarantined, rows_blocked, "
-                    f"blocking_rules FROM {files_dataset.name} "
-                    f"WHERE {FILE_STATUS} = '{FILE_FAILED}'"
-                )
 
     if bronze.relation == "auto_cdc":
         pipelines.create_streaming_table(name=bronze.name, **_table_options(config, "bronze"))

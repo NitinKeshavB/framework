@@ -458,7 +458,7 @@ def test_pipeline_wiring_uses_auto_cdc_only_when_dedup_is_on():
         config=config_from_document(_billing()),
     )
     kinds = [dataset.kind for dataset in graph.datasets]
-    assert kinds == ["raw", "staged", "valid", "files", "bronze", "quarantine"]
+    assert kinds == ["raw", "staged", "valid", "bronze", "quarantine"]
     assert graph.auto_cdc["stored_as_scd_type"] == 1
     assert pipelines.cdc[0]["keys"] == ["invoice_id"]
     assert "cloudFiles.schemaLocation" not in spark.options

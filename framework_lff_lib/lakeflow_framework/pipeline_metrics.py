@@ -25,11 +25,13 @@ import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from lakeflow_framework.config import BATCH_ID, INGEST_TIMESTAMP, SRC_FILE_NAME, SRC_FILE_PATH
 from lakeflow_framework.load_metrics import LEDGER, LEDGER_COLUMNS
 from lakeflow_framework.sqlnames import require_catalog, sql_string
+from lakeflow_framework.volume_listing import list_volume_files
 
 log = logging.getLogger(__name__)
 
@@ -70,12 +72,11 @@ class Dataflow:
     quarantine: str  # catalog.schema.table
     append: bool = True  # False for AUTO CDC, where duplicate keys collapse so counts differ
     build_error: str | None = None  # why the spec could not be registered, when it could not
-    files: str = ""  # catalog.schema.table of the per-file view, for a file source
-    blocked_check: str = ""  # the table whose failure fails the update when a file was blocked
-    arrivals: str = (
-        ""  # the view of files that arrived since the last run; set when a file is expected
-    )
+    file_load: bool = False  # a file source: per-file rows are counted from bronze and quarantine
+    expect_file: bool = False  # a file must arrive every run; checked against the volume listing
+    fail_rules: tuple[str, ...] = ()  # rules whose broken rows make the load FAILED
     path: str = ""  # where the files land, for the message when none came
+    path_glob: str = ""  # which files in ``path`` count
     source_kind: str = ""  # sftp_files / sharepoint_files / database / …
     run_as: str = ""  # configured service principal, empty when default
 
@@ -164,14 +165,7 @@ class UpdateRecorder:
             table
             for flow in self.dataflows
             if flow.build_error is None
-            for table in (
-                flow.staged,
-                flow.target,
-                flow.quarantine,
-                flow.files,
-                flow.blocked_check,
-                flow.arrivals,
-            )
+            for table in (flow.staged, flow.target, flow.quarantine)
             if table
         ]
 
@@ -289,16 +283,28 @@ class UpdateRecorder:
             "files_read": 0,
             "files_failed": 0,
             "failure_reason": reason,
-            # Not ledger columns: where the per-file rows are read from, and what to wait for.
-            "_files_table": flow.files,
-            "_arrivals_table": flow.arrivals,
+            # Not ledger columns: what the per-file rows and the arrival check are built from.
+            "_file_load": flow.file_load,
+            "_expect_file": flow.expect_file,
+            "_fail_rules": flow.fail_rules,
             "_path": flow.path,
+            "_path_glob": flow.path_glob,
             "_append": flow.append,
             "_quarantine_table": flow.quarantine or None,
         }
-        if not flow.files and healthy and flow.append:
-            # Not a file source, so no per-file counts: what was read and not kept was dropped.
+        if healthy and flow.append:
+            # What was read and kept nowhere (a drop rule) was dropped. Per-file rows cannot say.
             row["rows_dropped"] = max(read - inserted - quarantined, 0)
+        if healthy and flow.fail_rules and staged is not None:
+            # Rows that broke a ``fail`` rule, from the staged flow's own expectations. A table
+            # with no quarantine keeps those rows nowhere, so the files cannot show them.
+            hits = {
+                name: staged.expectations[name]["failed_records"]
+                for name in flow.fail_rules
+                if staged.expectations.get(name, {}).get("failed_records")
+            }
+            if hits:
+                row["_fail_hits"] = hits
         return row
 
     def _flow(self, update: _Update, table: str) -> _Flow | None:
@@ -460,61 +466,126 @@ def file_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tupl
     ]
 
 
-def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
-    """The per-file counts of this run, from the dataflow's file view. Empty when it has none.
+def read_files_sql(row: dict[str, Any]) -> str | None:
+    """One row per file of this run, counted from what the run wrote to bronze and quarantine.
 
-    The view holds only the latest run, so it is read only when its rows carry this run's batch.
+    No working table: every row of the run carries ``_batch_id``, and bronze and quarantine are
+    clustered on the load time, so the time bound lets Delta skip older files. A file's quarantine
+    rows hold the rules they broke, which is how a ``fail`` rule marks its file. A row dropped by a
+    drop rule is kept nowhere, so it is not in any file's count (the table's ``rows_dropped``
+    has it). For a table that keeps history by key, bronze counts the rows the run left there.
     """
 
-    table, batch = row.get("_files_table"), row.get("batch_id")
-    if not table or not batch:
+    batch, started, target = row.get("batch_id"), row.get("started_at"), row.get("target_table")
+    if not row.get("_file_load") or not batch or not target:
+        return None
+    scope = f"WHERE {BATCH_ID} = {sql_string(str(batch))}"
+    if isinstance(started, datetime):
+        since = (started.astimezone(UTC) - LOAD_TIME_SLACK).strftime("%Y-%m-%d %H:%M:%S")
+        scope += f" AND {INGEST_TIMESTAMP} >= TIMESTAMP '{since}+00:00'"
+    none = "CAST(array() AS ARRAY<STRING>)"
+    parts = [
+        f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 1 AS loaded, 0 AS quarantined, "
+        f"{none} AS failed FROM {target} {scope}"
+    ]
+    if row.get("_quarantine_table"):
+        parts.append(
+            f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 0, 1, failed_rules "
+            f"FROM {row['_quarantine_table']} {scope}"
+        )
+    fail_rules = ", ".join(sql_string(name) for name in row.get("_fail_rules") or ())
+    blockers = (
+        f"array_join(array_sort(array_intersect(array_distinct(flatten(collect_list(failed))), "
+        f"array({fail_rules}))), ', ')"
+        if fail_rules
+        else "''"
+    )
+    return (
+        f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, sum(loaded) AS rows_loaded, "
+        f"sum(quarantined) AS rows_quarantined, {blockers} AS blocking_rules, "
+        "array_join(array_sort(array_distinct(flatten(collect_list(failed)))), ', ') "
+        "AS failed_rules "
+        f"FROM ({' UNION ALL '.join(parts)}) GROUP BY {SRC_FILE_PATH}, {SRC_FILE_NAME} "
+        f"ORDER BY {SRC_FILE_PATH}"
+    )
+
+
+def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+    """The per-file counts of this run, for ``ledger_detail``. Empty for a table that is not files."""
+
+    sql = read_files_sql(row)
+    if sql is None:
         return []
-    found = spark.sql(
-        f"SELECT * FROM {table} WHERE _batch_id = {sql_string(str(batch))} ORDER BY _src_file_path"
-    ).collect()
     files = []
-    for item in found:
+    for item in spark.sql(sql).collect():
         data = item.asDict() if hasattr(item, "asDict") else dict(item)
+        loaded = int(data.get("rows_loaded") or 0)
+        quarantined = int(data.get("rows_quarantined") or 0)
+        blocking = data.get("blocking_rules") or ""
         files.append(
             {
-                "src_file_path": data.get("_src_file_path"),
-                "src_file_name": data.get("_src_file_name"),
-                "status": data.get("file_status"),
+                "src_file_path": data.get(SRC_FILE_PATH),
+                "src_file_name": data.get(SRC_FILE_NAME),
+                "status": "FAILED" if blocking else "WARNING" if quarantined else "PROCESSED",
                 "detail_kind": "file",
-                "rows_read": data.get("rows_read"),
-                "rows_inserted": data.get("rows_loaded"),
-                "rows_quarantined": data.get("rows_quarantined"),
-                "rows_dropped": int(data.get("rows_dropped") or 0)
-                + int(data.get("rows_blocked") or 0),
-                "failed_rules": data.get("failed_rules"),
-                "blocking_rules": data.get("blocking_rules"),
+                "rows_read": loaded + quarantined,
+                "rows_inserted": loaded,
+                "rows_quarantined": quarantined,
+                "rows_dropped": 0,
+                "failed_rules": data.get("failed_rules") or "",
+                "blocking_rules": blocking,
             }
         )
     return files
 
 
 EMPTY_FILE = "file has no rows"
+# A file that landed a moment before the previous run started still belongs to that run.
+ARRIVAL_SLACK = timedelta(minutes=5)
+# A clock that runs a little behind the cluster's must not hide rows of this run.
+LOAD_TIME_SLACK = timedelta(minutes=5)
 
 
-def read_arrivals(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """The files that arrived since the previous run, or None when this table expects no file."""
+def read_arrivals(
+    spark: Any, catalog: str, row: dict[str, Any], files: list[dict[str, Any]]
+) -> list[dict[str, Any]] | None:
+    """The files that arrived since the previous regular run, or None when no file is expected.
 
-    table = row.get("_arrivals_table")
-    if not table:
+    The volume is listed for names, sizes and arrival times only. A file is new when it arrived
+    after the previous regular run started (a backfill, which also writes to the ledger, does not
+    move that). ``has_rows`` is true when this run counted rows from it (``files``);
+    ``recorded_before`` when an earlier load already wrote it to ``ledger_detail``. Nothing here is
+    a pipeline table: it is the listing, ``load_ledger`` and ``ledger_detail``.
+    """
+
+    if not row.get("_expect_file") or not row.get("_path"):
         return None
-    found = spark.sql(f"SELECT * FROM {table}").collect()
-    arrivals = []
-    for item in found:
-        data = item.asDict() if hasattr(item, "asDict") else dict(item)
-        arrivals.append(
-            {
-                "src_file_path": data.get("file_path"),
-                "src_file_name": data.get("file_name"),
-                "has_rows": bool(data.get("has_rows")),
-                "recorded_before": bool(data.get("recorded_before")),
-            }
-        )
-    return arrivals
+    meta = f"{require_catalog(catalog)}.framework_meta"
+    pid = sql_string(row["dataflow"])
+    previous = spark.sql(
+        f"SELECT unix_timestamp(max(started_at)) AS since FROM {meta}.{LEDGER} "
+        f"WHERE dataflow = {pid} AND update_id NOT LIKE 'backfill-%'"
+    ).collect()
+    since = previous[0]["since"] if previous else None
+    cutoff = float(since) - ARRIVAL_SLACK.total_seconds() if since is not None else None
+    recorded = {
+        str(item["src_file_path"])
+        for item in spark.sql(
+            f"SELECT DISTINCT src_file_path FROM {meta}.{LEDGER_DETAIL} "
+            f"WHERE dataflow = {pid} AND src_file_path IS NOT NULL"
+        ).collect()
+    }
+    read = {str(item["src_file_path"]) for item in files}
+    return [
+        {
+            "src_file_path": item["file_path"],
+            "src_file_name": item["file_path"].rsplit("/", 1)[-1],
+            "has_rows": item["file_path"] in read,
+            "recorded_before": item["file_path"] in recorded,
+        }
+        for item in list_volume_files(row["_path"], row.get("_path_glob") or None)
+        if cutoff is None or item["arrived_at"].timestamp() > cutoff
+    ]
 
 
 def apply_arrivals(row: dict[str, Any], arrivals: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -575,25 +646,26 @@ def mark_failed(row: dict[str, Any], reason: str) -> None:
 def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, Any]:
     """Fold the per-file counts into the table's ledger row.
 
-    A file blocked by a ``fail`` rule makes the table's load FAILED: the counts stay real (rows
-    read, quarantined, blocked), and the reason names the files and the rules that blocked them.
+    A row that broke a ``fail`` rule goes to quarantine and its file is FAILED; the file's good
+    rows still load. That makes the table's load FAILED while the job succeeds: the counts stay
+    real, and the reason names the files and the rules. ``_fail_hits`` (from the event log) says
+    the same for a table whose bad rows are kept nowhere, so no file shows them.
     """
 
     row["_files"] = files
-    if not files:
-        return row
     failed = [item for item in files if item["status"] == "FAILED"]
     for item in files:
         item["error_message"] = (
-            f"blocked by fail rule(s): {item.get('blocking_rules')}"
+            f"rows broke fail rule(s): {item.get('blocking_rules')}"
             if item["status"] == "FAILED"
             else None
         )
-    row["files_read"] = len(files)
-    row["files_failed"] = len(failed)
-    row["rows_dropped"] = sum(
-        int(item.get("rows_dropped") or 0) + int(item.get("rows_blocked") or 0) for item in files
-    )
+    if files:
+        row["files_read"] = len(files)
+        row["files_failed"] = len(failed)
+        dropped = sum(int(item.get("rows_dropped") or 0) for item in files)
+        if dropped:  # a backfill counts them per file; the pipeline run has them for the table
+            row["rows_dropped"] = dropped
     if failed:
         shown = ", ".join(
             f"{item['src_file_name']} ({item.get('blocking_rules')})"
@@ -602,10 +674,13 @@ def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, A
         more = len(failed) - MAX_FILES_IN_REASON
         row["target_status"] = "FAILED"
         row["failure_reason"] = _clip(
-            f"{len(failed)} of {len(files)} file(s) blocked by fail rules, none of their rows "
-            f"loaded to {row.get('target_table')}: {shown}"
+            f"{len(failed)} of {len(files)} file(s) had rows that broke fail rules; those rows "
+            f"were kept out of {row.get('target_table')}: {shown}"
             + (f" and {more} more" if more > 0 else "")
         )
+    elif row.get("_fail_hits"):
+        broken = ", ".join(f"{name} ({count})" for name, count in row["_fail_hits"].items())
+        mark_failed(row, f"rows broke fail rule(s) and were kept out of bronze: {broken}")
     read = int(row.get("rows_read") or 0)
     accounted = sum(
         int(row.get(column) or 0)
@@ -666,7 +741,7 @@ def write_rows(
                 log.exception("load metrics: could not read the file counts of %s", row["dataflow"])
                 apply_files(row, [])
             try:
-                apply_arrivals(row, read_arrivals(spark, row))
+                apply_arrivals(row, read_arrivals(spark, catalog, row, row.get("_files") or []))
             except Exception:
                 log.exception("load metrics: could not read the arrivals of %s", row["dataflow"])
     at = _now()

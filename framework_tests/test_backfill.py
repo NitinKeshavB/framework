@@ -139,10 +139,9 @@ def _blocked(name: str) -> dict:
         "src_file_name": name,
         "status": "FAILED",
         "rows_read": 10,
-        "rows_loaded": 0,
+        "rows_loaded": 8,
         "rows_quarantined": 2,
         "rows_dropped": 0,
-        "rows_blocked": 8,
         "failed_rules": "amount_positive",
         "blocking_rules": "amount_positive",
         "load_kind": "backfill",
@@ -151,7 +150,7 @@ def _blocked(name: str) -> dict:
 
 def _clean(name: str) -> dict:
     return {**_blocked(name), "status": "PROCESSED", "rows_loaded": 10, "rows_quarantined": 0,
-            "rows_blocked": 0, "failed_rules": "", "blocking_rules": ""}  # fmt: skip
+            "failed_rules": "", "blocking_rules": ""}  # fmt: skip
 
 
 def test_the_ledger_marks_the_table_failed_but_the_backfill_ends_with_a_warning(
@@ -171,10 +170,11 @@ def test_the_ledger_marks_the_table_failed_but_the_backfill_ends_with_a_warning(
     (row,) = written
     # Every file is processed to the end; the load is recorded FAILED with the file named.
     assert (row["files_read"], row["files_failed"]) == (3, 1)
-    assert (row["rows_read"], row["rows_inserted"], row["rows_quarantined"]) == (30, 20, 2)
-    assert (row["rows_dropped"], row["rows_deleted"]) == (8, 20)
+    # The good rows of the failed file loaded too: only its bad rows went to quarantine.
+    assert (row["rows_read"], row["rows_inserted"], row["rows_quarantined"]) == (30, 28, 2)
+    assert (row["rows_dropped"], row["rows_deleted"]) == (0, 20)
     assert row["target_status"] == "FAILED"
-    assert row["failure_reason"].startswith("backfill: 1 of 3 file(s) blocked")
+    assert row["failure_reason"].startswith("backfill: 1 of 3 file(s) had rows that broke fail")
     assert "b.csv (amount_positive)" in row["failure_reason"]
     assert row["update_id"] == "backfill-1" and row["load_kind"] == "backfill"
     # The files were written to ledger_detail by each micro-batch, so the table's write adds none.

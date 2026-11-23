@@ -2,7 +2,7 @@
 
 One job serves every table: it takes the table's id, loads that table's spec from the registry,
 and runs the same staging step as the pipeline (``pipeline.stage_frame``), so the same read options,
-rules, rule actions, audit columns and file blocking apply. Nothing of the pipeline is copied.
+rules, rule actions and audit columns apply. Nothing of the pipeline is copied.
 
 Modes:
 
@@ -15,9 +15,10 @@ With none of ``files``, ``dates`` or ``failed``, the selector is empty, which me
 table's directory. That and ``full_refresh`` need ``confirm``.
 
 A file's earlier rows are removed from bronze and quarantine before it is loaded again, so a
-reload never leaves a duplicate. A file blocked by a ``fail`` rule is recorded FAILED, its bad rows go
-to quarantine, none of its good rows load, and the backfill goes on with the next file. The run still
-ends successfully, with a warning, because one bad file must not stop a thousand good ones.
+reload never leaves a duplicate. A file with a row that broke a ``fail`` rule is recorded FAILED and
+that row goes to quarantine; the file's good rows load, and the backfill goes on with the next file.
+The run still ends successfully, with a warning, because one bad file must not stop a thousand good
+ones.
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ from lakeflow_framework.pipeline import (
     FILE_STATUS,
     PIPELINE_SCHEMA,
     file_columns,
-    files_name,
     files_sql,
     is_file_load,
     quarantine_frame,
@@ -281,7 +281,7 @@ def run_backfill(
     blocked = blocked_files(result)
     if blocked:
         result.warnings.append(
-            f"{len(blocked)} file(s) blocked by fail rules: "
+            f"{len(blocked)} file(s) had rows that broke fail rules: "
             + ", ".join(item["src_file_name"] for item in blocked[:MAX_LISTED])
         )
     if result.empty:
@@ -359,20 +359,16 @@ def _load(
         view = f"_backfill_{uuid.uuid4().hex}"
         frame.createOrReplaceTempView(view)
         counted = session.sql(
-            files_sql(view, blocking, this_run=False, quarantine=quarantine is not None)
+            files_sql(view, blocking, quarantine=quarantine is not None)
         ).collect()
         files = [_as_file(row) for row in counted]
         paths = [item["src_file_path"] for item in files]
         _remove(session, paths, *targets)
-        blocked = [item["src_file_path"] for item in files if item["status"] == FILE_FAILED]
         marked = apply_files(dict(stub), files)["_files"]
         session.createDataFrame(
             file_records([{**stub, "_files": marked}], _now()), FILE_SCHEMA
         ).write.mode("append").saveAsTable(ledger)
         good = frame.filter(f"{DQ_RESULT} = 'pass'")
-        if blocked:
-            keep = session.createDataFrame([(path,) for path in blocked], f"{SRC_FILE_PATH} STRING")
-            good = good.join(keep, SRC_FILE_PATH, "left_anti")
         internal = f"{DQ_COLUMN}, {DQ_RESULT}"
         _insert(session, good.selectExpr(f"* EXCEPT ({internal})"), bronze)
         if quarantine:
@@ -429,7 +425,7 @@ def blocked_files(result: Result) -> list[dict[str, Any]]:
 
 def _as_file(row: Any) -> dict[str, Any]:
     data = row.asDict() if hasattr(row, "asDict") else dict(row)
-    dropped = int(data.get("rows_dropped") or 0) + int(data.get("rows_blocked") or 0)
+    dropped = int(data.get("rows_dropped") or 0)
     return {
         "detail_kind": "file",
         "src_file_path": data[SRC_FILE_PATH],
@@ -517,7 +513,7 @@ def _record(
     if row["_files"]:
         row["files_read"] += len(row["_files"])
         row["files_failed"] += len(row["_files"])
-        parts = [warning for warning in result.warnings if "blocked" not in warning]
+        parts = [warning for warning in result.warnings if "fail rules" not in warning]
         mark_failed(row, "backfill: " + "; ".join(parts))
     elif result.none_found:
         mark_failed(row, f"backfill: no file found for this request in {config.path}")
@@ -561,13 +557,7 @@ def _full_refresh(spark: Any, config: PipelineConfig, result: Result, *, confirm
         config.table_name("bronze"),
         *([config.table_name("quarantine")] if config.has_quarantine else []),
         f"{config.catalog}.{PIPELINE_SCHEMA}.{config.pipeline_id}_staged",
-        f"{config.catalog}.{PIPELINE_SCHEMA}.{files_name(config)}",
     ]
-    if blocking_rules(compile_rules(config)):
-        # The check is what fails the update when a file is blocked, so it is refreshed too.
-        result.planned.append(
-            f"{config.catalog}.{PIPELINE_SCHEMA}.{config.pipeline_id}_blocked_check"
-        )
     if result.dry_run:
         return result
     pipeline_uuid = _pipeline_uuid(spark, config)
