@@ -163,8 +163,10 @@ raw_to_bronze:
       type: string
       description: TODO describe the column
 
-# Rows that fail a rule go to <bronze table>_qrntn in the bronze schema. Add a quarantine:
-# block only to override its table, schema, classification, or pii.
+# A quarantine table exists only with rules or a quarantine: block. Rows that fail a rule go to
+# <bronze table>_qrntn in the bronze schema, with bronze's columns plus failed_rules. Add a
+# quarantine: block to override its table, schema, classification, or pii, or to quarantine the
+# framework's own checks without writing rules. With neither, a row failing those checks is dropped.
 """
 
 
@@ -194,8 +196,10 @@ raw_to_bronze:
       type: string
       description: TODO describe the column
 
-# Rows that fail a rule go to <bronze table>_qrntn in the bronze schema. Add a quarantine:
-# block only to override its table, schema, classification, or pii.
+# A quarantine table exists only with rules or a quarantine: block. Rows that fail a rule go to
+# <bronze table>_qrntn in the bronze schema, with bronze's columns plus failed_rules. Add a
+# quarantine: block to override its table, schema, classification, or pii, or to quarantine the
+# framework's own checks without writing rules. With neither, a row failing those checks is dropped.
 """
 
 _DATABASE_TEMPLATE = """\
@@ -222,8 +226,10 @@ raw_to_bronze:
       type: string
       description: TODO describe the column
 
-# Rows that fail a rule go to <bronze table>_qrntn in the bronze schema. Add a quarantine:
-# block only to override its table, schema, classification, or pii.
+# A quarantine table exists only with rules or a quarantine: block. Rows that fail a rule go to
+# <bronze table>_qrntn in the bronze schema, with bronze's columns plus failed_rules. Add a
+# quarantine: block to override its table, schema, classification, or pii, or to quarantine the
+# framework's own checks without writing rules. With neither, a row failing those checks is dropped.
 """
 
 

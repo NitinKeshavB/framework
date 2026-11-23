@@ -1,10 +1,10 @@
 # Quality rules for bronze tables
 
-A rule is a SQL condition that every good row must satisfy. By default a row that fails any rule goes to the table's quarantine table instead of bronze. Every rule example on this page is in `framework_tests/test_quality_cookbook.py`, which checks that the validator accepts it and that sample values pass and fail as shown. The same samples were also run on Spark.
+A rule is a SQL condition that every good row must satisfy. By default a row that fails any rule goes to the table's quarantine table instead of bronze. Declaring a rule (or a `quarantine:` block) is what creates that table; a spec with neither has no quarantine, and a row failing the framework's own checks is dropped and counted ([README](README.md#quality-rules-and-quarantine)). Every rule example on this page is in `framework_tests/test_quality_cookbook.py`, which checks that the validator accepts it and that sample values pass and fail as shown. The same samples were also run on Spark.
 
 ## What happens to a row that fails a rule
 
-You choose, per table or per rule. `raw_to_bronze.on_bad_rows` sets the default for the table's rules, and `on_fail` on one rule overrides it:
+You choose with `on_fail`, set in **one place only**: on `raw_to_bronze` for every rule of the table, or on the rules themselves. A spec that sets it in both places is refused, so the action of a rule is always found in one place. `on_fail` needs `rules`: `raw_to_bronze.on_fail` with no rules is refused by `./run.sh generate`:
 
 | Action | A row that fails | The load | Use it when |
 | --- | --- | --- | --- |
@@ -14,8 +14,15 @@ You choose, per table or per rule. `raw_to_bronze.on_bad_rows` sets the default 
 | `fail` | **Blocks the whole file.** None of the file's rows reach bronze, the good ones included. Its bad rows go to quarantine | The run is `FAILED`, naming the file and the rule. Every other file still loads | A file with one bad row is not trustworthy, and you would rather stop and fix it |
 
 ```yaml
+# One action for the whole table (also used by the framework's own checks):
 raw_to_bronze:
-  on_bad_rows: quarantine           # the default for every rule below
+  on_fail: drop
+  rules:
+    - { name: ride_id_present, expression: "ride_id IS NOT NULL" }                    # drop
+    - { name: end_station_id_length, expression: "..." }                               # drop
+
+# Or one per rule (a rule that says nothing quarantines):
+raw_to_bronze:
   rules:
     - { name: ride_id_present, expression: "ride_id IS NOT NULL" }                    # quarantine
     - { name: ended_not_before_started, expression: "...", on_fail: fail }             # stop the load
@@ -36,7 +43,7 @@ This was run on a real pipeline: a file with one bad row was blocked, the run an
 
 A table loaded from a **database** has no files, so `fail` there stops the whole run: no row of the run, good ones included, reaches bronze.
 
-The checks the framework adds itself (`schema_conformance`, `cast_<column>`, `not_null_<key>`) follow `on_bad_rows`. With `on_bad_rows: fail`, a value that does not fit its column, or an empty key, also blocks the file.
+The checks the framework adds itself (`schema_conformance`, `cast_<column>`, `not_null_<key>`) follow `raw_to_bronze.on_fail`, or quarantine when it is not set (drop, when the table has no quarantine). With `on_fail: fail` on `raw_to_bronze`, a value that does not fit its column, or an empty key, also blocks the file.
 
 Not available yet: a limit such as "fail only when more than 5% of rows are bad".
 
@@ -78,7 +85,7 @@ Each run's ledger row shows `rows_read ≈ rows_inserted + rows_quarantined + ro
 
 - **One rule, one condition.** The rule must be **true** for a good row. Anything else fails it, **including NULL**. A column that may be empty must say so: `phone IS NULL OR phone rlike '...'`.
 - **Every rule runs on every row.** The row does not stop at the first failure. It carries the names of all the rules it failed in `failed_rules`, so name each rule for what it checks.
-- **By default a failing rule does not fail the load.** The good rows load, the bad rows go to `<bronze table>_qrntn`, and the run shows `COMPLETED` with `rows_quarantined` set. Change that with `on_bad_rows` and `on_fail` (above).
+- **By default a failing rule does not fail the load.** The good rows load, the bad rows go to `<bronze table>_qrntn`, and the run shows `COMPLETED` with `rows_quarantined` set. Change that with `on_fail` (above).
 - **A row is in bronze or in quarantine, never both.**
 - **Rules are about one row.** They can look at that row's columns and nothing else (see "What a rule cannot do").
 

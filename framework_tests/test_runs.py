@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from lakeflow_framework.runs import (
+    PIPELINE_UPDATE_COLUMNS,
     event_log_jobs,
     framework_jobs,
     job_run_rows,
@@ -271,9 +273,13 @@ def test_system_lakeflow_sql_merges_registered_workflows_in_one_plan():
     assert "system.lakeflow.job_run_timeline" in runs
     assert "system.lakeflow.job_task_run_timeline" in tasks
     assert "tags['lakeflow_framework_workflow']" in runs
-    assert "FROM framework_dev.framework_meta.v_workflows" in runs
+    # Registered workflows plus their source system's run_as, straight from the registry.
+    assert "FROM framework_dev.framework_meta.asset_registry_current w" in runs
+    assert "WHERE w.object_kind = 'workflow'" in runs
+    assert "FROM framework_dev.framework_meta.v_workflows" in tasks
     assert "run_type = 'JOB_RUN'" in runs
-    assert "WHEN result_state = 'SUCCEEDED' THEN 'SUCCEEDED'" in runs
+    assert "WHEN r.result_state = 'SUCCEEDED' THEN 'SUCCEEDED'" in runs
+    assert "WHEN result_state = 'SUCCEEDED' THEN 'SUCCEEDED'" in tasks
     spark = _Spark(
         {
             "v_workflows": [{"job_name": "abs_daily"}],
@@ -304,6 +310,16 @@ def test_pipeline_updates_come_from_update_progress_events_in_each_event_log():
     assert "latest_at >= TIMESTAMP '2026-11-17 06:00:00'" in sql
     assert "UNION ALL" not in sql
     assert "WHEN 'COMPLETED' THEN 'SUCCEEDED'" in sql
+    assert "CAST('' AS STRING) AS run_as" in sql
+    with_registry = pipeline_updates_sql(
+        "c.framework_events.abs_daily_event_log", "abs_daily", NOW, meta="c.framework_meta"
+    )
+    assert "FROM c.framework_meta.asset_registry_current w" in with_registry
+    assert "w.full_name = 'abs_daily'" in with_registry
+    # The MERGE sets every PIPELINE_UPDATE_COLUMNS column from s.*, so the source must select each.
+    final_select = with_registry.rsplit("\nSELECT", 1)[1].split("\nFROM marked")[0]
+    for column in PIPELINE_UPDATE_COLUMNS:
+        assert re.search(rf"(\bAS {column},?$|^\s*{column},?$)", final_select, re.M), column
     with pytest.raises(ValueError):
         pipeline_updates_sql("c.framework_events.abs_daily_event_log", "bad-job", NOW)
 

@@ -168,7 +168,7 @@ Editable Lucidchart ([Lakeflow framework_meta](https://lucid.app/lucidchart/4713
 | `<pipeline_id>_files`, `_blocked_check`, `_arrivals` | `framework_meta` | ingestion pipeline (file sources) | The latest run's files; the blocked files of that run; the files that arrived since the previous run | Materialized views (see "Inside one pipeline") |
 | `backfill_state` | `framework_meta` (a volume) | `framework_backfill` | The Auto Loader schema and checkpoint of one backfill run | Volume; a finished run's folder can be deleted |
 | bronze, `<schema>.<table>` | `<source>_bronze` | ingestion pipeline | One passing row, or one row per key with Auto CDC | Streaming table or materialized view |
-| quarantine, `<table>_qrntn` | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |
+| quarantine, `<table>_qrntn` (only with `rules` or a `quarantine` block) | `<source>_bronze` | ingestion pipeline | One failing row | Streaming table or materialized view |
 
 The registry tables change once per deploy, hot→archive once a day, and hourly `framework_runs` records job runs and pipeline updates. A delivery run writes its own data tables, event log under `framework_events`, and, from the pipeline's event hook, its rows in `load_ledger`, `ledger_detail`. Schemas, volumes, and foreign catalogs exist before a deploy. Until go-live, drop `framework_meta` (and recreate `framework_events` via DDL) to pick up new columns; `CREATE IF NOT EXISTS` will not ALTER existing tables.
 

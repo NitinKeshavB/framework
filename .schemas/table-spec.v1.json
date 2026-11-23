@@ -103,11 +103,11 @@
           "enum": ["insert_only", "scd1", "scd2", "full_refresh"],
           "description": "How rows are taken. insert_only appends. scd1 upserts on primary_keys by watermark_column. scd2 keeps every version. full_refresh (database tables) mirrors the source and keeps a removed key, closed. Omitted: scd1 when dedup is true, else insert_only for files."
         },
-        "on_bad_rows": {
+        "on_fail": {
           "type": "string",
           "enum": ["quarantine", "drop", "warn", "fail"],
           "default": "quarantine",
-          "description": "What happens to a row that fails a rule, for every rule that does not say its own on_fail. fail stops the whole update, so good rows of that run are not loaded either."
+          "description": "What happens to a row that fails a rule, for every rule and for the framework's own checks. Needs rules. Set it here or on the rules, not both. fail stops the whole update, so good rows of that run are not loaded either."
         },
         "delete_when": {
           "type": "string",
@@ -141,7 +141,7 @@
               "on_fail": {
                 "type": "string",
                 "enum": ["quarantine", "drop", "warn", "fail"],
-                "description": "What happens to a row that fails this rule. Overrides on_bad_rows. quarantine: to the quarantine table. drop: discarded. warn: loads, only counted. fail: the update fails, so no row of the run reaches bronze."
+                "description": "What happens to a row that fails this rule. Only when raw_to_bronze sets no on_fail (one place only). quarantine: to the quarantine table. drop: discarded. warn: loads, only counted. fail: the update fails, so no row of the run reaches bronze."
               }
             }
           }

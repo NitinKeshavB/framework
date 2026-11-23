@@ -57,9 +57,11 @@ resources:
     framework_runs:
       name: framework_runs
       performance_target: PERFORMANCE_OPTIMIZED
+      # PAUSED until requested (scheduled runs fail: run_as user not a direct workspace member).
       schedule:
         quartz_cron_expression: "0 15 * * * ?"
         timezone_id: UTC
+        pause_status: PAUSED
       tasks:
         - task_key: job_runs
           environment_key: framework_env
@@ -140,9 +142,11 @@ resources:
     framework_optimize:
       name: framework_optimize
       performance_target: PERFORMANCE_OPTIMIZED
+      # PAUSED until requested (scheduled runs fail: run_as user not a direct workspace member).
       schedule:
         quartz_cron_expression: "0 0 3 * * ?"
         timezone_id: UTC
+        pause_status: PAUSED
       tasks:
         - task_key: optimize
           environment_key: framework_env

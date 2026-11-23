@@ -40,6 +40,11 @@ targets:
       root_path: /Workspace/Shared/aztech_framework
     variables:
       catalog: aal_dev_fdh # TEMPORARY: prod catalog not accessible from this workspace; revert to aal_prod_fdh at go-live
+    # TEMPORARY (phase 1): jobs run as this user. Phase 2 switches to an admin service principal:
+    #   run_as: { service_principal_name: <application id> }
+    # Scheduled runs need this identity to be a direct member of the workspace.
+    run_as:
+      user_name: adm_ye9z286@allianzms.onmicrosoft.com
     # Prefer groups over personal user_name entries.
     permissions:
       - group_name: OE-AAL-ADPDBX-dev-FDH-DataEngineer

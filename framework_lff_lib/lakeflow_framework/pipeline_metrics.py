@@ -310,11 +310,17 @@ class UpdateRecorder:
     def _reason(self, update_id: str, update: _Update, state: str, flow: Dataflow) -> str:
         if flow.build_error:
             return _clip(flow.build_error)
-        own = (
-            _key(flow.staged),
-            _key(flow.target),
-            _key(flow.quarantine),
-            flow.pipeline_id.lower(),
+        # Empty names left out: "" is "in" every key, so a table without quarantine would claim
+        # every other table's error in the same delivery.
+        own = tuple(
+            name
+            for name in (
+                _key(flow.staged),
+                _key(flow.target),
+                _key(flow.quarantine),
+                flow.pipeline_id.lower(),
+            )
+            if name
         )
         parts: list[str] = []
         for name, text in update.errors:

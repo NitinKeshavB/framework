@@ -39,6 +39,7 @@ from lakeflow_framework.pipeline import (
     files_name,
     files_sql,
     is_file_load,
+    quarantine_frame,
     stage_frame,
 )
 from lakeflow_framework.pipeline_metrics import (
@@ -334,7 +335,10 @@ def _load(
     staged = stage_frame(
         reader.load(config.path).selectExpr("*", *file_columns(datetime.now(UTC))), config, batch
     )
-    bronze, quarantine = config.table_name("bronze"), config.table_name("quarantine")
+    bronze = config.table_name("bronze")
+    # A table without rules or a quarantine block has no quarantine table: its bad rows are dropped.
+    quarantine = config.table_name("quarantine") if config.has_quarantine else None
+    targets = [bronze, quarantine] if quarantine else [bronze]
     stub = {
         "job_name": config.job_name,
         "layer": config.layer or LAYER,
@@ -354,10 +358,12 @@ def _load(
         session = frame.sparkSession
         view = f"_backfill_{uuid.uuid4().hex}"
         frame.createOrReplaceTempView(view)
-        counted = session.sql(files_sql(view, blocking, this_run=False)).collect()
+        counted = session.sql(
+            files_sql(view, blocking, this_run=False, quarantine=quarantine is not None)
+        ).collect()
         files = [_as_file(row) for row in counted]
         paths = [item["src_file_path"] for item in files]
-        _remove(session, paths, bronze, quarantine)
+        _remove(session, paths, *targets)
         blocked = [item["src_file_path"] for item in files if item["status"] == FILE_FAILED]
         marked = apply_files(dict(stub), files)["_files"]
         session.createDataFrame(
@@ -369,10 +375,12 @@ def _load(
             good = good.join(keep, SRC_FILE_PATH, "left_anti")
         internal = f"{DQ_COLUMN}, {DQ_RESULT}"
         _insert(session, good.selectExpr(f"* EXCEPT ({internal})"), bronze)
-        bad = frame.filter(f"{DQ_RESULT} IN ('fail', 'quarantine')").selectExpr(
-            f"* EXCEPT ({internal})", f"{DQ_COLUMN} AS failed_rules"
-        )
-        _insert(session, bad, quarantine)
+        if quarantine:
+            # Same shape as the pipeline's quarantine flow (bronze's types plus failed_rules).
+            bad = quarantine_frame(
+                frame.filter(f"{DQ_RESULT} IN ('fail', 'quarantine')"), config, internal
+            )
+            _insert(session, bad, quarantine)
 
     query = (
         staged.writeStream.foreachBatch(process)
@@ -497,7 +505,7 @@ def _record(
         "files_failed": 0,
         "failure_reason": None,
         "_append": True,
-        "_quarantine_table": config.table_name("quarantine"),
+        "_quarantine_table": (config.table_name("quarantine") if config.has_quarantine else None),
     }
     apply_files(row, files)
     if row["files_failed"]:
@@ -551,7 +559,7 @@ def _full_refresh(spark: Any, config: PipelineConfig, result: Result, *, confirm
         )
     result.planned = [
         config.table_name("bronze"),
-        config.table_name("quarantine"),
+        *([config.table_name("quarantine")] if config.has_quarantine else []),
         f"{config.catalog}.{PIPELINE_SCHEMA}.{config.pipeline_id}_staged",
         f"{config.catalog}.{PIPELINE_SCHEMA}.{files_name(config)}",
     ]

@@ -139,7 +139,7 @@ quarantine: { schema: erp_quarantine}
 
 ## Common spec rules
 
-- `raw_to_bronze` holds the bronze table, keys, `columns`, and `rules`. Rows that fail the rules go to `<bronze table>_qrntn` in the bronze schema by default. The `quarantine` block is optional and can override `table`, `schema`, `classification`, or `pii`.
+- `raw_to_bronze` holds the bronze table, keys, `columns`, and `rules`. Rows that fail the rules go to `<bronze table>_qrntn` in the bronze schema by default. The `quarantine` block is optional and can override `table`, `schema`, `classification`, or `pii`. A quarantine table exists only when the spec has `rules` or a `quarantine` block; with neither, rows failing the framework's own checks are dropped and counted.
 - A column is `name`, `type`, and an optional `description`, which becomes the column comment in Unity Catalog. The table's and each column's `classification` and `pii`, and the table's `domain`, `owner`, `data_domain`, `team`, `technical_owner`, layer, pipeline, job, load method, requester, and delivery, become Unity Catalog tags. The source's schemas get `source.yaml`'s domain, owner, owner email, kind, foreign catalog, and engine. `registry_sync` sets both at deploy. `classification` and `pii` on a column are only needed when they differ from the bronze table.
 - `pii` values are `pii_health`, `pii_basic`, `pii_finance`, `pii_biometric`, `pii_personal`. Omit `pii` when there is none. A `raw`, `bronze`, or `quarantine` block can override `classification` or `pii`.
 - `notify.on_failure` is who is mailed when the job fails. It defaults to the technical owner. The generated job's `email_notifications` carries the addresses of all its tables.
@@ -201,7 +201,7 @@ A table depends only on lower layers: bronze, then silver, then gold, then a dat
 
 For source system `billing` and table `invoices`:
 
-- Files from a raw volume or a database: `<catalog>.billing_bronze.invoices` and `<catalog>.billing_bronze.invoices_qrntn`. The quarantine table is the bronze table name plus `_qrntn`, in the bronze schema, unless the spec sets `quarantine.table` or `quarantine.schema`.
+- Files from a raw volume or a database: `<catalog>.billing_bronze.invoices` and `<catalog>.billing_bronze.invoices_qrntn`. The quarantine table is the bronze table name plus `_qrntn`, in the bronze schema, unless the spec sets `quarantine.table` or `quarantine.schema`. It is created only for a spec with `rules` or a `quarantine` block.
 - Cloud files also write `<catalog>.billing_raw.invoices`.
 
 Quarantine carries `failed_rules`, the names of the rules that failed. Rows that pass go to bronze. Both are read from one private staging table, so the source is read once. Volume-file rows also carry `_source_file` and `_ingested_at`, and database rows carry `_ingested_at`.

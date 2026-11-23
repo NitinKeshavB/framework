@@ -39,16 +39,6 @@ raw_to_bronze:
   # How rows are taken: insert_only (append) | scd1 (upsert on primary_keys) | scd2 (keep history)
   # | full_refresh (database tables). Omitted: insert_only for files.
   load_type: insert_only
-  # What happens to a row that fails a rule. This is the default for every rule below, and a rule
-  # can say its own with on_fail (an example sits above the rules):
-  #   quarantine  the row goes to the quarantine table and the good rows load      (default)
-  #   drop        the row is discarded and kept nowhere (only the counts show it)
-  #   warn        the row loads as usual; the failure is only counted in the metrics
-  #   fail        the whole FILE is blocked: none of its rows reach bronze, good ones included, and
-  #               its bad rows go to quarantine. The run and job FAIL naming the file; other files
-  #               load. The file is marked read, so it is not picked up again: fix it and run
-  #               framework_backfill (./run.sh backfill) to load it.
-  on_bad_rows: quarantine
   # Declaring the columns turns type inference off, so every column lands as the type given here.
   # A value that cannot be read as that type goes to _rescued_data instead of failing the load.
   columns:
@@ -67,49 +57,58 @@ raw_to_bronze:
     - { name: member_casual, type: string, description: Whether the rider is a member or casual }
   # Every bronze and quarantine table also gets, with no setting needed: _src_file_path,
   # _src_file_name, _src_row_hash, _batch_id and _ingest_timestamp (and _rescued_data for files).
-  # Two rules per column. With on_bad_rows: quarantine, a row that fails any rule goes to
+  # Two rules per column. With on_fail: quarantine, a row that fails any rule goes to
   # quarantine with the names of the rules it failed. A rule must be true for a good row, and a null
   # result counts as a failure, so a column that may be empty says so with "IS NULL OR ...".
   # Columns are text, so numbers and times are checked by pattern or with try_cast.
   #
-  # One rule can differ from the table's setting with on_fail: quarantine | drop | warn | fail.
-  # For example, stop the load only when a ride's end is before its start, and merely count a
-  # missing station:
-  #   - { name: ended_not_before_started, expression: "...", on_fail: fail }
-  #   - { name: end_station_id_length,    expression: "...", on_fail: warn }
+
   rules:
     - { name: ride_id_present, expression: "ride_id IS NOT NULL AND length(trim(ride_id)) > 0" }
     - { name: ride_id_format, expression: "ride_id rlike '^[0-9A-Fa-f]{16}$'" }
     - { name: rideable_type_present, expression: "rideable_type IS NOT NULL AND length(trim(rideable_type)) > 0" }
     - { name: rideable_type_known, expression: "rideable_type IN ('classic_bike', 'electric_bike', 'docked_bike')" }
     - { name: started_at_present, expression: "started_at IS NOT NULL AND length(trim(started_at)) > 0" }
-    - { name: started_at_is_timestamp, expression: "try_cast(started_at AS timestamp) IS NOT NULL" }
-    - { name: ended_at_is_timestamp, expression: "try_cast(ended_at AS timestamp) IS NOT NULL" }
-    - { name: ended_not_before_started, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
-    - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
-    - { name: start_station_name_length, expression: "length(start_station_name) <= 200" }
-    - { name: start_station_id_present, expression: "start_station_id IS NOT NULL AND length(trim(start_station_id)) > 0" }
-    - { name: start_station_id_length, expression: "length(start_station_id) <= 50" }
-    - { name: end_station_name_not_blank, expression: "end_station_name IS NULL OR length(trim(end_station_name)) > 0" }
-    - { name: end_station_name_length, expression: "end_station_name IS NULL OR length(end_station_name) <= 200" }
-    - { name: end_station_id_not_blank, expression: "end_station_id IS NULL OR length(trim(end_station_id)) > 0" }
-    - { name: end_station_id_length, expression: "end_station_id IS NULL OR length(end_station_id) <= 50" }
-    - { name: start_lat_is_number, expression: "start_lat rlike '^-?[0-9]+([.][0-9]+)?$'" }
-    - { name: start_lat_in_range, expression: "start_lat rlike '^-?(([0-8]?[0-9])([.][0-9]+)?|90([.]0+)?)$'" }
-    - { name: start_lng_is_number, expression: "start_lng rlike '^-?[0-9]+([.][0-9]+)?$'" }
-    - { name: start_lng_in_range, expression: "start_lng rlike '^-?((1[0-7][0-9]|[0-9]{1,2})([.][0-9]+)?|180([.]0+)?)$'" }
-    - { name: end_lat_is_number, expression: "end_lat IS NULL OR end_lat rlike '^-?[0-9]+([.][0-9]+)?$'" }
-    - { name: end_lat_in_range, expression: "end_lat IS NULL OR end_lat rlike '^-?(([0-8]?[0-9])([.][0-9]+)?|90([.]0+)?)$'" }
-    - { name: end_lng_is_number, expression: "end_lng IS NULL OR end_lng rlike '^-?[0-9]+([.][0-9]+)?$'" }
-    - { name: end_lng_in_range, expression: "end_lng IS NULL OR end_lng rlike '^-?((1[0-7][0-9]|[0-9]{1,2})([.][0-9]+)?|180([.]0+)?)$'" }
-    - { name: member_casual_present, expression: "member_casual IS NOT NULL AND length(trim(member_casual)) > 0" }
-    - { name: member_casual_known, expression: "member_casual IN ('member', 'casual')" }
+  # What happens to a row that fails a rule, for every rule below and the framework's own checks.
+  # Set on_fail here OR on each rule (an example sits above the rules), never both.
+  # Optional: leave it out to get the default (quarantine). on_fail needs rules: on its own,
+  # generate refuses it. A table that needs no quarantine at all leaves out the rules, on_fail and
+  # the quarantine: block; bad rows of the built-in checks are then dropped and counted.
+  #   quarantine  the row goes to the quarantine table and the good rows load      (default)
+  #   drop        the row is discarded and kept nowhere (only the counts show it)
+  #   warn        the row loads as usual; the failure is only counted in the metrics
+  #   fail        the whole FILE is blocked: none of its rows reach bronze, good ones included, and
+  #               its bad rows go to quarantine. The run and job FAIL naming the file; other files
+  #               load. The file is marked read, so it is not picked up again: fix it and run
+  #               framework_backfill (./run.sh backfill) to load it.
+  on_fail: quarantine
+    # - { name: started_at_is_timestamp, expression: "try_cast(started_at AS timestamp) IS NOT NULL" }
+    # - { name: ended_at_is_timestamp, expression: "try_cast(ended_at AS timestamp) IS NOT NULL" }
+    # - { name: ended_not_before_started, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
+    # - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
+    # - { name: start_station_name_length, expression: "length(start_station_name) <= 200" }
+    # - { name: start_station_id_present, expression: "start_station_id IS NOT NULL AND length(trim(start_station_id)) > 0" }
+    # - { name: start_station_id_length, expression: "length(start_station_id) <= 50" }
+    # - { name: end_station_name_not_blank, expression: "end_station_name IS NULL OR length(trim(end_station_name)) > 0" }
+    # - { name: end_station_name_length, expression: "end_station_name IS NULL OR length(end_station_name) <= 200" }
+    # - { name: end_station_id_not_blank, expression: "end_station_id IS NULL OR length(trim(end_station_id)) > 0" }
+    # - { name: end_station_id_length, expression: "end_station_id IS NULL OR length(end_station_id) <= 50" }
+    # - { name: start_lat_is_number, expression: "start_lat rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    # - { name: start_lat_in_range, expression: "start_lat rlike '^-?(([0-8]?[0-9])([.][0-9]+)?|90([.]0+)?)$'" }
+    # - { name: start_lng_is_number, expression: "start_lng rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    # - { name: start_lng_in_range, expression: "start_lng rlike '^-?((1[0-7][0-9]|[0-9]{1,2})([.][0-9]+)?|180([.]0+)?)$'" }
+    # - { name: end_lat_is_number, expression: "end_lat IS NULL OR end_lat rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    # - { name: end_lat_in_range, expression: "end_lat IS NULL OR end_lat rlike '^-?(([0-8]?[0-9])([.][0-9]+)?|90([.]0+)?)$'" }
+    # - { name: end_lng_is_number, expression: "end_lng IS NULL OR end_lng rlike '^-?[0-9]+([.][0-9]+)?$'" }
+    # - { name: end_lng_in_range, expression: "end_lng IS NULL OR end_lng rlike '^-?((1[0-7][0-9]|[0-9]{1,2})([.][0-9]+)?|180([.]0+)?)$'" }
+    # - { name: member_casual_present, expression: "member_casual IS NOT NULL AND length(trim(member_casual)) > 0" }
+    # - { name: member_casual_known, expression: "member_casual IN ('member', 'casual')" }
 
 # Failed rows go to abs_bronze.gl_abs_qrntn: the bronze schema, the bronze table plus _qrntn.
 # Add a quarantine block only to change that:
-# quarantine:
-#   schema: abs_quarantine
-#   table: gl_abs_rejects
+quarantine:
+   schema: abs_quarantine
+   table: gl_abs_rejects
 #   description: Rides that failed a quality rule, with the names of the rules in failed_rules.
 
 # ==================================================================================================
@@ -159,7 +158,8 @@ raw_to_bronze:
 #   watermark_column: started_at     # scd1, scd2: the column that orders changes (must be a column below)
 #   dedup: true                      # the older way to say scd1
 #   delete_when: "status = 'DEL'"    # scd1: keep the row and flag _is_deleted instead of removing it
-#   on_bad_rows: quarantine          # quarantine | drop | warn | fail  (see above)
+#   on_fail: quarantine              # optional, needs rules; quarantine | drop | warn | fail,
+#                                    # for every rule. Omit it if the table needs no quarantine
 #   columns:
 #     - name: ride_id
 #       type: string                 # string, int, decimal(18,2), date, timestamp, ...
@@ -169,7 +169,7 @@ raw_to_bronze:
 #   rules:
 #     - name: ride_id_present        # letters, digits, underscore; unique in the table
 #       expression: "ride_id IS NOT NULL"
-#       on_fail: quarantine          # optional: quarantine | drop | warn | fail
+#       on_fail: quarantine          # optional, only if raw_to_bronze sets no on_fail
 #
 # quarantine:                        # optional: only to change the defaults
 #   schema: abs_quarantine           # default the bronze schema
@@ -182,5 +182,5 @@ raw_to_bronze:
 #
 # Added to every bronze and quarantine table by the framework, with no setting: _src_file_path,
 # _src_file_name, _src_row_hash, _batch_id, _ingest_timestamp, and _rescued_data for file formats.
-# Checks added by the framework, which follow on_bad_rows: schema_conformance, cast_<column>,
+# Checks added by the framework, which follow raw_to_bronze.on_fail: schema_conformance, cast_<column>,
 # not_null_<key> for primary keys. More on rules: framework_ingestion/QUALITY_RULES.md.

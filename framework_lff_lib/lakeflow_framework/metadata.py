@@ -217,7 +217,7 @@ def _dataflow_record(config: PipelineConfig) -> dict[str, Any]:
     return {
         "raw": raw,
         "bronze": config.table_name("bronze"),
-        "quarantine": config.table_name("quarantine"),
+        "quarantine": config.table_name("quarantine") if config.has_quarantine else None,
     }
 
 

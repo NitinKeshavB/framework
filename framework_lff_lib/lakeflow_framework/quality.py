@@ -197,9 +197,15 @@ def assert_safe_rule_expression(
 
 def compile_rules(config: PipelineConfig) -> list[CompiledRule]:
     """The declared rules, then the checks the framework adds. The added ones follow the table's
-    ``on_bad_rows``: a table set to fail also fails on a missing key or an unreadable value."""
+    ``on_fail``: a table set to fail also fails on a missing key or an unreadable value.
 
-    action = config.on_bad_rows
+    A table with no quarantine (no rules and no quarantine block) has nowhere to send a row, so
+    its added checks drop a bad row instead; the row is counted in ``rows_dropped``.
+    """
+
+    action = config.on_fail
+    if action == "quarantine" and not config.has_quarantine:
+        action = "drop"
     rules = [
         CompiledRule(rule.name, rule.expression, "declared", rule.action) for rule in config.rules
     ]

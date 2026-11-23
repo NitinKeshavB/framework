@@ -29,6 +29,7 @@ from lakeflow_framework.config import (
     IS_DELETED,
     MANIFEST_SETTING,
     MAX_CLUSTER_KEYS,
+    RESCUED_DATA,
     SPECS_SETTING,
     SRC_FILE_NAME,
     SRC_FILE_PATH,
@@ -353,7 +354,7 @@ def _install_recorder(
                 owner=config.owner,
                 staged=f"{pipeline_id}_staged",
                 target=config.table_name("bronze"),
-                quarantine=config.table_name("quarantine"),
+                quarantine=config.table_name("quarantine") if config.has_quarantine else "",
                 append=not config.uses_auto_cdc,
                 build_error=error,
                 files=_sibling(config, files_name(config)) if is_file_load(config) else "",
@@ -582,14 +583,15 @@ def assemble(config: PipelineConfig) -> Graph:
                 kind="bronze", name=bronze_name, relation=relation, detail={"source": valid_name}
             )
         )
-    datasets.append(
-        Dataset(
-            kind="quarantine",
-            name=config.table_name("quarantine"),
-            relation=relation,
-            detail={"source": staged_name, "where": quarantine_where(rules, files=files)},
+    if config.has_quarantine:
+        datasets.append(
+            Dataset(
+                kind="quarantine",
+                name=config.table_name("quarantine"),
+                relation=relation,
+                detail={"source": staged_name, "where": quarantine_where(rules, files=files)},
+            )
         )
-    )
     return Graph(
         pipeline_id=config.pipeline_id,
         datasets=datasets,
@@ -651,6 +653,52 @@ def _typed_sequence(frame: Any, config: PipelineConfig) -> Any:
     )
 
 
+def quarantine_frame(frame: Any, config: PipelineConfig, internal: str) -> Any:
+    """The quarantine shape: bronze's columns and types, plus ``failed_rules``.
+
+    Bronze casts its sequence column (``_typed_sequence``); quarantine does the same with
+    TRY_CAST, because its rows are the ones that may not convert. A value that does not convert
+    is NULL in the column and kept as text in ``_rescued_data`` under the column's name, merged
+    into what Auto Loader already rescued. A table with no rescue column gets one here.
+    The pipeline and a backfill both use this, so the two write the same shape.
+    """
+
+    if not hasattr(frame, "selectExpr"):
+        return frame
+    frame = frame.selectExpr(f"* EXCEPT ({internal})", f"{DQ_COLUMN} AS failed_rules")
+    sequence, type_name = config.watermark_column, config.sequence_type
+    if not sequence or not type_name or not hasattr(frame, "columns"):
+        return frame
+    return frame.selectExpr(*rescued_cast_exprs(list(frame.columns), sequence, type_name))
+
+
+def rescued_cast_exprs(columns: list[str], column: str, type_name: str) -> list[str]:
+    """Select list that TRY_CASTs ``column`` and keeps an unconvertible value in _rescued_data."""
+
+    lost = f"`{column}` IS NOT NULL AND TRY_CAST(`{column}` AS {type_name}) IS NULL"
+    kept = f"map('{column}', CAST(`{column}` AS STRING))"
+    if RESCUED_DATA in columns:
+        earlier = (
+            f"coalesce(from_json({RESCUED_DATA}, 'MAP<STRING, STRING>'), "
+            "CAST(map() AS MAP<STRING, STRING>))"
+        )
+        rescued = (
+            f"CASE WHEN {lost} THEN to_json(map_concat({earlier}, {kept})) "
+            f"ELSE {RESCUED_DATA} END AS {RESCUED_DATA}"
+        )
+    else:
+        rescued = f"CASE WHEN {lost} THEN to_json({kept}) END AS {RESCUED_DATA}"
+    exprs = [
+        f"TRY_CAST(`{name}` AS {type_name}) AS `{name}`"
+        if name == column
+        else (rescued if name == RESCUED_DATA else f"`{name}`")
+        for name in columns
+    ]
+    if RESCUED_DATA not in columns:
+        exprs.append(rescued)
+    return exprs
+
+
 # Change history bronze and quarantine keep, so a silver run that was down for days can still
 # read exactly what changed. Delta removes change files older than the retention.
 CHANGE_FEED_RETENTION = "interval 30 days"
@@ -682,12 +730,15 @@ def batch_id() -> str:
     return _BATCH_ID
 
 
-def files_sql(staged: str, blocking: list[str], *, this_run: bool = True) -> str:
+def files_sql(
+    staged: str, blocking: list[str], *, this_run: bool = True, quarantine: bool = True
+) -> str:
     """One row per file of this run: counts and status, from the staged rows of this run only.
 
     The run is found by ``_batch_id`` and, so Delta can skip older files, by the load time the
     staged table is clustered on. A backfill passes ``this_run=False`` for a view that holds
-    nothing but the rows it is counting.
+    nothing but the rows it is counting. With ``quarantine=False`` (a table without one) the bad
+    rows of a blocked file are kept nowhere, so they count as dropped, not quarantined.
     """
 
     run = batch_id()
@@ -705,13 +756,15 @@ def files_sql(staged: str, blocking: list[str], *, this_run: bool = True) -> str
         if blocking
         else "''"
     )
+    kept_bad = "('fail', 'quarantine')" if quarantine else "('quarantine')"
+    lost_bad = "('drop')" if quarantine else "('drop', 'fail')"
     return (
         f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, {BATCH_ID}, "
         "count(*) AS rows_read, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN 0 "
         f"ELSE count_if({DQ_RESULT} = 'pass') END AS rows_loaded, "
-        f"count_if({DQ_RESULT} IN ('fail', 'quarantine')) AS rows_quarantined, "
-        f"count_if({DQ_RESULT} = 'drop') AS rows_dropped, "
+        f"count_if({DQ_RESULT} IN {kept_bad}) AS rows_quarantined, "
+        f"count_if({DQ_RESULT} IN {lost_bad}) AS rows_dropped, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 "
         f"THEN count_if({DQ_RESULT} = 'pass') ELSE 0 END AS rows_blocked, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN '{FILE_FAILED}' "
@@ -832,7 +885,7 @@ def stage_frame(frame: Any, config: PipelineConfig, batch: str | None = None) ->
 def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) -> None:
     by_kind = {dataset.kind: dataset for dataset in graph.datasets}
     raw, staged, valid = by_kind.get("raw"), by_kind["staged"], by_kind["valid"]
-    bronze, quarantine = by_kind["bronze"], by_kind["quarantine"]
+    bronze, quarantine = by_kind["bronze"], by_kind.get("quarantine")
     options = get_strategy(config.load_method).options(config)
     persisted = pipelines.materialized_view if config.is_batch else pipelines.table
 
@@ -897,7 +950,13 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
         @pipelines.materialized_view(name=files_dataset.name, **_table_options(config, "files"))
         def _files() -> Any:
-            return spark.sql(files_sql(staged.name, files_dataset.detail["blocking"]))
+            return spark.sql(
+                files_sql(
+                    staged.name,
+                    files_dataset.detail["blocking"],
+                    quarantine=config.has_quarantine,
+                )
+            )
 
         arrivals_dataset = by_kind.get("arrivals")
         if arrivals_dataset is not None:
@@ -954,12 +1013,14 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
         def _bronze() -> Any:
             return _reader().table(valid.name)
 
-    @persisted(name=quarantine.name, **_table_options(config, "quarantine"))
-    def _quarantine() -> Any:
-        frame = _filtered(_reader().table(staged.name), quarantine.detail["where"])
-        if hasattr(frame, "selectExpr"):
-            return frame.selectExpr(f"* EXCEPT ({internal})", f"{DQ_COLUMN} AS failed_rules")
-        return frame
+    if quarantine is not None:
+        where = quarantine.detail["where"]
+
+        @persisted(name=quarantine.name, **_table_options(config, "quarantine"))
+        def _quarantine() -> Any:
+            return quarantine_frame(
+                _filtered(_reader().table(staged.name), where), config, internal
+            )
 
     if config.load_method == "autoloader":
 

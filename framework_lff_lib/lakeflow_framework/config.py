@@ -117,8 +117,9 @@ class Column:
     pii: list[str] = field(default_factory=list)
 
 
-# What happens to a row that fails a rule (``raw_to_bronze.on_bad_rows`` for all of a table's
-# rules, ``on_fail`` on one rule to override it):
+# What happens to a row that fails a rule. ``on_fail`` is set in one place only: on
+# ``raw_to_bronze`` for all of a table's rules (and the framework's own checks), or on the rules
+# themselves. A spec that sets both is refused.
 #   quarantine  the row goes to the quarantine table; the good rows load (the default)
 #   drop        the row is discarded and kept nowhere
 #   warn        the row loads as usual; the failure is only counted in the metrics
@@ -202,7 +203,7 @@ class PipelineConfig:
     watermark_column: str | None = None
     columns: list[Column] = field(default_factory=list)
     rules: list[QualityRule] = field(default_factory=list)
-    on_bad_rows: str = "quarantine"  # the action of every rule that does not say its own
+    on_fail: str = "quarantine"  # raw_to_bronze.on_fail: every rule's action and the added checks'
     fixed_columns: list[FixedColumn] = field(default_factory=list)
     delimiter: str | None = None
     header: bool = True
@@ -221,6 +222,8 @@ class PipelineConfig:
     delete_when: str | None = None
     description: str = ""
     quarantine_description: str = ""
+    # The spec has a ``quarantine:`` block (``rules`` and ``on_fail`` count through ``rules``).
+    quarantine_requested: bool = False
     job_name: str | None = None
     domain: str = ""
     data_domain: str = ""
@@ -301,8 +304,20 @@ class PipelineConfig:
         return f"{self.source_catalog}.{self.source_table}"
 
     @property
+    def has_quarantine(self) -> bool:
+        """A quarantine table exists when the spec has a quarantine block, rules, or on_fail
+        (which needs rules, so it is covered by them).
+
+        With neither, the framework's own checks (casts, keys, schema conformance) drop a bad row
+        and count it in ``rows_dropped``: there is no quarantine logic for the table at all.
+        """
+
+        return bool(self.rules) or self.quarantine_requested
+
+    @property
     def layers(self) -> tuple[str, ...]:
-        return ("raw", "bronze", "quarantine") if self.has_raw else ("bronze", "quarantine")
+        written = ("raw", "bronze") if self.has_raw else ("bronze",)
+        return (*written, "quarantine") if self.has_quarantine else written
 
     def layer_schema(self, layer: str) -> str:
         return {
@@ -381,28 +396,32 @@ class PipelineConfig:
                     {
                         "name": rule.name,
                         "expression": rule.expression,
-                        # Only when it differs from the table's setting, so a spec that sets
-                        # neither keeps the same hash it had before the setting existed.
-                        **({"on_fail": rule.action} if rule.action != self.on_bad_rows else {}),
+                        # Only when it differs from the table's setting. A rule differs only
+                        # when the table sets nothing (the two are never both set), so this
+                        # document is always valid to read back.
+                        **({"on_fail": rule.action} if rule.action != self.on_fail else {}),
                     }
                     for rule in self.rules
                 ],
             },
-            "quarantine": _table_document(
-                self.quarantine_schema, self.quarantine_table, self.tags["quarantine"]
-            ),
         }
+        if self.has_quarantine:
+            # Written only when the table exists, so reading this document back (the manifest)
+            # does not turn a spec without rules into one that asked for quarantine.
+            document["quarantine"] = _table_document(
+                self.quarantine_schema, self.quarantine_table, self.tags["quarantine"]
+            )
+            _put(document["quarantine"], "description", self.quarantine_description or None)
         _put(document, "job_name", self.job_name)
         _put(document, "delivery", self.delivery or None)
         _put(document["raw_to_bronze"], "watermark_column", self.watermark_column)
         if self.cluster_by:
             document["raw_to_bronze"]["bronze"]["cluster_by"] = list(self.cluster_by)
         document["raw_to_bronze"]["load_type"] = self.load_type
-        if self.on_bad_rows != "quarantine":
-            document["raw_to_bronze"]["on_bad_rows"] = self.on_bad_rows
+        if self.on_fail != "quarantine":
+            document["raw_to_bronze"]["on_fail"] = self.on_fail
         _put(document["raw_to_bronze"], "delete_when", self.delete_when)
         _put(document, "description", self.description or None)
-        _put(document["quarantine"], "description", self.quarantine_description or None)
         return document
 
     def content_hash(self) -> str:
@@ -857,13 +876,13 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         | ({str(watermark)} if watermark else set())
         | LINEAGE_COLUMNS
     )
-    on_bad_rows = _rule_action(raw_to_bronze.get("on_bad_rows"), "on_bad_rows", label, errors)
+    on_fail = _table_on_fail(raw_to_bronze, label, errors)
     rules = _rules(
         raw_to_bronze.get("rules"),
         label,
         errors,
         columns=rule_columns,
-        default_action=on_bad_rows,
+        default_action=on_fail,
     )
     cluster_by = _cluster_by(bronze_target.get("cluster_by"), columns, label, errors)
     delete_when = _delete_when(
@@ -932,11 +951,13 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         file_events=file_options.file_events if file_options else False,
         expect_file=file_options.expect_file if file_options else False,
         cluster_by=cluster_by,
-        on_bad_rows=on_bad_rows,
+        on_fail=on_fail,
         load_type=load_type,
         delete_when=delete_when,
         description=description,
         quarantine_description=quarantine_description,
+        # on_fail, on the table or a rule, always comes with rules, which already ask for one.
+        quarantine_requested=document.get("quarantine") is not None,
         job_name=_optional_text(document.get("job_name")),
         domain=domain,
         data_domain=data_domain,
@@ -1185,6 +1206,12 @@ def _tags(
     if has_raw:
         layers.insert(0, ("raw", raw_target))
     for layer, section in layers:
+        if layer == "quarantine" and not section and "classification" not in shared:
+            # No quarantine block and no shared labels (a manifest copy of a table without
+            # quarantine): it has bronze's labels, as an omitted block always meant.
+            if "bronze" in found:
+                found[layer] = found["bronze"]
+            continue
         tags = _layer_tags(shared, section, f"{label}: {layer}", errors)
         if tags is not None:
             found[layer] = tags
@@ -1556,6 +1583,34 @@ def _column_tags(
     else:
         pii = []
     return classification, pii
+
+
+def _table_on_fail(raw_to_bronze: Mapping[str, Any], label: str, errors: list[str]) -> str:
+    """``raw_to_bronze.on_fail``: the action of every rule, set here or on the rules, not both."""
+
+    if "on_bad_rows" in raw_to_bronze:
+        errors.append(f"{label}: raw_to_bronze.on_bad_rows is now raw_to_bronze.on_fail")
+    value = raw_to_bronze.get("on_fail")
+    if value is None:
+        return "quarantine"
+    rules = raw_to_bronze.get("rules")
+    if not rules:
+        # on_fail says what happens to a row that fails a rule, so it means nothing on its own.
+        errors.append(
+            f"{label}: raw_to_bronze.on_fail needs rules: it sets what happens to a row that "
+            "fails a rule. Add rules, or remove on_fail (a table with neither has no quarantine)"
+        )
+    own = [
+        str(item.get("name") or "?")
+        for item in (rules if isinstance(rules, list) else [])
+        if isinstance(item, Mapping) and item.get("on_fail") is not None
+    ]
+    if own:
+        errors.append(
+            f"{label}: set on_fail in one place only: on raw_to_bronze for every rule, or on "
+            f"each rule, not both (rule(s) {', '.join(own)} set their own)"
+        )
+    return _rule_action(value, "on_fail", label, errors)
 
 
 def _rule_action(value: Any, key: str, label: str, errors: list[str]) -> str:

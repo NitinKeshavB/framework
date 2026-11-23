@@ -514,18 +514,35 @@ def event_log_jobs(table_names: Iterable[str]) -> dict[str, str]:
     return logs
 
 
-def pipeline_updates_sql(events_table: str, job_name: str, since: datetime) -> str:
+def pipeline_updates_sql(
+    events_table: str, job_name: str, since: datetime, meta: str | None = None
+) -> str:
     """One row per pipeline update in a single event log (one scan, no UNION ALL fan-in).
 
     An update with any event since ``since`` is read whole, so its start is not cut off.
     Call once per log — Catalyst plans stay small at hundreds of pipelines.
+    ``run_as`` comes from the workflow's source system in the registry (as for job runs),
+    ``''`` when ``meta`` is not given or nothing is registered. The event log has no run_as.
     """
 
     if not _IDENTIFIER.match(job_name or ""):
         raise ValueError("job name is required")
     cutoff = since.strftime("%Y-%m-%d %H:%M:%S")
+    if meta is None:
+        who = "SELECT CAST('' AS STRING) AS run_as"
+    else:
+        # max() over zero rows still returns one row, so the CROSS JOIN never drops updates.
+        who = f"""SELECT coalesce(max(s.config:run_as::STRING), '') AS run_as
+  FROM {meta}.asset_registry_current w
+  LEFT JOIN {meta}.asset_registry_current s
+    ON s.object_kind = 'source_system'
+   AND s.full_name = w.config:source_system::STRING
+  WHERE w.object_kind = 'workflow' AND w.full_name = '{job_name}'"""
     return f"""
-WITH marked AS (
+WITH who AS (
+  {who}
+),
+marked AS (
   SELECT
     CAST('{job_name}' AS STRING) AS job_name,
     origin.pipeline_id AS pipeline_id,
@@ -548,10 +565,12 @@ SELECT
   max_by(state, event_at) AS state,
   CASE max_by(state, event_at) WHEN 'COMPLETED' THEN 'SUCCEEDED'
     WHEN 'FAILED' THEN 'FAILED' WHEN 'CANCELED' THEN 'CANCELED' ELSE 'RUNNING' END AS status,
+  who.run_as AS run_as,
   current_timestamp() AS recorded_at
 FROM marked
+CROSS JOIN who
 WHERE latest_at >= TIMESTAMP '{cutoff}'
-GROUP BY job_name, pipeline_id, update_id
+GROUP BY job_name, pipeline_id, update_id, who.run_as
 """
 
 
@@ -581,7 +600,7 @@ def record_pipeline_updates(spark, catalog: str, now: datetime | None = None) ->
     log.info("pipeline updates: reading updates since %s", since.isoformat())
     merged = 0
     for table_name, job in sorted(logs.items()):
-        source = pipeline_updates_sql(f"{events}.{table_name}", job, since)
+        source = pipeline_updates_sql(f"{events}.{table_name}", job, since, meta=meta)
         spark.sql(
             _merge_sql(
                 f"{meta}.pipeline_updates",

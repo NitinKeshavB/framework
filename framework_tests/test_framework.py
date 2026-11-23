@@ -535,10 +535,15 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     ]
     assert keys and all(len(key.split(",")) <= 4 for key in keys)
     assert "'delta.autoOptimize.autoCompact' = 'false'" not in text
-    # First-deploy DDL: no ALTER. CHECKs live in CREATE TABLE; views are CREATE OR REPLACE.
-    assert not any(statement.upper().startswith("ALTER") for statement in statements)
-    assert "CONSTRAINT load_ledger_load_kind CHECK" in text
-    assert "CONSTRAINT ledger_detail_kind CHECK" in text
+    # Delta rejects CHECK inside CREATE TABLE: each CHECK is an ALTER DROP IF EXISTS + ADD pair.
+    creates = [s for s in statements if s.upper().startswith("CREATE TABLE")]
+    assert creates and not any(" CHECK (" in s for s in creates)
+    alters = [s for s in statements if s.upper().startswith("ALTER")]
+    assert alters and all(" CONSTRAINT " in s for s in alters)
+    added = {s.split(" ADD CONSTRAINT ")[1].split()[0] for s in alters if " ADD CONSTRAINT " in s}
+    dropped = {s.split(" IF EXISTS ")[1] for s in alters if " DROP CONSTRAINT IF EXISTS " in s}
+    assert added == dropped
+    assert {"load_ledger_load_kind", "ledger_detail_kind", "flow_checkpoint_status"} <= added
     assert "VIEW framework_dev.framework_meta.v_ownership_refusals" in text
     assert "ownership_refusals" in text
     assert "run_ledger" not in text and "run_current" not in text
@@ -588,8 +593,9 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "valid_from" in text
     assert "valid_to" in text
     assert "is_current" in text
-    # Fresh schema: CREATE tables/views plus idempotent INSERT seeds for enum refs.
-    assert {statement.split()[0].upper() for statement in statements} <= {"CREATE", "INSERT"}
+    # CREATE tables/views, idempotent INSERT seeds for enum refs, ALTER for CHECK constraints.
+    kinds = {statement.split()[0].upper() for statement in statements}
+    assert kinds <= {"CREATE", "INSERT", "ALTER"}
     assert "ref_metric_name" not in text
     assert _column_list(text, "asset_registry") == [*OBJECT_COLUMNS, "config", *SCD_COLUMNS]
     assert _column_list(text, "ownership_refusals") == list(LEDGER_COLUMNS)

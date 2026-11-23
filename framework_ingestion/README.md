@@ -119,6 +119,18 @@ flowchart LR
 
 `raw_to_bronze.rules` holds SQL conditions every good row must meet. By default, a row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantined` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.
 
+A quarantine table is created only when the spec asks for one:
+
+| Spec has | Quarantine table | A row failing the framework's own checks (`cast_<column>`, `not_null_<key>`, `schema_conformance`) |
+| --- | --- | --- |
+| `rules:` (with or without `on_fail`) | `<bronze table>_qrntn` beside bronze, or as the `quarantine:` block says | Follows `raw_to_bronze.on_fail` (default `quarantine`) |
+| Only a `quarantine:` block | As the block says | Quarantined |
+| None of these | None, and no quarantine flow | Dropped, counted in `rows_dropped` |
+
+All three are optional: a table that needs no quarantine leaves out `rules`, `on_fail`, and the `quarantine:` block. `on_fail` sets what happens to a row that fails a rule, so it needs `rules`: `./run.sh generate` refuses a spec with `raw_to_bronze.on_fail` and no rules.
+
+The quarantine table has bronze's columns and types plus `failed_rules`. A value that cannot be converted to its bronze type (the sequence column of a dedup load) is NULL in the column and kept as text in `_rescued_data`, under the column's name.
+
 ```yaml
 raw_to_bronze:
   rules:
@@ -128,7 +140,7 @@ raw_to_bronze:
     - { name: ended_after_start, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
 ```
 
-What happens to a failing row is a choice: `raw_to_bronze.on_bad_rows` (and `on_fail` on one rule) is `quarantine` (the default), `drop`, `warn` or `fail`. `fail` blocks the whole **file** that holds a bad row: none of its rows reach bronze, its bad rows go to quarantine, the run and job end `FAILED` naming the file, and the file is not picked up again. `framework_backfill` reloads files by name or arrival date, or refreshes a table, through the same rules. A table in a scheduled delivery also expects a file with rows each run: none, or an empty one, is recorded `FAILED` in the ledger while the job still succeeds (`source.expect_file`; see QUALITY_RULES.md). `abs_gl.yaml` shows every option of a spec, commented, at the bottom.
+What happens to a failing row is a choice: `on_fail` is `quarantine` (the default), `drop`, `warn` or `fail`, set in one place only, either on `raw_to_bronze` for every rule or on each rule, never both. `fail` blocks the whole **file** that holds a bad row: none of its rows reach bronze, its bad rows go to quarantine, the run and job end `FAILED` naming the file, and the file is not picked up again. `framework_backfill` reloads files by name or arrival date, or refreshes a table, through the same rules. A table in a scheduled delivery also expects a file with rows each run: none, or an empty one, is recorded `FAILED` in the ledger while the job still succeeds (`source.expect_file`; see QUALITY_RULES.md). `abs_gl.yaml` shows every option of a spec, commented, at the bottom.
 
 `rlike` matches anywhere in the value, so anchor a pattern with `^` and `$`, and write `[0-9]` instead of `\d`: a single backslash is dropped silently. `./run.sh generate` reads a rule as text. It catches an unknown column, an unapproved function, an unclosed bracket or a half-written condition, but not a regex that does not compile or a function with the wrong arguments, which would fail the whole update at load time. Run **`./run.sh check:rules <profile> <warehouse-id> [catalog]`** before a deploy that changes a rule: it evaluates every rule on a warehouse, and with a catalog also counts the rows each would quarantine. **[QUALITY_RULES.md](QUALITY_RULES.md)** has the regex guide, a copyable pattern list, every kind of check you can add (presence, length, allowed values, numbers, dates, across columns, conditional), the approved functions, the checks that are on by default, what a rule cannot do, how to test a rule against existing data before deploying, and where the results show up. `abs_gl.yaml` has a full example with two rules per column.
 
@@ -175,7 +187,7 @@ changes.commit()  # only now: record how far the reader has consumed
 
 Progress is one row per `(reader_table, source_table)` in `framework_meta.flow_checkpoint` (layer-independent). The read is pinned to one table version, so rows committed meanwhile are picked up next time and none are skipped. `commit()` comes after the reader has used the rows, so a run that stops before it reads the same rows again: **the merge must be idempotent.** With `keys`, the feed leaves out an update that only restamped a row without changing its content.
 
-If the source is rebuilt (a full refresh, a replace, a restore), the change feed cannot be followed across it. The reader stops and says so. Delete that pair's row in `flow_checkpoint`, rebuild the reader table, and the next read starts again from the source as it is.
+If the source is rebuilt (a full refresh, a replace, a restore), the change feed cannot be followed across it. The reader stops and says so. Delete every row for that `(reader_table, source_table)` pair in `flow_checkpoint` (it is append-only and `v_flow_checkpoint` falls back to the newest remaining `SUCCEEDED` row, so deleting only the latest one resumes from an older mark), rebuild the reader table, and the next read starts again from the source as it is.
 
 ## Describe your tables and columns
 

@@ -25,9 +25,12 @@ RULES = (
 )
 
 
-def spec(table_level: str | None = None, rule_level: str = "warn") -> str:
-    head = f"  on_bad_rows: {table_level}\n" if table_level else ""
-    return _volume_spec(extra=head + RULES % rule_level)
+def spec(table_level: str | None = None, rule_level: str | None = None) -> str:
+    """``on_fail`` on raw_to_bronze (``table_level``) or on the rule id_format (``rule_level``)."""
+
+    head = f"  on_fail: {table_level}\n" if table_level else ""
+    rules = RULES % rule_level if rule_level else RULES.replace(", on_fail: %s", "")
+    return _volume_spec(extra=head + rules)
 
 
 def build(tmp_path: Path, text: str):
@@ -50,35 +53,62 @@ class _FailPipelines(_Pipelines):
 
 def test_a_spec_that_says_nothing_quarantines_exactly_as_before(tmp_path: Path) -> None:
     config = _config(tmp_path, FILE_SOURCE, "a.yaml", _volume_spec(extra=RULES % "quarantine"))
-    assert config.on_bad_rows == "quarantine"
+    assert config.on_fail == "quarantine"
     assert {rule.action for rule in config.rules} == {"quarantine"}
     rules = compile_rules(config)
     assert valid_where(rules) == "size(_dq_failed_rules) = 0"
     assert quarantine_where(rules) == "size(_dq_failed_rules) > 0"
     assert fail_expectations(rules) == {}
-    assert "on_bad_rows" not in config.canonical()["raw_to_bronze"]
+    assert "on_fail" not in config.canonical()["raw_to_bronze"]
     assert all("on_fail" not in r for r in config.canonical()["raw_to_bronze"]["rules"])
 
 
-def test_the_table_sets_a_default_and_a_rule_can_override_it(tmp_path: Path) -> None:
-    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec(table_level="drop", rule_level="warn"))
-    assert config.on_bad_rows == "drop"
+def test_on_fail_on_the_table_sets_every_rule_and_every_built_in_check(tmp_path: Path) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec(table_level="drop"))
+    assert config.on_fail == "drop"
     assert {rule.name: rule.action for rule in config.rules} == {
-        "id_present": "drop",  # no on_fail, so the table's setting
-        "id_format": "warn",  # its own
+        "id_present": "drop",
+        "id_format": "drop",
     }
-    # The framework's own checks follow the table's setting.
     assert {r.name: r.action for r in compile_rules(config) if r.origin != "declared"} == {
         "cast_thing_id": "drop",
         "schema_conformance": "drop",
     }
 
 
+def test_on_fail_on_the_rules_sets_only_those_rules(tmp_path: Path) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec(rule_level="warn"))
+    assert config.on_fail == "quarantine"
+    assert {rule.name: rule.action for rule in config.rules} == {
+        "id_present": "quarantine",  # says nothing
+        "id_format": "warn",  # its own
+    }
+    # The framework's own checks: quarantine, since the table sets nothing.
+    builtin = {r.action for r in compile_rules(config) if r.origin != "declared"}
+    assert builtin == {"quarantine"}
+
+
+def test_on_fail_in_both_places_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ConfigValidationError, match="set on_fail in one place only") as caught:
+        _config(tmp_path, FILE_SOURCE, "a.yaml", spec(table_level="drop", rule_level="warn"))
+    assert "id_format" in str(caught.value)
+
+
+def test_the_old_name_on_bad_rows_says_what_it_is_now(tmp_path: Path) -> None:
+    text = _volume_spec(extra="  on_bad_rows: drop\n" + RULES.replace(", on_fail: %s", ""))
+    with pytest.raises(ConfigValidationError, match="on_bad_rows is now raw_to_bronze.on_fail"):
+        _config(tmp_path, FILE_SOURCE, "a.yaml", text)
+
+
+@pytest.mark.parametrize("level", ["table", "rule"])
 @pytest.mark.parametrize("action", ["quarantine", "drop", "warn", "fail"])
-def test_the_canonical_form_round_trips_every_action(tmp_path: Path, action: str) -> None:
-    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec(table_level=action, rule_level="warn"))
+def test_the_canonical_form_round_trips_every_action(
+    tmp_path: Path, action: str, level: str
+) -> None:
+    text = spec(table_level=action) if level == "table" else spec(rule_level=action)
+    config = _config(tmp_path, FILE_SOURCE, "a.yaml", text)
     again = config_from_document(config.canonical())
-    assert again.on_bad_rows == action
+    assert again.on_fail == config.on_fail
     assert [(r.name, r.action) for r in again.rules] == [(r.name, r.action) for r in config.rules]
     assert again.content_hash() == config.content_hash()
 
@@ -90,7 +120,7 @@ def test_the_action_is_part_of_the_hash_so_a_change_makes_a_new_version(tmp_path
 
 
 def test_an_unknown_action_is_refused_with_the_choices(tmp_path: Path) -> None:
-    with pytest.raises(ConfigValidationError, match="on_bad_rows must be one of"):
+    with pytest.raises(ConfigValidationError, match=r"a\.yaml: on_fail must be one of"):
         _config(tmp_path, FILE_SOURCE, "a.yaml", spec(table_level="ignore"))
     with pytest.raises(ConfigValidationError, match="rule 'id_format' on_fail must be one of"):
         _config(tmp_path, FILE_SOURCE, "b.yaml", spec(rule_level="skip"))
@@ -138,13 +168,13 @@ def test_a_fail_rule_on_files_blocks_the_file_and_a_check_fails_the_update(tmp_p
     assert (
         "files_things_blocked_check" in pipelines.names and "files_things_files" in pipelines.names
     )
-    assert config.on_bad_rows == "quarantine"
+    assert config.on_fail == "quarantine"
 
 
 def test_a_table_set_to_fail_blocks_a_file_on_every_rule_and_every_built_in_check(
     tmp_path: Path,
 ) -> None:
-    config, spark, pipelines = build(tmp_path, spec(table_level="fail", rule_level="fail"))
+    config, spark, pipelines = build(tmp_path, spec(table_level="fail"))
     assert {"id_present", "id_format", "cast_thing_id", "schema_conformance"} <= set(
         pipelines.expectations
     )
@@ -188,7 +218,7 @@ def test_the_result_of_a_row_is_decided_once_and_stored_with_it(tmp_path: Path) 
 
 
 def test_the_pipeline_uses_the_routing_for_bronze_and_quarantine(tmp_path: Path) -> None:
-    _config_, spark, _pipelines = build(tmp_path, spec(table_level="drop", rule_level="warn"))
+    _config_, spark, _pipelines = build(tmp_path, spec(table_level="drop"))
     wheres = spark.readStream.wheres
     assert "_dq_result = 'pass'" in wheres  # bronze
     assert "_dq_result IN ('fail', 'quarantine')" in wheres  # quarantine
@@ -197,8 +227,8 @@ def test_the_pipeline_uses_the_routing_for_bronze_and_quarantine(tmp_path: Path)
 def test_the_registry_records_each_rules_action(tmp_path: Path) -> None:
     import json
 
-    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec(table_level="drop", rule_level="warn"))
+    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec(rule_level="warn"))
     (pipeline,) = [r for r in object_rows(config) if r["object_kind"] == "pipeline"]
     rules = {r["name"]: r["action"] for r in json.loads(pipeline["config_json"])["rules"]}
-    assert rules["id_present"] == "drop" and rules["id_format"] == "warn"
-    assert rules["schema_conformance"] == "drop"
+    assert rules["id_present"] == "quarantine" and rules["id_format"] == "warn"
+    assert rules["schema_conformance"] == "quarantine"
