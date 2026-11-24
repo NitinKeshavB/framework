@@ -62,8 +62,10 @@ class AutoLoader(LoadStrategy):
         options = {
             "cloudFiles.format": SPARK_FORMAT[config.file_format],
             "cloudFiles.includeExistingFiles": "true",
+            # Declared columns come as schemaHints. With none, infer_schema chooses: "strings"
+            # keeps every column a string, anything else infers real types (the default).
             "cloudFiles.inferColumnTypes": "false"
-            if config.columns or config.fixed_columns
+            if config.columns or config.fixed_columns or config.infer_schema == "strings"
             else "true",
             "cloudFiles.allowOverwrites": "false",
         }

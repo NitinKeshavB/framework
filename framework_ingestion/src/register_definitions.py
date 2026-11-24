@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 
+from lakeflow_framework.infer_columns import keep_inferred_columns
 from lakeflow_framework.ingestion import registry_rows
 from lakeflow_framework.logs import job_logging, step
 from lakeflow_framework.registry import append_definitions, retire_definitions
@@ -29,6 +30,8 @@ def main() -> None:
     spark = SparkSession.builder.getOrCreate()
     with step(log, "read the bundle's definitions"):
         rows = registry_rows(bundle, catalog, bundle_id=bundle_id)
+    with step(log, "keep the columns inferred from bronze for tables that declare none"):
+        rows = keep_inferred_columns(spark, rows, catalog)
     systems = sorted(row["full_name"] for row in rows if row["object_kind"] == "source_system")
     log.info("%d definition(s) from source system(s) %s", len(rows), ", ".join(systems))
     with step(log, "write new and changed definitions"):

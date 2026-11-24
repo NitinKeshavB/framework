@@ -203,13 +203,20 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     generate(bundle)
     source = (bundle / BUILD_DIR / "pipelines" / "billing_daily.py").read_text("utf-8")
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
-    # Only the refresh: the pipeline records its own counts, status, and errors (an event hook),
-    # and framework_runs records the job runs.
-    assert [task["task_key"] for task in _job(bundle)["tasks"]] == ["refresh_pipeline"]
+    # The refresh, then one task that registers inferred columns. The pipeline records its own
+    # counts, status, and errors (an event hook), and framework_runs records the job runs.
+    tasks = _job(bundle)["tasks"]
+    assert [task["task_key"] for task in tasks] == ["refresh_pipeline", "infer_columns"]
+    assert tasks[1]["depends_on"] == [{"task_key": "refresh_pipeline"}]
+    assert tasks[1]["spark_python_task"]["parameters"][2:] == [
+        "billing_credits",
+        "billing_invoices",
+    ]
     job = _job(bundle)
     assert "run_as" not in job
     assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
-    assert "environments" not in job  # nothing in the job runs Python
+    # Only the infer_columns task runs Python, so the job carries the one environment it needs.
+    assert [env["environment_key"] for env in job["environments"]] == ["framework_env"]
     settings = _settings(bundle)
     assert "lff.manifest" in settings
     assert settings["lff.manifest"].endswith(f"{BUILD_DIR}/manifests/billing_daily.json")

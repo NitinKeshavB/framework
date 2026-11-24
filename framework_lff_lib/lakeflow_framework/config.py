@@ -82,6 +82,9 @@ FORMATS = (
     "excel",
     "yaml",
 )
+INFER_SCHEMA_MODES = ("typed", "strings")
+# The text formats, where Auto Loader chooses the column types. Parquet and Avro carry their own.
+INFER_SCHEMA_FORMATS = frozenset({"csv", "delimited", "json"})
 SECRET_PARTS = ("account_key", "access_key", "secret", "password", "token")
 UNRESOLVED = re.compile(r"\$\{[^}]+\}")
 CLOUD_PATH = re.compile(r"^(abfss|s3)://", re.IGNORECASE)
@@ -158,6 +161,7 @@ class FileSourceOptions:
     json_multiline: bool = False
     file_events: bool = False
     expect_file: bool = False
+    infer_schema: str | None = None
     fixed_columns: list[FixedColumn] = field(default_factory=list)
 
 
@@ -217,6 +221,10 @@ class PipelineConfig:
     # rows, is recorded FAILED in the ledger (the job still succeeds). On by default for a table
     # in a scheduled delivery.
     expect_file: bool = False
+    # How Auto Loader types the columns of a spec that declares none: "typed" infers real types,
+    # "strings" keeps every column a string. None leaves it as before (typed). Meaningless once
+    # ``columns`` are declared, and refused then.
+    infer_schema: str | None = None
     cluster_by: list[str] = field(default_factory=list)
     load_type: str = "insert_only"
     delete_when: str | None = None
@@ -360,6 +368,7 @@ class PipelineConfig:
             _put(source, "multiline", True if self.json_multiline else None)
             _put(source, "file_events", True if self.file_events else None)
             _put(source, "expect_file", True if self.expect_file else None)
+            _put(source, "infer_schema", self.infer_schema)
             if self.fixed_columns:
                 source["fixed_columns"] = [
                     {"name": column.name, "start": column.start, "length": column.length}
@@ -869,6 +878,11 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
             "so it must be in columns with its type"
         )
     fixed_columns = file_options.fixed_columns if file_options else []
+    if file_options and file_options.infer_schema and (columns or fixed_columns):
+        errors.append(
+            f"{label}: infer_schema is for a spec that declares no columns; "
+            "remove it, or remove the columns"
+        )
     rule_columns = (
         {column.name for column in columns}
         | {column.name for column in fixed_columns}
@@ -950,6 +964,7 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         json_multiline=file_options.json_multiline if file_options else False,
         file_events=file_options.file_events if file_options else False,
         expect_file=file_options.expect_file if file_options else False,
+        infer_schema=file_options.infer_schema if file_options else None,
         cluster_by=cluster_by,
         on_fail=on_fail,
         load_type=load_type,
@@ -988,6 +1003,7 @@ _FILE_ONLY_KEYS = frozenset(
         "multiline",
         "file_events",
         "expect_file",
+        "infer_schema",
         "max_files_per_trigger",
         "fixed_columns",
         "external_location",
@@ -1103,6 +1119,18 @@ def _parse_file_source(
         expect_file = False
         ok = False
 
+    infer_schema = source.get("infer_schema")
+    if infer_schema is not None:
+        if infer_schema not in INFER_SCHEMA_MODES:
+            errors.append(f"{label}: infer_schema must be one of {', '.join(INFER_SCHEMA_MODES)}")
+            ok = False
+        elif file_format not in INFER_SCHEMA_FORMATS:
+            errors.append(
+                f"{label}: infer_schema applies to {', '.join(sorted(INFER_SCHEMA_FORMATS))}; "
+                f"{file_format} carries its own column types"
+            )
+            ok = False
+
     max_files = source.get("max_files_per_trigger")
     max_files_value: int | None = None
     if max_files is not None:
@@ -1131,6 +1159,7 @@ def _parse_file_source(
         json_multiline=multiline,
         file_events=file_events,
         expect_file=expect_file,
+        infer_schema=str(infer_schema) if infer_schema else None,
         fixed_columns=fixed_columns,
     )
 

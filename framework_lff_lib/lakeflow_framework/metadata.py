@@ -281,6 +281,69 @@ def _column_rows(
     return rows
 
 
+INFERRED_SOURCE = "inferred"
+QUARANTINE_ONLY_COLUMNS = {"failed_rules": "Rules that failed for this row"}
+
+
+def metadata_column_names() -> frozenset[str]:
+    """The columns the framework adds itself. A table whose registered columns are all these has
+    no columns of its own in the registry."""
+
+    return frozenset(AUDIT_COLUMN_DESCRIPTIONS) | frozenset(QUARANTINE_ONLY_COLUMNS)
+
+
+def observed_column_rows(
+    config: PipelineConfig,
+    observed: Mapping[str, list[tuple[str, str]]],
+    recorded_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """One version per column of tables that already exist, from what each table really has.
+
+    ``observed`` maps a layer to its (name, type) pairs in table order. The rows are marked
+    ``source = inferred``, so a later deploy keeps them (``infer_columns.keep_inferred_columns``)
+    and a spec that starts declaring columns replaces them. A column the framework adds keeps its
+    description; one that came from the files has none, because nobody described it.
+    """
+
+    recorded = recorded_at or _now()
+    scope = _scope(config)
+    root = pipeline_stable_key(config)
+    rows: list[dict[str, Any]] = []
+    for layer, found in observed.items():
+        table_name = config.table_name(layer)
+        classification = config.tags[layer].classification
+        described = {
+            name: description
+            for name, _type, description, _cls, _pii in audit_columns(config, layer, classification)
+        }
+        if layer == "quarantine":
+            described.update(QUARANTINE_ONLY_COLUMNS)
+        for ordinal, (name, type_name) in enumerate(found, start=1):
+            record = {
+                "name": name,
+                "ordinal": ordinal,
+                "data_type": type_name.lower(),
+                "description": described.get(name, ""),
+                "classification": classification,
+                "pii": "",
+            }
+            rows.append(
+                _object(
+                    "column",
+                    f"{table_name}.{name}",
+                    scope,
+                    table_name,
+                    "column_of",
+                    json.dumps(record, sort_keys=True),
+                    _column_hash(record),
+                    INFERRED_SOURCE,
+                    recorded,
+                    stable_key=f"{root}|column|{layer}|{name}",
+                )
+            )
+    return rows
+
+
 def audit_columns(
     config: PipelineConfig, layer: str, classification: str
 ) -> list[tuple[str, str, str, str, list[str]]]:

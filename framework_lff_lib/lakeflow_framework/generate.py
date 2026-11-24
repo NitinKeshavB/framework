@@ -261,9 +261,27 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         refresh["depends_on"] = [{"task_key": "batch_load"}]
     refresh["pipeline_task"] = {"pipeline_id": f"${{resources.pipelines.{name}_pipeline.id}}"}
     tasks.append(refresh)
-    # No recording task follows. The pipeline records its own load counts, status, and error once
-    # per update (an event hook, see pipeline_metrics). The hourly framework_runs job records the
-    # job runs themselves, including runs that never reached the pipeline.
+    # No recording task follows for load counts. The pipeline records its own load counts, status,
+    # and error once per update (an event hook, see pipeline_metrics). The hourly framework_runs
+    # job records the job runs themselves, including runs that never reached the pipeline.
+    # The one task after the load registers the columns of a table that declares none. It does a
+    # single SELECT and stops for a table whose columns are already registered, and it never fails
+    # the job (see src/infer_columns.py).
+    tasks.append(
+        {
+            "task_key": "infer_columns",
+            "depends_on": [{"task_key": "refresh_pipeline"}],
+            "environment_key": "framework_env",
+            "spark_python_task": {
+                "python_file": "../../src/infer_columns.py",
+                "parameters": [
+                    "--catalog",
+                    "${var.catalog}",
+                    *(config.pipeline_id for config in configs),
+                ],
+            },
+        }
+    )
 
     # Deployed names carry a dev or prod prefix, so the run views join system tables on this tag.
     job: dict[str, Any] = {"name": name, "tags": job_tags(system, delivery, configs)}
@@ -279,13 +297,12 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         job["trigger"] = {"file_arrival": {"url": f"/Volumes/${{var.catalog}}/{schema}/{volume}/"}}
     else:
         job["trigger"] = {"file_arrival": {"url": detail["path"]}}
-    if batch_paths:
-        job["environments"] = [
-            {
-                "environment_key": "framework_env",
-                "spec": {"environment_version": ENVIRONMENT_VERSION, "dependencies": [WHEEL]},
-            }
-        ]
+    job["environments"] = [
+        {
+            "environment_key": "framework_env",
+            "spec": {"environment_version": ENVIRONMENT_VERSION, "dependencies": [WHEEL]},
+        }
+    ]
     job["performance_target"] = system.performance_target or PERFORMANCE_TARGET
     job["tasks"] = tasks
     if system.run_as:
