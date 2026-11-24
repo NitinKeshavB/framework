@@ -158,37 +158,93 @@ def test_quarantine_and_drop_and_warn_can_be_mixed_in_one_table(tmp_path: Path) 
     )
 
 
-def test_a_fail_rule_on_files_never_fails_the_flow_and_adds_no_working_table(
-    tmp_path: Path,
-) -> None:
+def test_a_fail_rule_on_files_blocks_the_file_and_a_check_fails_the_update(tmp_path: Path) -> None:
     config, spark, pipelines = build(tmp_path, spec(table_level=None, rule_level="fail"))
-    # A failing flow would leave the file unread, so it would be picked up again. The failure is
-    # recorded in the ledger instead, from the rows that went to quarantine.
-    assert pipelines.fail_expectations == []
+    # The only run-level failure is the check after the load. A failing flow would leave the file
+    # unread, so it would be picked up again.
+    assert pipelines.fail_expectations == ["no_file_blocked_by_fail_rule"]
     # The rule itself still counts, like any other, in the event log.
     assert "id_format" in pipelines.expectations and "id_present" in pipelines.expectations
-    assert not [name for name in pipelines.names if name.endswith(("_files", "_blocked_check"))]
+    assert (
+        "files_things_blocked_check" in pipelines.names and "files_things_files" in pipelines.names
+    )
     assert config.on_fail == "quarantine"
 
 
-def test_a_table_set_to_fail_counts_every_rule_and_every_built_in_check(
+def test_the_per_file_dataset_is_published_and_the_check_is_private(tmp_path: Path) -> None:
+    _config_, _spark, pipelines = build(tmp_path, spec(table_level=None, rule_level="fail"))
+    # the hook reads the per-file counts from the published dataset, for exact numbers
+    assert "private" not in pipelines.options["files_things_files"]
+    assert pipelines.options["files_things_blocked_check"]["private"] is True
+
+
+def test_a_table_with_no_fail_rule_gets_none_of_these_datasets(tmp_path: Path) -> None:
+    _config_, _spark, pipelines = build(tmp_path, spec(table_level=None, rule_level="quarantine"))
+    extra = ("_files", "_blocked_check", "_valid", "_arrivals")
+    assert not [name for name in pipelines.names if name.endswith(extra)]
+    assert pipelines.fail_expectations == []
+
+
+def test_a_table_that_drops_rows_gets_the_per_file_dataset_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    from lakeflow_framework.pipeline import assemble, has_blocking, has_file_counts
+
+    for text in (spec(rule_level="drop"), spec(table_level="drop")):
+        config, _spark, pipelines = build(tmp_path, text)
+        # a dropped row is kept in no table, so only this dataset can tell a file how many it lost
+        assert has_file_counts(config) and not has_blocking(config)
+        assert "files_things_files" in pipelines.names
+        assert "private" not in pipelines.options["files_things_files"]
+        # nothing holds a file back or fails the update, and bronze reads staged directly
+        extra = ("_blocked_check", "_valid")
+        assert not [name for name in pipelines.names if name.endswith(extra)]
+        assert pipelines.fail_expectations == []
+        kinds = [dataset.kind for dataset in assemble(config).datasets]
+        assert "files" in kinds and "valid" not in kinds and "blocked_check" not in kinds
+
+
+def test_a_table_that_only_quarantines_or_warns_gets_no_per_file_dataset(tmp_path: Path) -> None:
+    from lakeflow_framework.pipeline import has_file_counts
+
+    for text in (spec(rule_level="quarantine"), spec(rule_level="warn"), spec(table_level="warn")):
+        config, _spark, pipelines = build(tmp_path, text)
+        assert not has_file_counts(config)
+        assert not [name for name in pipelines.names if name.endswith("_files")]
+
+
+def test_a_rule_switched_off_does_not_make_a_table_a_dropping_one(tmp_path: Path) -> None:
+    from lakeflow_framework.pipeline import has_file_counts
+
+    text = _volume_spec(
+        extra=(
+            "  rules:\n"
+            '    - { name: id_present, expression: "thing_id IS NOT NULL" }\n'
+            "    - { name: id_format, expression: \"thing_id rlike '^[A-Z]+$'\", on_fail: drop, enabled: false }\n"
+        )
+    )
+    config, _spark, _pipelines = build(tmp_path, text)
+    assert not has_file_counts(config)
+
+
+def test_a_table_set_to_fail_blocks_a_file_on_every_rule_and_every_built_in_check(
     tmp_path: Path,
 ) -> None:
     config, spark, pipelines = build(tmp_path, spec(table_level="fail"))
     assert {"id_present", "id_format", "cast_thing_id", "schema_conformance"} <= set(
         pipelines.expectations
     )
-    assert pipelines.fail_expectations == []
+    assert pipelines.fail_expectations == ["no_file_blocked_by_fail_rule"]
 
 
-def test_a_row_that_broke_a_fail_rule_goes_to_quarantine_and_the_rest_of_its_file_loads(
+def test_a_file_that_is_blocked_keeps_its_good_rows_out_and_its_bad_rows_in_quarantine(
     tmp_path: Path,
 ) -> None:
     config, spark, _pipelines = build(tmp_path, spec(table_level=None, rule_level="fail"))
     rules = compile_rules(config)
     assert valid_where(rules, files=True) == "_dq_result = 'pass'"
     assert quarantine_where(rules, files=True) == "_dq_result IN ('fail', 'quarantine')"
-    assert getattr(spark.readStream, "joins", []) == []  # no join against a per-file table
+    assert spark.readStream.joins == [(["_src_file_path", "_batch_id"], "left_anti")]
 
 
 def test_a_database_table_has_no_files_so_fail_still_fails_the_run(tmp_path: Path) -> None:

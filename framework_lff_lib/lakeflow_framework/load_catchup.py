@@ -93,6 +93,22 @@ def _catch_up_job(spark: Any, catalog: str, meta: str, event_log: str, job: str,
     return written
 
 
+def _fail_rules(rules_json: Any) -> tuple[str, ...]:
+    """The names of the rules that block a file, from the registry's list of rules."""
+
+    try:
+        rules = json.loads(str(rules_json or "[]"))
+    except ValueError:
+        return ()
+    return tuple(
+        str(rule["name"])
+        for rule in rules
+        if isinstance(rule, dict)
+        and rule.get("action") == "fail"
+        and rule.get("enabled") is not False
+    )
+
+
 def _dataflows(spark: Any, meta: str, job: str) -> list[Dataflow]:
     found = _rows(spark.sql(_registered_dataflows_sql(meta, job, LAYER)))
     return [
@@ -103,6 +119,12 @@ def _dataflows(spark: Any, meta: str, job: str) -> list[Dataflow]:
             staged=f"{row['pipeline_id']}_staged",
             target=str(row.get("target_table") or ""),
             quarantine=str(row.get("quarantine_table") or ""),
+            # What the pipeline's own hook knows from the spec, so a replay judges a run with
+            # no file, or an empty one, the same way it does.
+            expect_file=str(row.get("expect_file") or "").lower() == "true",
+            fail_rules=_fail_rules(row.get("rules_json")),
+            path=str(row.get("source_path") or ""),
+            path_glob=str(row.get("path_glob") or ""),
         )
         for row in found
     ]
@@ -134,7 +156,7 @@ def _replay(
         )
     ]
     recorder = UpdateRecorder(
-        job, LAYER, _with_file_load(spark, _in_this_update(dataflows, events))
+        job, LAYER, _with_file_load(spark, _in_this_update(dataflows, events), events)
     )
     for event in events:
         rows = recorder.handle(event)
@@ -163,14 +185,40 @@ def _in_this_update(dataflows: list[Dataflow], events: list[dict[str, Any]]) -> 
     return mine or dataflows
 
 
-def _with_file_load(spark: Any, dataflows: list[Dataflow]) -> list[Dataflow]:
-    """Mark the tables whose per-file rows can be counted from bronze and quarantine.
+def _with_file_load(
+    spark: Any, dataflows: list[Dataflow], events: list[dict[str, Any]]
+) -> list[Dataflow]:
+    """Mark the tables whose per-file rows can be counted from bronze and quarantine, and wait for
+    a table's blocked-file check only when this update ran one.
 
-    The registry does not say which rules fail a load or whether a file is expected, so a replay
-    records files and their counts but not a FAILED file or a missing-file check.
+    A replay knows from the events: a table with no ``fail`` rule has no check, and an update that
+    failed before it ran has no flow for it. The check is what fails the update, so without it a
+    failed update would be read as complete. Which rules fail a load and whether a file is
+    expected come from the table's own spec, which the registry carries, so a replay names a
+    blocked file's rule and runs the same missing-file check as the pipeline's hook.
     """
 
-    return [replace(flow, file_load=_loads_files(spark, flow.target)) for flow in dataflows]
+    names = [(event.get("origin") or {}).get("flow_name") for event in events]
+    result = []
+    for flow in dataflows:
+        loads_files = _loads_files(spark, flow.target)
+        check = f"{flow.pipeline_id}_blocked_check"
+        files = f"{flow.pipeline_id}_files"
+        catalog = flow.target.split(".", 1)[0] if "." in flow.target else ""
+        ran_check = any(_same_table(name, check) for name in names)
+        ran_files = bool(catalog) and any(_same_table(name, files) for name in names)
+        result.append(
+            replace(
+                flow,
+                file_load=loads_files,
+                # only a table read from files has a file to expect
+                expect_file=flow.expect_file and loads_files,
+                blocked_check=check if ran_check else "",
+                # the exact per-file counts, when this update built them
+                files=f"{catalog}.framework_meta.{files}" if ran_files else "",
+            )
+        )
+    return result
 
 
 def _batch_of(spark: Any, row: dict[str, Any]) -> str | None:

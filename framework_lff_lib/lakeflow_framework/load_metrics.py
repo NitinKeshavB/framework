@@ -391,7 +391,11 @@ SELECT
   CAST(d.owner AS STRING) AS owner,
   CAST(d.config:{layer}::STRING AS STRING) AS target_table,
   CAST(d.config:quarantine::STRING AS STRING) AS quarantine_table,
-  CAST(p.full_name AS STRING) AS pipeline_id
+  CAST(p.full_name AS STRING) AS pipeline_id,
+  CAST(p.config_json:config.source_to_raw.source.path AS STRING) AS source_path,
+  CAST(p.config_json:config.source_to_raw.source.path_glob AS STRING) AS path_glob,
+  CAST(p.config_json:config.source_to_raw.source.expect_file AS STRING) AS expect_file,
+  CAST(p.config_json:rules AS STRING) AS rules_json
 FROM {meta}.asset_registry_current d
 JOIN {meta}.asset_registry_current p
   ON p.object_kind = 'pipeline' AND p.full_name = d.parent_full_name

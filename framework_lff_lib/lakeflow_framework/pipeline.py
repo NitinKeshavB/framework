@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -359,6 +359,12 @@ def _install_recorder(
                 file_load=is_file_load(config),
                 expect_file=is_file_load(config) and config.expect_file,
                 fail_rules=tuple(blocking_rules(compile_rules(config))),
+                blocked_check=blocked_check_name(config) if has_blocking(config) else "",
+                files=(
+                    f"{config.catalog}.{PIPELINE_SCHEMA}.{files_name(config)}"
+                    if has_file_counts(config)
+                    else ""
+                ),
                 path=config.path if is_file_load(config) else "",
                 path_glob=(config.path_glob or "") if is_file_load(config) else "",
                 source_kind=config.source_kind,
@@ -455,16 +461,43 @@ def assemble(config: PipelineConfig) -> Graph:
     staged_name = f"{config.pipeline_id}_staged"
     valid_name = f"{config.pipeline_id}_valid"
     passing = valid_where(rules, files=files)
+    blocking = has_blocking(config)
     datasets.append(Dataset(kind="staged", name=staged_name, relation=relation, detail=checked))
-    if config.uses_auto_cdc:
-        # Auto CDC needs a named source, so the passing rows get a view. An append table reads
-        # staged directly and has none.
+    if config.uses_auto_cdc or blocking:
+        # Auto CDC needs a named source, and a table with a ``fail`` rule has to leave the rows of
+        # a blocked file out. An append table with neither reads staged directly and has no view.
         datasets.append(
             Dataset(
                 kind="valid",
                 name=valid_name,
                 relation="temporary_view",
-                detail={"source": staged_name, "where": passing},
+                detail={
+                    "source": staged_name,
+                    "where": passing,
+                    "blocked_by": files_name(config) if blocking else None,
+                },
+            )
+        )
+    if has_file_counts(config):
+        # ``_files`` has one row per file of this run, and the event hook reads its exact per-file
+        # counts: a blocked file's good rows and a dropped row are in no other table. A table with
+        # a ``fail`` rule also uses it to keep a blocked file out of bronze (the valid view) and to
+        # fail the update (the private check). A table that only drops rows gets just this one.
+        datasets.append(
+            Dataset(
+                kind="files",
+                name=files_name(config),
+                relation="materialized_view",
+                detail={"source": staged_name, "blocking": blocking_rules(rules)},
+            )
+        )
+    if blocking:
+        datasets.append(
+            Dataset(
+                kind="blocked_check",
+                name=blocked_check_name(config),
+                relation="materialized_view",
+                detail={"source": files_name(config)},
             )
         )
     auto_cdc = None
@@ -497,7 +530,7 @@ def assemble(config: PipelineConfig) -> Graph:
                 kind="bronze",
                 name=bronze_name,
                 relation=relation,
-                detail={"source": staged_name, "where": passing},
+                detail={"source": valid_name if blocking else staged_name, "where": passing},
             )
         )
     if config.has_quarantine:
@@ -622,11 +655,14 @@ CHANGE_FEED_RETENTION = "interval 30 days"
 # Columns the pipeline stamps on every load. An SCD2 table must not open a version because of them.
 UNTRACKED_COLUMNS = (SRC_FILE_PATH, SRC_FILE_NAME, BATCH_ID, INGEST_TIMESTAMP)
 _BATCH_ID: str | None = None
-# The per-file status of a file. FAILED means a row of it broke a ``fail`` rule.
+_BATCH_STARTED: datetime | None = None
+# The per-file status of a file. FAILED means a row of it broke a ``fail`` rule and the file is blocked.
 FILE_STATUS = "file_status"
 FILE_FAILED = "FAILED"
 FILE_WARNING = "WARNING"
 FILE_PROCESSED = "PROCESSED"
+# A clock that runs a little behind the cluster's must not hide rows of this run.
+_CLOCK_SLACK = timedelta(minutes=5)
 
 
 def batch_id() -> str:
@@ -637,22 +673,69 @@ def batch_id() -> str:
     the same process, writes it to ``load_ledger.batch_id`` beside the real update id.
     """
 
-    global _BATCH_ID
+    global _BATCH_ID, _BATCH_STARTED
     if _BATCH_ID is None:
         _BATCH_ID = str(uuid.uuid4())
+        _BATCH_STARTED = datetime.now(UTC)
     return _BATCH_ID
 
 
-def files_sql(staged: str, blocking: list[str], *, quarantine: bool = True) -> str:
-    """One row per file of a backfill micro-batch: counts and status, from the rows in ``staged``.
+def files_name(config: PipelineConfig) -> str:
+    """The private per-file dataset of a table that has a ``fail`` rule."""
 
-    Only a backfill uses this: it holds the staged rows in memory and has no table to count from.
-    A regular run counts its files from bronze and quarantine (``pipeline_metrics.read_files``).
-    A file with a row that broke a ``fail`` rule is ``FAILED``; its good rows still load and the
-    bad ones go to quarantine. With ``quarantine=False`` (a table without one) those bad rows are
-    kept nowhere, so they count as dropped, not quarantined.
+    return f"{config.pipeline_id}_files"
+
+
+def blocked_check_name(config: PipelineConfig) -> str:
+    """The private dataset whose failure fails the update when a file was blocked."""
+
+    return f"{config.pipeline_id}_blocked_check"
+
+
+def has_blocking(config: PipelineConfig) -> bool:
+    """True when a file of this table can be blocked: it is read from files and has a ``fail`` rule."""
+
+    return is_file_load(config) and bool(blocking_rules(compile_rules(config)))
+
+
+def has_dropping(config: PipelineConfig) -> bool:
+    """True when a rule of this file table drops a row: kept in no table, so no file count can see it."""
+
+    return is_file_load(config) and any(rule.action == "drop" for rule in config.active_rules)
+
+
+def has_file_counts(config: PipelineConfig) -> bool:
+    """True when the table needs the per-file dataset, for exact counts in ``ledger_detail``.
+
+    A blocked file's good rows and a row a ``drop`` rule removed are read and then kept nowhere, so
+    bronze and quarantine cannot give a file's ``rows_read`` or ``rows_dropped``. Only this
+    dataset can. A table that has neither gets no extra dataset.
     """
 
+    return has_blocking(config) or has_dropping(config)
+
+
+def files_sql(
+    staged: str, blocking: list[str], *, this_run: bool = True, quarantine: bool = True
+) -> str:
+    """One row per file: counts and status, from the staged rows.
+
+    A file with a row that broke a ``fail`` rule is ``FAILED``: none of its rows load (``rows_loaded``
+    is 0, its good rows are ``rows_blocked``) and its bad rows are in quarantine. The run is found by
+    ``_batch_id`` and, so Delta can skip older files, by the load time the staged table is clustered
+    on. A backfill passes ``this_run=False`` for a view that holds only the rows it is counting.
+    With ``quarantine=False`` (a table without one) the bad rows of a blocked file are kept
+    nowhere, so they count as dropped, not quarantined.
+    """
+
+    run = batch_id()
+    since = (_BATCH_STARTED or datetime.now(UTC)) - _CLOCK_SLACK
+    scope = (
+        f"WHERE {BATCH_ID} = {sql_string(run)} "
+        f"AND {INGEST_TIMESTAMP} >= TIMESTAMP '{since.strftime('%Y-%m-%d %H:%M:%S')}+00:00' "
+        if this_run
+        else ""
+    )
     names = ", ".join(sql_string(name) for name in blocking)
     blockers = (
         f"array_join(array_intersect(array_distinct(flatten(collect_list({DQ_COLUMN}))), "
@@ -665,16 +748,19 @@ def files_sql(staged: str, blocking: list[str], *, quarantine: bool = True) -> s
     return (
         f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, {BATCH_ID}, "
         "count(*) AS rows_read, "
-        f"count_if({DQ_RESULT} = 'pass') AS rows_loaded, "
+        f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN 0 "
+        f"ELSE count_if({DQ_RESULT} = 'pass') END AS rows_loaded, "
         f"count_if({DQ_RESULT} IN {kept_bad}) AS rows_quarantined, "
         f"count_if({DQ_RESULT} IN {lost_bad}) AS rows_dropped, "
+        f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 "
+        f"THEN count_if({DQ_RESULT} = 'pass') ELSE 0 END AS rows_blocked, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN '{FILE_FAILED}' "
         f"WHEN count_if({DQ_RESULT} <> 'pass') > 0 THEN '{FILE_WARNING}' "
         f"ELSE '{FILE_PROCESSED}' END AS {FILE_STATUS}, "
         f"{blockers} AS blocking_rules, "
         f"array_join(array_sort(array_distinct(flatten(collect_list({DQ_COLUMN})))), ', ') "
         "AS failed_rules "
-        f"FROM {staged} "
+        f"FROM {staged} {scope}"
         f"GROUP BY {SRC_FILE_PATH}, {SRC_FILE_NAME}, {BATCH_ID}"
     )
 
@@ -702,6 +788,14 @@ def _table_options(config: PipelineConfig, layer: str) -> dict[str, Any]:
         options["private"] = True
         if is_file_load(config):
             options["cluster_by"] = [INGEST_TIMESTAMP]
+        return options
+    if layer == "files":
+        # Published, and only for a table with a ``fail`` rule. The event hook reads it for
+        # exact per-file counts: a blocked file's good rows are read and held back, so they are in
+        # neither bronze nor quarantine, and only this dataset knows how many the file held.
+        options["comment"] = (
+            f"One row per file of the latest run of {config.pipeline_id}: counts and status."
+        )
         return options
     if layer in {"bronze", "quarantine"}:
         options["table_properties"].update(
@@ -818,16 +912,57 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
     internal = f"{DQ_COLUMN}, {DQ_RESULT}" if is_file_load(config) else DQ_COLUMN
 
-    def _passing(where: str) -> Any:
-        """The rows that pass, without the two rule columns, with the sequence column typed."""
+    def _passing(where: str, blocked_by: str | None = None) -> Any:
+        """The rows that pass, without the two rule columns, with the sequence column typed.
+
+        With ``blocked_by`` (a table that has a ``fail`` rule) the rows of a blocked file are left
+        out too: a file is read once, so a blocked file is never retried, and none of its rows may
+        reach bronze. Its bad rows are in quarantine.
+        """
 
         frame = _filtered(_reader().table(staged.name), where)
+        if blocked_by:
+            blocked = (
+                spark.read.table(blocked_by)
+                .filter(f"{FILE_STATUS} = '{FILE_FAILED}'")
+                .select(SRC_FILE_PATH, BATCH_ID)
+            )
+            frame = frame.join(blocked, [SRC_FILE_PATH, BATCH_ID], "left_anti")
         if hasattr(frame, "selectExpr"):
             frame = frame.selectExpr(f"* EXCEPT ({internal})")
         return _typed_sequence(frame, config)
 
     if valid is not None:
-        pipelines.temporary_view(name=valid.name)(lambda: _passing(valid.detail["where"]))
+        pipelines.temporary_view(name=valid.name)(
+            lambda: _passing(valid.detail["where"], valid.detail.get("blocked_by"))
+        )
+
+    files_dataset = by_kind.get("files")
+    if files_dataset is not None:
+
+        @pipelines.materialized_view(name=files_dataset.name, **_table_options(config, "files"))
+        def _files() -> Any:
+            return spark.sql(
+                files_sql(
+                    staged.name,
+                    files_dataset.detail["blocking"],
+                    quarantine=config.has_quarantine,
+                )
+            )
+
+        check = by_kind.get("blocked_check")
+        if check is not None:
+            # Runs after bronze and quarantine have finished, so the blocked files are already
+            # read when it fails the update. A failing load flow would leave Auto Loader's
+            # checkpoint behind and the next run would read the file again. Private.
+            @pipelines.expect_all_or_fail({"no_file_blocked_by_fail_rule": "1 = 0"})
+            @pipelines.materialized_view(name=check.name, private=True)
+            def _blocked_check() -> Any:
+                return spark.sql(
+                    f"SELECT {SRC_FILE_NAME}, rows_read, rows_quarantined, rows_blocked, "
+                    f"blocking_rules FROM {files_dataset.name} "
+                    f"WHERE {FILE_STATUS} = '{FILE_FAILED}'"
+                )
 
     if bronze.relation == "auto_cdc":
         pipelines.create_streaming_table(name=bronze.name, **_table_options(config, "bronze"))
@@ -847,6 +982,9 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
         @persisted(name=bronze.name, **_table_options(config, "bronze"))
         def _bronze() -> Any:
+            # Through the valid view when a ``fail`` rule can block a file, else straight from staged.
+            if valid is not None:
+                return _reader().table(valid.name)
             return _passing(bronze.detail["where"])
 
     if quarantine is not None:

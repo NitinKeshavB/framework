@@ -207,3 +207,23 @@ def test_record_loads_returns_zero_when_no_registered_dataflows() -> None:
     spark = _recording_spark(statements, count=0)
     assert record_loads(spark, "aal_dev_fdh", "abs_daily", layer="bronze") == 0
     assert not any(statement.upper().startswith("INSERT") for statement in statements)
+
+
+def test_registered_dataflows_sql_carries_what_the_file_check_needs() -> None:
+    from lakeflow_framework.load_metrics import _registered_dataflows_sql
+
+    sql = _registered_dataflows_sql("c.framework_meta", "abs_daily", "bronze")
+    for needle in ("source_path", "path_glob", "expect_file", "rules_json"):
+        assert needle in sql
+
+
+def test_catchup_dataflows_get_expect_file_and_fail_rules_from_the_registry() -> None:
+    from lakeflow_framework import load_catchup
+
+    rules = (
+        '[{"name": "a", "action": "fail"}, {"name": "b", "action": "fail", "enabled": false}, '
+        '{"name": "c", "action": "drop"}]'
+    )
+    assert load_catchup._fail_rules(rules) == ("a",)
+    assert load_catchup._fail_rules(None) == ()
+    assert load_catchup._fail_rules("not json") == ()

@@ -70,6 +70,7 @@ raw_to_bronze:
     - { name: rideable_type_known, expression: "rideable_type IN ('classic_bike', 'electric_bike', 'docked_bike')" }
     - { name: started_at_present, expression: "started_at IS NOT NULL AND length(trim(started_at)) > 0" }
     - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
+    - { name: member_casual_known, expression: "member_casual IN ('member', 'casual')" }
   # What happens to a row that fails a rule, for every rule below and the framework's own checks.
   # Set on_fail here OR on each rule (an example sits above the rules), never both.
   # Optional: leave it out to get the default (quarantine). on_fail needs rules: on its own,
@@ -82,14 +83,14 @@ raw_to_bronze:
   #               its bad rows go to quarantine. The run and job FAIL naming the file; other files
   #               load. The file is marked read, so it is not picked up again: fix it and run
   #               framework_backfill (./run.sh backfill) to load it.
-  on_fail: quarantine
+  on_fail: fail
     # - { name: started_at_is_timestamp, expression: "try_cast(started_at AS timestamp) IS NOT NULL" }
     # - { name: ended_at_is_timestamp, expression: "try_cast(ended_at AS timestamp) IS NOT NULL" }
     # - { name: ended_not_before_started, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
     # - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
     # - { name: start_station_name_length, expression: "length(start_station_name) <= 200" }
-    # - { name: start_station_id_present, expression: "start_station_id IS NOT NULL AND length(trim(start_station_id)) > 0" }
     # - { name: start_station_id_length, expression: "length(start_station_id) <= 50" }
+    # - { name: start_station_id_present, expression: "start_station_id IS NOT NULL AND length(trim(start_station_id)) > 0" }
     # - { name: end_station_name_not_blank, expression: "end_station_name IS NULL OR length(trim(end_station_name)) > 0" }
     # - { name: end_station_name_length, expression: "end_station_name IS NULL OR length(end_station_name) <= 200" }
     # - { name: end_station_id_not_blank, expression: "end_station_id IS NULL OR length(trim(end_station_id)) > 0" }

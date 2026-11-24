@@ -114,7 +114,8 @@ flowchart LR
   staged -->|pass| bronze["bronze"]
   staged -->|quarantine| qrntn["_qrntn + failed_rules"]
   staged -->|drop| dropped["dropped"]
-  staged -->|fail| qrntn
+  staged -->|"fail: its whole file is blocked"| qrntn
+  staged -.->|"blocked file moved to _failed/"| failed["volume/_failed"]
 ```
 
 `raw_to_bronze.rules` holds SQL conditions every good row must meet. By default, a row that fails any rule goes to `<bronze table>_qrntn` with the names of the rules it failed in `failed_rules`; the other rows load, and the run still shows `COMPLETED` with `rows_quarantined` set. A rule must be true for a good row and a NULL result fails it, so a column that may be empty says `col IS NULL OR ...`.

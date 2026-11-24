@@ -82,6 +82,11 @@ FORMATS = (
     "excel",
     "yaml",
 )
+# Where a file blocked by a fail rule is parked, at the root of its volume. Reserved: no table reads it.
+FAILED_FOLDER = "_failed"
+# Where a file a backfill loaded goes when the pipeline has not read it yet, so the next regular run
+# does not read it again. Also reserved: no table reads it.
+BACKFILLED_FOLDER = "_backfilled"
 INFER_SCHEMA_MODES = ("typed", "strings")
 # The text formats, where Auto Loader chooses the column types. Parquet and Avro carry their own.
 INFER_SCHEMA_FORMATS = frozenset({"csv", "delimited", "json"})
@@ -1084,6 +1089,11 @@ def _parse_file_source(
     elif load_method != "volume_files" and not _storage_path(path):
         errors.append(f"{label}: path must start with abfss:// or s3://, or be a /Volumes path")
         ok = False
+    if path and VOLUME_PATH.match(path):
+        problem = _failed_folder_problem(path, load_method)
+        if problem:
+            errors.append(f"{label}: {problem}")
+            ok = False
 
     fixed_columns = _fixed_columns(source.get("fixed_columns"), label, errors)
     if file_format == "fixed_width" and not fixed_columns:
@@ -1172,6 +1182,32 @@ def _parse_file_source(
         infer_schema=str(infer_schema) if infer_schema else None,
         fixed_columns=fixed_columns,
     )
+
+
+def _failed_folder_problem(path: str, load_method: str) -> str | None:
+    """Why a /Volumes path cannot be read, given the ``_failed`` folder at the root of the volume.
+
+    A file a ``fail`` rule blocked is moved to ``<volume>/_failed/``. Auto Loader skips a folder
+    that starts with an underscore. COPY INTO and CTAS are not relied on to, so they must read a
+    folder below the volume root, where ``_failed`` cannot be reached.
+    """
+
+    parts = [part for part in path.split("/") if part]
+    below = parts[4:]  # Volumes / catalog / schema / volume / ...
+    if FAILED_FOLDER in below:
+        return f"{FAILED_FOLDER} is reserved for files a fail rule blocked; read another folder"
+    if BACKFILLED_FOLDER in below:
+        return (
+            f"{BACKFILLED_FOLDER} is reserved for files a backfill loaded before the pipeline read "
+            "them; read another folder"
+        )
+    if load_method in {"copy_into", "ctas", "autoloader"} and not below:
+        return (
+            f"{load_method} must read a folder below the volume root, because files a fail rule "
+            f"blocked are parked in <volume>/{FAILED_FOLDER}/ and files a backfill loaded are set "
+            f"aside in <volume>/{BACKFILLED_FOLDER}/, and neither must ever be read"
+        )
+    return None
 
 
 def _table_document(schema: str, table: str, tags: TableTags) -> dict[str, Any]:

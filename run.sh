@@ -154,10 +154,15 @@ function check:rules {
 
 # reload files of one table, or refresh it, through the table's own rules (the framework_backfill
 # job; it needs framework_bundle deployed). Every option is KEY=VALUE after the target:
-#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=files files=a.csv,b.csv
-#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=dates date_from=2026-11-01 date_to=2026-11-03
-#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=failed
-#   ./run.sh backfill <target> <databricks-profile> table=abs_gl mode=full_refresh confirm=true
+#   ./run.sh backfill <target> <databricks-profile> table=aal_dev_fdh.abs_bronze.gl_abs mode=files \
+#       files=/Volumes/aal_dev_fdh/abs_raw/gl_source_extract/a.csv,/Volumes/aal_dev_fdh/abs_raw/gl_source_extract/b.csv
+#   ./run.sh backfill <target> <databricks-profile> table=aal_dev_fdh.abs_bronze.gl_abs mode=dates date_from=2026-11-01 date_to=2026-11-03
+#   ./run.sh backfill <target> <databricks-profile> table=aal_dev_fdh.abs_bronze.gl_abs mode=failed
+#   ./run.sh backfill <target> <databricks-profile> table=aal_dev_fdh.abs_bronze.gl_abs mode=full_refresh confirm=true
+# table is the bronze table's full name. Its pipeline id (abs_gl) works too. files are full
+# volume paths; a bare file name also works and matches that name in any folder of the table.
+# on_fail=quarantine|drop|warn|fail judges the reloaded files by that action for this run only,
+# instead of the table's own (not for full_refresh, which runs the table's own pipeline).
 # It lists the files and changes nothing unless dry_run=false is given. With no files or dates it
 # reloads every file, which needs confirm=true.
 function backfill {

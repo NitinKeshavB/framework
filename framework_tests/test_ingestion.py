@@ -117,6 +117,33 @@ def test_only_a_job_with_a_table_that_declares_no_columns_gets_the_infer_task(bu
     assert [env["environment_key"] for env in job["environments"]] == ["framework_env"]
 
 
+def test_a_job_with_a_fail_rule_gets_a_task_that_parks_blocked_files_even_after_a_failure(
+    bundle: Path,
+) -> None:
+    # a table whose rule fails the load when a row breaks it
+    _add_table(
+        bundle,
+        "audit",
+        "collections",
+        **{"      expression: amount >= 0": "      expression: amount >= 0\n      on_fail: fail"},
+    )
+    generate(bundle)
+    job = _job(bundle)
+    tasks = {task["task_key"]: task for task in job["tasks"]}
+    assert list(tasks) == ["refresh_pipeline", "park_failed_files"]
+    park = tasks["park_failed_files"]
+    # a blocked file fails the update, so the task has to run when the refresh did not succeed
+    assert park["run_if"] == "ALL_DONE"
+    assert park["depends_on"] == [{"task_key": "refresh_pipeline"}]
+    assert park["spark_python_task"]["parameters"][2:] == ["billing_audit"]
+    assert [env["environment_key"] for env in job["environments"]] == ["framework_env"]
+
+
+def test_a_job_with_no_fail_rule_has_no_parking_task(bundle: Path) -> None:
+    generate(bundle)
+    assert "park_failed_files" not in {task["task_key"] for task in _job(bundle)["tasks"]}
+
+
 def _job(bundle: Path, name: str = "billing_daily") -> dict:
     document = yaml.safe_load(
         (bundle / BUILD_DIR / "resources" / f"{name}.job.yml").read_text("utf-8")

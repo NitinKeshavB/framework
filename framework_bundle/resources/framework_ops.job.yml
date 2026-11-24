@@ -101,13 +101,18 @@ resources:
     framework_backfill:
       name: framework_backfill
       performance_target: PERFORMANCE_OPTIMIZED
+      # The defaults of table and files are patterns, so a run from the UI shows the format and the
+      # user edits the parts in <angle brackets>. Run unedited, the job refuses with a message: a
+      # table still holding its pattern is refused, as are files in mode files. In another mode the
+      # files pattern is ignored. To add more files, put a comma between full paths. To reload every
+      # file of the table, clear files and set confirm to true.
       parameters:
-        - name: table
-          default: ""
+        - name: table # the bronze table's full name (its pipeline id works too)
+          default: "${var.catalog}.<bronze_schema>.<table>"
         - name: mode # files, dates, failed or full_refresh
           default: files
-        - name: files # comma-separated file names (mode files)
-          default: ""
+        - name: files # full volume paths, comma-separated (mode files)
+          default: "/Volumes/${var.catalog}/<raw_schema>/<volume>/<folder>/<file>.csv"
         - name: date_from # arrival time, YYYY-MM-DD or YYYY-MM-DD HH:MM (mode dates)
           default: ""
         - name: date_to
@@ -116,6 +121,8 @@ resources:
           default: "true"
         - name: confirm # true is needed for full_refresh and for no selector at all
           default: "false"
+        - name: on_fail # quarantine, drop, warn or fail for this run only. Empty keeps the table's own
+          default: ""
       tasks:
         - task_key: backfill
           environment_key: framework_env
@@ -130,6 +137,7 @@ resources:
               - "{{job.parameters.date_to}}"
               - "{{job.parameters.dry_run}}"
               - "{{job.parameters.confirm}}"
+              - "{{job.parameters.on_fail}}"
       environments:
         - environment_key: framework_env
           spec:

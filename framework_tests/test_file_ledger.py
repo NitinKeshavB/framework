@@ -26,6 +26,7 @@ from test_pipeline_metrics import (
     progress,
     recorder,
     run,
+    update_state,
 )
 
 AT = datetime(2026, 11, 19, tzinfo=UTC)
@@ -54,8 +55,9 @@ def hundred_files_three_bad() -> list[dict]:
         _file(
             f"bad_{n}.csv",
             read=10,
-            loaded_rows=8,
+            loaded_rows=0,
             quarantined=2,
+            dropped=8,
             status="FAILED",
             failed_rules="amount_positive",
             blocking_rules="amount_positive",
@@ -74,9 +76,9 @@ def row_for(files: list[dict], *, read: int, written: int, quarantine: int) -> d
 def test_three_bad_files_in_a_hundred_give_one_failed_load_that_names_them() -> None:
     row = row_for(hundred_files_three_bad(), read=1000, written=970, quarantine=6)
     assert (row["files_read"], row["files_failed"]) == (100, 3)
-    assert row["rows_dropped"] == 24  # read - inserted - quarantined, from the table's own flows
+    assert row["rows_dropped"] == 24  # the good rows of the three blocked files
     assert row["target_status"] == "FAILED"
-    assert "3 of 100 file(s) had rows that broke fail rules" in row["failure_reason"]
+    assert "3 of 100 file(s) blocked by fail rules" in row["failure_reason"]
     assert "bad_0.csv (amount_positive)" in row["failure_reason"]
 
 
@@ -88,9 +90,10 @@ def test_every_file_is_written_with_its_own_counts_and_the_batch() -> None:
     assert first["src_file_name"] == "ok_000.csv"
     assert (first["rows_read"], first["rows_inserted"], first["rows_dropped"]) == (10, 10, 0)
     bad = dict(zip(DETAIL_COLUMNS, records[-1], strict=True))
-    # The good rows of a file with a bad row still load; only the bad rows are kept out.
-    assert bad["status"] == "FAILED" and bad["rows_inserted"] == 8 and bad["rows_quarantined"] == 2
-    assert bad["error_message"] == "rows broke fail rule(s): amount_positive"
+    # A blocked file loads nothing: its bad rows are in quarantine and its good rows are dropped.
+    assert bad["status"] == "FAILED" and bad["rows_inserted"] == 0 and bad["rows_dropped"] == 8
+    assert bad["rows_quarantined"] == 2
+    assert bad["error_message"] == "blocked by fail rule(s): amount_positive"
     assert first["error_message"] is None
     assert len(DETAIL_SCHEMA.split(", ")) == len(DETAIL_COLUMNS)
 
@@ -140,21 +143,237 @@ def _file_count_row() -> dict:
     }
 
 
-def test_a_file_whose_quarantined_rows_broke_a_fail_rule_is_failed_and_its_good_rows_count() -> (
+CHECK = "aal.framework_meta.abs_accounting_blocked_check"
+FILES = "aal.framework_meta.abs_accounting_files"
+
+
+def blocked_run(check_status: str = "FAILED", update: str = "FAILED") -> list[dict]:
+    """A good file of 5 rows and a blocked file of 80,000 rows, 3 of them bad.
+
+    The staged flow reads 80,005. Bronze gets the 5 good rows, quarantine the 3 bad ones, and the
+    other 79,997 rows of the blocked file are read and kept nowhere.
+    """
+
+    return [
+        update_state("RUNNING", 0),
+        progress(STAGED, "RUNNING", 1, metrics={"num_output_rows": 80005}),
+        progress(STAGED, "COMPLETED", 2),
+        progress(BRONZE, "RUNNING", 3, metrics={"num_output_rows": 5}),
+        progress(BRONZE, "COMPLETED", 4),
+        progress(QUARANTINE, "RUNNING", 3, metrics={"num_output_rows": 3}),
+        progress(QUARANTINE, "COMPLETED", 4),
+        progress(FILES, "COMPLETED", 4),
+        progress(CHECK, check_status, 5),
+        update_state(update, 9),
+    ]
+
+
+def blocked_dataflow():
+    return dataflow(
+        file_load=True,
+        fail_rules=("amt",),
+        blocked_check="abs_accounting_blocked_check",
+        files=FILES,
+    )
+
+
+def files_dataset_rows() -> list[dict]:
+    """What the table's per-file dataset holds for that run (see ``files_sql``)."""
+
+    common = {"failed_rules": "", "blocking_rules": "", "rows_dropped": 0, "rows_blocked": 0}
+    return [
+        {
+            **common,
+            "_src_file_path": "/Volumes/c/s/v/good.csv",
+            "_src_file_name": "good.csv",
+            "file_status": "PROCESSED",
+            "rows_read": 5,
+            "rows_loaded": 5,
+            "rows_quarantined": 0,
+        },
+        {
+            **common,
+            "_src_file_path": "/Volumes/c/s/v/bad.csv",
+            "_src_file_name": "bad.csv",
+            "file_status": "FAILED",
+            "rows_read": 80000,
+            "rows_loaded": 0,
+            "rows_quarantined": 3,
+            "rows_blocked": 79997,
+            "failed_rules": "amt",
+            "blocking_rules": "amt",
+        },
+    ]
+
+
+def test_a_blocked_file_reads_everything_it_held_and_shows_what_was_dropped() -> None:
+    spark = _Spark()
+    spark.files = files_dataset_rows()
+    (row,) = run(recorder(blocked_dataflow()), blocked_run())
+    row["batch_id"] = "batch-1"
+    write_rows(spark, "aal_dev_fdh", [row])
+    good, bad = row["_files"]
+    assert (good["status"], good["rows_read"], good["rows_inserted"]) == ("PROCESSED", 5, 5)
+    # 80,000 read: 3 quarantined, the other 79,997 dropped, none loaded, and the file is FAILED
+    assert (bad["status"], bad["rows_read"], bad["rows_inserted"]) == ("FAILED", 80000, 0)
+    assert (bad["rows_quarantined"], bad["rows_dropped"]) == (3, 79997)
+    assert bad["rows_read"] == bad["rows_inserted"] + bad["rows_quarantined"] + bad["rows_dropped"]
+    assert bad["error_message"] == "blocked by fail rule(s): amt"
+    # the load row agrees with its files
+    assert (row["rows_read"], row["rows_inserted"], row["rows_quarantined"]) == (80005, 5, 3)
+    assert row["rows_dropped"] == 79997
+    assert row["target_status"] == "FAILED" and (row["files_read"], row["files_failed"]) == (2, 1)
+    assert (
+        "1 of 2 file(s) blocked by fail rules, none of their rows loaded" in row["failure_reason"]
+    )
+    detail = spark.saved["aal_dev_fdh.framework_meta.ledger_detail"].data
+    by_name = {record[DETAIL_COLUMNS.index("src_file_name")]: record for record in detail}
+    assert by_name["bad.csv"][DETAIL_COLUMNS.index("rows_read")] == 80000
+    assert by_name["bad.csv"][DETAIL_COLUMNS.index("status")] == "FAILED"
+    assert by_name["good.csv"][DETAIL_COLUMNS.index("status")] == "PROCESSED"
+    (query,) = [q for q in spark.queries if "abs_accounting_files" in q]
+    assert "_batch_id = 'batch-1'" in query
+
+
+def test_the_per_file_counts_fall_back_to_bronze_and_quarantine_if_the_dataset_cannot_be_read() -> (
     None
 ):
+    class NoFiles(_Spark):
+        def sql(self, statement: str):
+            if "abs_accounting_files" in statement:
+                raise RuntimeError("table not found")
+            return super().sql(statement)
+
+    spark = NoFiles()
+    spark.files = [
+        {
+            **_file_count_row(),
+            "_src_file_path": "/Volumes/c/s/v/bad.csv",
+            "_src_file_name": "bad.csv",
+            "rows_loaded": 0,
+            "rows_quarantined": 3,
+            "failed_rules": "amt",
+            "blocking_rules": "amt",
+        }
+    ]
+    (row,) = run(recorder(blocked_dataflow()), blocked_run())
+    row["batch_id"] = "batch-1"
+    write_rows(spark, "aal_dev_fdh", [row])  # the ledger is still written
+    (bad,) = row["_files"]
+    assert (bad["status"], bad["rows_quarantined"]) == ("FAILED", 3)
+    assert row["target_status"] == "FAILED" and row["rows_dropped"] == 79997
+
+
+class _Earlier(_Spark):
+    """A ledger that already holds a load of one of the files, as after a full refresh."""
+
+    def __init__(self, earlier: list[str]) -> None:
+        super().__init__()
+        self.earlier = earlier
+
+    def sql(self, statement: str):
+        if "SELECT DISTINCT src_file_path" in statement:
+            self.queries.append(statement)
+            found = [{"src_file_path": path} for path in self.earlier]
+            return type("R", (), {"collect": lambda _s: found})()
+        return super().sql(statement)
+
+
+def test_a_run_that_reads_a_file_again_is_recorded_as_a_backfill() -> None:
+    spark = _Earlier(["/Volumes/c/s/v/a.csv"])
+    spark.files = [_file_count_row()]
+    (row,) = run(recorder(dataflow(file_load=True)), loaded(5, 5, 0))
+    row["batch_id"] = "batch-1"
+    write_rows(spark, "aal_dev_fdh", [row])
+    assert row["load_kind"] == "backfill"
+    ledger = dict(
+        zip(
+            LEDGER_COLUMNS,
+            spark.saved["aal_dev_fdh.framework_meta.load_ledger"].data[0],
+            strict=True,
+        )
+    )
+    assert ledger["load_kind"] == "backfill"
+    (detail,) = spark.saved["aal_dev_fdh.framework_meta.ledger_detail"].data
+    assert detail[DETAIL_COLUMNS.index("load_kind")] == "backfill"
+    (query,) = [q for q in spark.queries if "SELECT DISTINCT src_file_path" in q]
+    assert "update_id <> " in query  # an earlier update, not this one
+
+
+def test_a_run_of_new_files_stays_regular() -> None:
+    spark = _Earlier([])
+    spark.files = [_file_count_row()]
+    (row,) = run(recorder(dataflow(file_load=True)), loaded(5, 5, 0))
+    row["batch_id"] = "batch-1"
+    write_rows(spark, "aal_dev_fdh", [row])
+    assert row["load_kind"] == "regular"
+    (detail,) = spark.saved["aal_dev_fdh.framework_meta.ledger_detail"].data
+    assert detail[DETAIL_COLUMNS.index("load_kind")] == "regular"
+
+
+def test_a_catch_up_replay_keeps_its_own_kind_even_when_the_files_were_seen() -> None:
+    spark = _Earlier(["/Volumes/c/s/v/a.csv"])
+    spark.files = [_file_count_row()]
+    (row,) = run(recorder(dataflow(file_load=True)), loaded(5, 5, 0))
+    row["batch_id"] = "batch-1"
+    write_rows(spark, "aal_dev_fdh", [row], replay=True)
+    assert row["load_kind"] == "catchup"
+
+
+def test_a_file_that_lost_rows_to_a_drop_rule_shows_them_in_ledger_detail() -> None:
+    """The load row said 3 read, 1 inserted, 2 dropped, and the file row said 1 read, 0 dropped."""
+
     spark = _Spark()
     spark.files = [
-        {**_file_count_row(), "rows_loaded": 8, "rows_quarantined": 2, "blocking_rules": "amt"}
+        {
+            "_src_file_path": "/Volumes/c/s/v/drops.csv",
+            "_src_file_name": "drops.csv",
+            "file_status": "WARNING",
+            "rows_read": 3,
+            "rows_loaded": 1,
+            "rows_quarantined": 0,
+            "rows_dropped": 2,
+            "rows_blocked": 0,
+            "failed_rules": "amt",
+            "blocking_rules": "",
+        }
     ]
-    (row,) = run(recorder(dataflow(file_load=True, fail_rules=("amt",))), loaded(10, 8, 2))
+    flow = dataflow(file_load=True, files=FILES)  # a table that drops rows: no check, no blocking
+    events = [
+        update_state("RUNNING", 0),
+        progress(STAGED, "RUNNING", 1, metrics={"num_output_rows": 3}),
+        progress(STAGED, "COMPLETED", 2),
+        progress(BRONZE, "RUNNING", 3, metrics={"num_output_rows": 1}),
+        progress(BRONZE, "COMPLETED", 4),
+        progress(QUARANTINE, "RUNNING", 3, metrics={"num_output_rows": 0}),
+        progress(QUARANTINE, "COMPLETED", 4),
+        progress(FILES, "COMPLETED", 4),
+        update_state("COMPLETED", 9),
+    ]
+    (row,) = run(recorder(flow), events)
     row["batch_id"] = "batch-1"
     write_rows(spark, "aal_dev_fdh", [row])
     (item,) = row["_files"]
-    assert item["status"] == "FAILED" and item["rows_read"] == 10 and item["rows_inserted"] == 8
-    assert row["target_status"] == "FAILED" and row["files_failed"] == 1
-    (query,) = [q for q in spark.queries if "_batch_id = 'batch-1'" in q]
-    assert "array('amt')" in query
+    assert (item["rows_read"], item["rows_inserted"], item["rows_dropped"]) == (3, 1, 2)
+    assert item["status"] == "WARNING" and row["target_status"] == "COMPLETED"
+    # the file agrees with the load
+    assert (row["rows_read"], row["rows_inserted"], row["rows_dropped"]) == (3, 1, 2)
+    (detail,) = spark.saved["aal_dev_fdh.framework_meta.ledger_detail"].data
+    assert detail[DETAIL_COLUMNS.index("rows_dropped")] == 2
+    assert detail[DETAIL_COLUMNS.index("rows_read")] == 3
+
+
+def test_the_recorder_waits_for_the_blocked_file_check_before_it_decides() -> None:
+    rec = recorder(blocked_dataflow())
+    events = blocked_run()
+    # every load flow and the per-file dataset are done, but the check that fails the update is not
+    assert all(rec.handle(event) is None for event in events[:8])
+    rows = rec.handle(events[8])  # the check fails, so the update did
+    assert rows is not None and "FAILED" in rows[0]["failure_reason"]
+    # the flows that finished still count: nothing is read as zero because the update failed
+    counts = (rows[0]["rows_read"], rows[0]["rows_inserted"], rows[0]["rows_quarantined"])
+    assert counts == (80005, 5, 3)
+    assert rows[0]["rows_dropped"] == 79997
 
 
 def test_a_fail_rule_hit_in_the_event_log_fails_a_table_whose_bad_rows_are_kept_nowhere() -> None:

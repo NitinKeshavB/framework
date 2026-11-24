@@ -195,7 +195,7 @@ def test_an_empty_file_beside_a_blocked_one_keeps_both_reasons() -> None:
     ]
     row = make_row(blocked)
     apply_arrivals(row, [_arrival("b.csv", has_rows=True), _arrival("e.csv", has_rows=False)])
-    assert "broke fail rules" in row["failure_reason"] and "e.csv" in row["failure_reason"]
+    assert "blocked by fail rules" in row["failure_reason"] and "e.csv" in row["failure_reason"]
     assert (row["files_read"], row["files_failed"]) == (2, 2)
 
 

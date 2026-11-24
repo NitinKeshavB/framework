@@ -1,7 +1,8 @@
 """Reload files of one table, or refresh it, through the table's own rules (framework_backfill job).
 
-Arguments: catalog table mode files date_from date_to dry_run confirm. A blocked file does not fail
-the run: it is recorded FAILED in the ledger and reported as a warning here.
+Arguments: catalog table mode files date_from date_to dry_run confirm on_fail. A blocked file does not
+fail the run: it is recorded FAILED in the ledger and reported as a warning here. on_fail, when given,
+judges the reloaded files by that action instead of the table's own, for this run only.
 """
 
 import sys
@@ -17,9 +18,9 @@ def _flag(value: str) -> bool:
 
 
 def main() -> None:
-    catalog, table, mode, files, date_from, date_to, dry_run, confirm = (sys.argv[1:] + [""] * 8)[
-        :8
-    ]
+    catalog, table, mode, files, date_from, date_to, dry_run, confirm, on_fail = (
+        sys.argv[1:] + [""] * 9
+    )[:9]
     log = job_logging(f"backfill.{table}")
     spark = SparkSession.builder.getOrCreate()
     try:
@@ -32,6 +33,7 @@ def main() -> None:
                 selection,
                 dry_run=_flag(dry_run),
                 confirm=_flag(confirm),
+                on_fail=on_fail,
             )
     except BackfillError as exc:
         raise SystemExit(f"backfill refused: {exc}") from exc

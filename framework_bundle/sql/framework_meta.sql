@@ -1090,6 +1090,10 @@ SELECT
 FROM ${catalog}.framework_meta.pipeline_updates pu
 JOIN ${catalog}.framework_meta.v_workflows workflow ON workflow.job_name = pu.job_name;
 
+-- pipeline_name is the deployed name of the pipeline update that made the load. A backfill of files
+-- is not a pipeline update (its update_id starts with backfill-), and a regular run has none until
+-- framework_runs records it, so those rows take the name of the table's pipeline instead: first by
+-- its id, then by the job. Each CTE has one row per key, so no load is repeated.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_loads AS
 WITH latest AS (
   SELECT *
@@ -1098,6 +1102,14 @@ WITH latest AS (
     PARTITION BY job_name, layer, update_id, dataflow
     ORDER BY recorded_at DESC
   ) = 1
+), name_by_pipeline AS (
+  SELECT pipeline_id, max_by(pipeline_name, started_at) AS pipeline_name
+  FROM ${catalog}.framework_meta.pipeline_updates
+  GROUP BY pipeline_id
+), name_by_job AS (
+  SELECT job_name, max_by(pipeline_name, started_at) AS pipeline_name
+  FROM ${catalog}.framework_meta.pipeline_updates
+  GROUP BY job_name
 )
 SELECT
   l.layer,
@@ -1129,13 +1141,15 @@ SELECT
   p.owner_kind,
   p.owner,
   cast(d.quarantine AS STRING) AS quarantine_table,
-  pu.pipeline_name
+  coalesce(pu.pipeline_name, by_id.pipeline_name, by_job.pipeline_name) AS pipeline_name
 FROM latest l
 LEFT JOIN ${catalog}.framework_meta.v_pipelines p ON p.pipeline = l.dataflow
 LEFT JOIN ${catalog}.framework_meta.v_dataflows d ON d.dataflow = l.dataflow
 LEFT JOIN ${catalog}.framework_meta.pipeline_updates pu
   ON pu.update_id = l.update_id
- AND (l.update_pipeline_uuid IS NULL OR pu.pipeline_id = l.update_pipeline_uuid);
+ AND (l.update_pipeline_uuid IS NULL OR pu.pipeline_id = l.update_pipeline_uuid)
+LEFT JOIN name_by_pipeline by_id ON by_id.pipeline_id = l.update_pipeline_uuid
+LEFT JOIN name_by_job by_job ON by_job.job_name = l.job_name;
 
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_ledger_detail AS
 SELECT

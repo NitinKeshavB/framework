@@ -280,6 +280,25 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
                 },
             }
         )
+    # A file a ``fail`` rule blocked is moved to a _failed folder under its table's folder, which
+    # Auto Loader skips. A blocked file fails the update, so this task runs whether the refresh
+    # succeeded or not, and only for a job that has a table with a ``fail`` rule.
+    from lakeflow_framework.pipeline import has_blocking
+
+    blocking = [config.pipeline_id for config in configs if has_blocking(config)]
+    if blocking:
+        tasks.append(
+            {
+                "task_key": "park_failed_files",
+                "depends_on": [{"task_key": "refresh_pipeline"}],
+                "run_if": "ALL_DONE",
+                "environment_key": "framework_env",
+                "spark_python_task": {
+                    "python_file": "../../src/park_failed_files.py",
+                    "parameters": ["--catalog", "${var.catalog}", *blocking],
+                },
+            }
+        )
 
     # Deployed names carry a dev or prod prefix, so the run views join system tables on this tag.
     job: dict[str, Any] = {"name": name, "tags": job_tags(system, delivery, configs)}
@@ -295,7 +314,7 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
         job["trigger"] = {"file_arrival": {"url": f"/Volumes/${{var.catalog}}/{schema}/{volume}/"}}
     else:
         job["trigger"] = {"file_arrival": {"url": detail["path"]}}
-    if batch_paths or undeclared:
+    if batch_paths or undeclared or blocking:
         job["environments"] = [
             {
                 "environment_key": "framework_env",

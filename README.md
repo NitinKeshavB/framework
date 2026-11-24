@@ -271,7 +271,7 @@ source venv/bin/activate        # or set PYTHON to a venv's python
 ./run.sh test:quick             # package tests; no Spark
 ./run.sh lint                   # pre-commit: Ruff, mypy, hygiene, generate checks
 ./run.sh check:rules <profile> <warehouse-id> [catalog]   # run every quality rule on a warehouse before deploying
-./run.sh backfill <target> <profile> table=<id> mode=files|dates|failed|full_refresh [files=a.csv,b.csv] [date_from=.. date_to=..] [dry_run=false] [confirm=true]
+./run.sh backfill <target> <profile> table=<catalog.schema.table> mode=files|dates|failed|full_refresh [files=/Volumes/<catalog>/<schema>/<volume>/<folder>/a.csv,...] [date_from=.. date_to=..] [dry_run=false] [confirm=true]
                                 # reload files of one table, or refresh it, through its own rules; a dry run unless dry_run=false
 ./run.sh generate:check         # also a local pre-commit hook when ingestion paths change
 ./run.sh projects:check         # also a local pre-commit hook when curation/example paths change

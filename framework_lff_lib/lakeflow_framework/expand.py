@@ -49,9 +49,14 @@ def expand(config: PipelineConfig, spec_name: str) -> tuple[str, str]:
 
     graph = assemble(config)
     by_kind = {dataset.kind: dataset for dataset in graph.datasets}
-    if "valid" in by_kind or config.uses_auto_cdc:
+    if config.uses_auto_cdc:
         raise ExpandError(
             f"{config.pipeline_id} keeps history by key (Auto CDC); expand writes append tables only"
+        )
+    if "valid" in by_kind:
+        raise ExpandError(
+            f"{config.pipeline_id} has a fail rule, so a blocked file is held back by extra "
+            "datasets (_valid, _files, _blocked_check) that expand does not write out yet"
         )
     if "quarantine" not in by_kind:
         raise ExpandError(f"{config.pipeline_id} has no quarantine table; expand needs one")
