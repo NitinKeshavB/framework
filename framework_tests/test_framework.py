@@ -1090,7 +1090,6 @@ def test_a_delivery_reads_every_pipeline_document_once():
     assert spark.read.tables == [
         "framework_dev.ledger_raw.entries",
         "ledger_entries_staged",
-        "ledger_entries_valid",
         "ledger_entries_staged",
     ]
 

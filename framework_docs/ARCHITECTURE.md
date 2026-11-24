@@ -98,8 +98,7 @@ The job has one task, **refresh_pipeline**. (Frozen `cloud_files` methods add **
 ```mermaid
 flowchart LR
   source[raw volume files or foreign table] -->|read once| staged["&lt;pipeline_id&gt;_staged (private)"]
-  staged -->|"_dq_result = pass"| valid["&lt;pipeline_id&gt;_valid (temporary view)"]
-  valid --> bronze[bronze table]
+  staged -->|"_dq_result = pass"| bronze[bronze table]
   staged -->|"_dq_result = fail or quarantine"| quarantine["quarantine table (_qrntn)"]
   bronze -.->|"counted by _batch_id"| hook["event hook"]
   quarantine -.->|"counted by _batch_id"| hook

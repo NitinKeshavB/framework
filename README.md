@@ -69,6 +69,8 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 `generate` validates every source and spec, then writes committed `SOURCE_MAP.md` and gitignored `.build/` artifacts (pipelines, jobs, delivery manifests). Details are in [framework_ingestion/README.md](framework_ingestion/README.md).
 
+The generated pipeline file is one line (`build_pipelines([...])`), because the datasets are built when the pipeline runs. To read what a table's pipeline builds, run `./run.sh expand <spec.yaml> <catalog>`. It writes `<pipeline_id>_pipeline.py` and `.sql` to `framework_ingestion/.build/expanded/`, for review only (they are not deployed). It handles append tables read from a volume; a table that keeps history by key (Auto CDC) is refused.
+
 ## Add a project, silver, gold, or data product
 
 ```bash

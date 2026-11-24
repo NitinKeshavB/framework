@@ -43,6 +43,15 @@ def main(argv: list[str] | None = None) -> int:
         "--check", action="store_true", help="change nothing; fail if generated files are stale"
     )
 
+    expand = commands.add_parser(
+        "expand", help="write out the Python and SQL a table's pipeline builds, to read or review"
+    )
+    expand.add_argument("spec", type=Path, help="one table spec")
+    expand.add_argument("--catalog", required=True, help="catalog the tables are named under")
+    expand.add_argument(
+        "--out", type=Path, default=Path("expanded"), help="folder for the two files"
+    )
+
     check_rules = commands.add_parser(
         "check-rules", help="run every quality rule on a SQL warehouse before deploying"
     )
@@ -135,6 +144,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"run `lakeflow-framework generate {args.bundle}`", file=sys.stderr)
                 return 1
             print(f"updated {', '.join(stale)}" if stale else "generated files are up to date")
+            return 0
+        if args.command == "expand":
+            from lakeflow_framework.expand import ExpandError, expand_spec
+
+            try:
+                written = expand_spec(args.spec, args.out, args.catalog)
+            except ExpandError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print("\n".join(f"wrote {path}" for path in written))
             return 0
         if args.command == "check-rules":
             from lakeflow_framework.rule_check import check_rules, databricks_cli, format_results

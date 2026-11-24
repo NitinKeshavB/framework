@@ -207,12 +207,16 @@ def test_volume_spec_reads_the_raw_volume_and_has_no_raw_table(tmp_path: Path) -
     graph = assemble(config)
     assert [dataset.kind for dataset in graph.datasets] == [
         "staged",
-        "valid",
         "bronze",
         "quarantine",
     ]
     assert graph.datasets[0].detail["source"] == config.path
-    assert graph.datasets[3].detail == {
+    # An append table has no valid view: bronze reads the staging table through the pass filter.
+    assert graph.datasets[1].detail == {
+        "source": "files_things_staged",
+        "where": "_dq_result = 'pass'",
+    }
+    assert graph.datasets[2].detail == {
         "source": "files_things_staged",
         "where": "_dq_result IN ('fail', 'quarantine')",
     }
@@ -424,12 +428,7 @@ def test_database_spec_reads_the_foreign_catalog(tmp_path: Path) -> None:
     assert config.source_reference() == "db_federated.dbo.things"
     assert config.is_batch and not config.uses_auto_cdc
     graph = assemble(config)
-    assert [dataset.relation for dataset in graph.datasets] == [
-        "batch",
-        "temporary_view",
-        "batch",
-        "batch",
-    ]
+    assert [dataset.relation for dataset in graph.datasets] == ["batch", "batch", "batch"]
 
 
 def test_merge_mode_stages_once_then_uses_snapshot_cdc_on_the_keys(tmp_path: Path) -> None:
@@ -503,8 +502,7 @@ def test_snapshot_mode_replaces_bronze_with_a_materialized_view(tmp_path: Path) 
     assert pipelines.kinds["framework_dev.db_quarantine.things_qrntn"] == "materialized_view"
     assert spark.reads == [
         ("db_things_staged", "table", "db_federated.dbo.things"),
-        ("db_things_valid", "table", "db_things_staged"),
-        ("framework_dev.db_bronze.things", "table", "db_things_valid"),
+        ("framework_dev.db_bronze.things", "table", "db_things_staged"),
         ("framework_dev.db_quarantine.things_qrntn", "table", "db_things_staged"),
     ]
 
@@ -521,17 +519,16 @@ def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path
     staged = "files_things_staged"
     assert pipelines.kinds == {
         staged: "table",
-        "files_things_valid": "view",
         bronze: "table",
         quarantine: "table",
     }
     assert pipelines.options[staged]["private"] is True
     assert spark.reads == [
         (staged, "files", config.path),
-        ("files_things_valid", "table", staged),
-        (bronze, "table", "files_things_valid"),
+        (bronze, "table", staged),
         (quarantine, "table", staged),
     ]
+    assert "_dq_result = 'pass'" in spark.readStream.wheres  # bronze keeps only passing rows
     assert pipelines.expectations == ["cast_thing_id", "schema_conformance"]
     assert spark.readStream.format_name == "cloudFiles"
     assert spark.readStream.options["cloudFiles.format"] == "csv"

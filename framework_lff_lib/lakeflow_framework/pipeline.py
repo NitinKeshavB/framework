@@ -454,18 +454,19 @@ def assemble(config: PipelineConfig) -> Graph:
         checked["result"] = result_sql(rules)
     staged_name = f"{config.pipeline_id}_staged"
     valid_name = f"{config.pipeline_id}_valid"
+    passing = valid_where(rules, files=files)
     datasets.append(Dataset(kind="staged", name=staged_name, relation=relation, detail=checked))
-    datasets.append(
-        Dataset(
-            kind="valid",
-            name=valid_name,
-            relation="temporary_view",
-            detail={
-                "source": staged_name,
-                "where": valid_where(rules, files=files),
-            },
+    if config.uses_auto_cdc:
+        # Auto CDC needs a named source, so the passing rows get a view. An append table reads
+        # staged directly and has none.
+        datasets.append(
+            Dataset(
+                kind="valid",
+                name=valid_name,
+                relation="temporary_view",
+                detail={"source": staged_name, "where": passing},
+            )
         )
-    )
     auto_cdc = None
     if config.uses_auto_cdc:
         datasets.append(
@@ -493,7 +494,10 @@ def assemble(config: PipelineConfig) -> Graph:
     else:
         datasets.append(
             Dataset(
-                kind="bronze", name=bronze_name, relation=relation, detail={"source": valid_name}
+                kind="bronze",
+                name=bronze_name,
+                relation=relation,
+                detail={"source": staged_name, "where": passing},
             )
         )
     if config.has_quarantine:
@@ -769,7 +773,7 @@ def stage_frame(frame: Any, config: PipelineConfig, batch: str | None = None) ->
 
 def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) -> None:
     by_kind = {dataset.kind: dataset for dataset in graph.datasets}
-    raw, staged, valid = by_kind.get("raw"), by_kind["staged"], by_kind["valid"]
+    raw, staged, valid = by_kind.get("raw"), by_kind["staged"], by_kind.get("valid")
     bronze, quarantine = by_kind["bronze"], by_kind.get("quarantine")
     options = get_strategy(config.load_method).options(config)
     persisted = pipelines.materialized_view if config.is_batch else pipelines.table
@@ -814,12 +818,16 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
     internal = f"{DQ_COLUMN}, {DQ_RESULT}" if is_file_load(config) else DQ_COLUMN
 
-    @pipelines.temporary_view(name=valid.name)
-    def _valid() -> Any:
-        frame = _filtered(_reader().table(staged.name), valid.detail["where"])
+    def _passing(where: str) -> Any:
+        """The rows that pass, without the two rule columns, with the sequence column typed."""
+
+        frame = _filtered(_reader().table(staged.name), where)
         if hasattr(frame, "selectExpr"):
             frame = frame.selectExpr(f"* EXCEPT ({internal})")
         return _typed_sequence(frame, config)
+
+    if valid is not None:
+        pipelines.temporary_view(name=valid.name)(lambda: _passing(valid.detail["where"]))
 
     if bronze.relation == "auto_cdc":
         pipelines.create_streaming_table(name=bronze.name, **_table_options(config, "bronze"))
@@ -839,7 +847,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
 
         @persisted(name=bronze.name, **_table_options(config, "bronze"))
         def _bronze() -> Any:
-            return _reader().table(valid.name)
+            return _passing(bronze.detail["where"])
 
     if quarantine is not None:
         where = quarantine.detail["where"]

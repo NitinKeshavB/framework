@@ -74,6 +74,17 @@ function generate {
     "$PYTHON" -m lakeflow_framework.cli generate "$THIS_DIR/framework_ingestion"
 }
 
+# write out the Python and SQL a table's pipeline builds, to read or review (not deployed):
+#   ./run.sh expand <spec.yaml> <catalog> [out-folder]
+# The default folder is framework_ingestion/.build/expanded, which git ignores.
+function expand {
+    _require-package
+    "$PYTHON" -m lakeflow_framework.cli expand \
+        "${1:?usage: ./run.sh expand <spec.yaml> <catalog> [out-folder]}" \
+        --catalog "${2:?catalog is required}" \
+        --out "${3:-$THIS_DIR/framework_ingestion/.build/expanded}"
+}
+
 # create source.yaml for a new source system:
 # ./run.sh new-source <domain> <source_system> <owner-email> [kind] [delivery]
 function new-source {

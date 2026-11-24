@@ -111,7 +111,7 @@ raw_to_bronze:
 ```mermaid
 flowchart LR
   src["Source once"] --> staged["_staged + rules"]
-  staged -->|pass| valid["_valid → bronze"]
+  staged -->|pass| bronze["bronze"]
   staged -->|quarantine| qrntn["_qrntn + failed_rules"]
   staged -->|drop| dropped["dropped"]
   staged -->|fail| qrntn
