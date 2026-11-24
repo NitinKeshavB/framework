@@ -78,7 +78,7 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             stable_key=f"{root}|{suffix}" if suffix else root,
         )
 
-    rules = [
+    rules: list[dict[str, Any]] = [
         {
             "name": rule.name,
             "expression": rule.expression,
@@ -86,6 +86,21 @@ def object_rows(config: PipelineConfig, recorded_at: str | None = None) -> list[
             "action": rule.action,
         }
         for rule in compile_rules(config)
+    ]
+    # A rule switched off with ``enabled: false`` is registered but never run. Only a disabled
+    # rule carries the flag, so a spec that never uses it keeps the hash it had. The views read a
+    # missing flag as enabled. The rules the spec declares come first, then the framework's own.
+    declared = sum(1 for rule in rules if rule["origin"] == "declared")
+    rules[declared:declared] = [
+        {
+            "name": rule.name,
+            "expression": rule.expression,
+            "origin": "declared",
+            "action": rule.action,
+            "enabled": False,
+        }
+        for rule in config.rules
+        if not rule.enabled
     ]
     rows = [
         row(

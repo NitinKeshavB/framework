@@ -234,6 +234,7 @@ Written only by `registry_sync` at deploy. Look up what is supposed to exist and
 | View | Use for |
 | --- | --- |
 | `v_columns`, `v_column_history` | Current and past columns: type, description, tags |
+| `v_rules`, `v_rule_history` | The data quality rules of each table (name, origin, action, SQL expression, `enabled`), now and with `valid_from` / `valid_to` / `is_active`. A rule with `enabled: false` is registered but not run, and a rule removed from the spec stays in `v_rules` with `enabled = false` |
 | `v_lineage` | Declared pipeline → table write/reject edges |
 
 ### Optional (needs `system_views: true` or UC compare)

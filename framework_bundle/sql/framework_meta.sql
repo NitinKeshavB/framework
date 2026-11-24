@@ -770,6 +770,76 @@ SELECT
 FROM ${catalog}.framework_meta.v_asset_registry_history
 WHERE object_kind = 'column';
 
+-- Every data quality rule (expectation) of every table, with the dates it applied. The rules are
+-- stored inside each pipeline version, so a rule that did not change would repeat in every version.
+-- This folds a run of consecutive versions that carry the same rule into one row.
+-- origin: declared (the spec's rules), key, type, schema (checks the framework adds).
+-- action: quarantine, drop, warn, or fail.
+-- enabled: false for a rule the spec switched off with enabled: false. It is registered, not run.
+-- is_current: this row is how the rule is defined now. valid_to is NULL while that holds.
+-- is_active: the rule is defined now and enabled, so it is enforced.
+-- Switching a rule off or on, or changing its expression or action, closes one row and opens another.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_rule_history AS
+WITH versions AS (
+  SELECT
+    full_name, parent_full_name, owner_kind, owner, valid_from, valid_to, is_current, is_deleted,
+    row_number() OVER (PARTITION BY full_name ORDER BY valid_from) AS version_no,
+    from_json(
+      config_json:rules,
+      'array<struct<name:string,expression:string,origin:string,action:string,enabled:boolean>>'
+    ) AS rules
+  FROM ${catalog}.framework_meta.v_asset_registry_history
+  WHERE object_kind = 'pipeline'
+), exploded AS (
+  SELECT
+    v.full_name, v.parent_full_name, v.owner_kind, v.owner, v.valid_from, v.valid_to,
+    v.is_current, v.version_no,
+    rl.name AS rule_name, rl.origin, rl.action, rl.expression,
+    coalesce(rl.enabled, true) AS enabled
+  FROM versions v
+  LATERAL VIEW explode(v.rules) t AS rl
+  WHERE NOT v.is_deleted
+), marked AS (
+  SELECT
+    *,
+    version_no - row_number() OVER (
+      PARTITION BY full_name, rule_name, origin, action, expression, enabled
+      ORDER BY version_no
+    ) AS stretch
+  FROM exploded
+)
+SELECT
+  parent_full_name AS job_name,
+  full_name AS pipeline,
+  owner_kind,
+  owner,
+  rule_name,
+  origin,
+  action,
+  expression,
+  enabled,
+  min(valid_from) AS valid_from,
+  max_by(valid_to, version_no) AS valid_to,
+  max_by(is_current, version_no) AS is_current,
+  enabled AND max_by(is_current, version_no) AS is_active
+FROM marked
+GROUP BY parent_full_name, full_name, owner_kind, owner, rule_name, origin, action, expression,
+  enabled, stretch;
+
+-- Every rule a table has ever had, in its latest state. enabled is true only for a rule that is in
+-- the spec now and not switched off. A rule removed from the spec, or commented out, stays here with
+-- enabled = false and the expression it last had. Filter on enabled for the ones that run.
+CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_rules AS
+SELECT job_name, pipeline, owner_kind, owner, rule_name, origin, action, expression,
+  is_active AS enabled
+FROM (
+  SELECT
+    *,
+    row_number() OVER (PARTITION BY pipeline, rule_name ORDER BY valid_from DESC) AS latest
+  FROM ${catalog}.framework_meta.v_rule_history
+)
+WHERE latest = 1;
+
 -- Tags are parked (unity.APPLY_TAGS = False). Flip drift_enabled.on to true when tags apply.
 CREATE OR REPLACE VIEW ${catalog}.framework_meta.v_metadata_drift AS
 WITH drift_enabled AS (

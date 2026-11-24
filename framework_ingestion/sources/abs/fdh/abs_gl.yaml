@@ -69,6 +69,7 @@ raw_to_bronze:
     - { name: rideable_type_present, expression: "rideable_type IS NOT NULL AND length(trim(rideable_type)) > 0" }
     - { name: rideable_type_known, expression: "rideable_type IN ('classic_bike', 'electric_bike', 'docked_bike')" }
     - { name: started_at_present, expression: "started_at IS NOT NULL AND length(trim(started_at)) > 0" }
+    - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
   # What happens to a row that fails a rule, for every rule below and the framework's own checks.
   # Set on_fail here OR on each rule (an example sits above the rules), never both.
   # Optional: leave it out to get the default (quarantine). on_fail needs rules: on its own,

@@ -100,6 +100,23 @@ def _add_table(bundle: Path, name: str, requested_by: str, **changes: str) -> Pa
     return path
 
 
+def test_only_a_job_with_a_table_that_declares_no_columns_gets_the_infer_task(bundle: Path) -> None:
+    path = _add_table(bundle, "notes", "collections")
+    text = path.read_text(encoding="utf-8")
+    # no dedup, keys, columns or rules: a table whose columns can only come from the data
+    path.write_text(
+        text[: text.index("  dedup: true")] + text[text.index("quarantine:") :], encoding="utf-8"
+    )
+    generate(bundle)
+    job = _job(bundle)
+    tasks = {task["task_key"]: task for task in job["tasks"]}
+    assert list(tasks) == ["refresh_pipeline", "infer_columns"]
+    assert tasks["infer_columns"]["depends_on"] == [{"task_key": "refresh_pipeline"}]
+    # only the table with nothing declared is named, not the billing table that declares columns
+    assert tasks["infer_columns"]["spark_python_task"]["parameters"][2:] == ["billing_notes"]
+    assert [env["environment_key"] for env in job["environments"]] == ["framework_env"]
+
+
 def _job(bundle: Path, name: str = "billing_daily") -> dict:
     document = yaml.safe_load(
         (bundle / BUILD_DIR / "resources" / f"{name}.job.yml").read_text("utf-8")
@@ -203,20 +220,13 @@ def test_one_delivery_is_one_pipeline_and_one_job_for_every_team(bundle: Path) -
     generate(bundle)
     source = (bundle / BUILD_DIR / "pipelines" / "billing_daily.py").read_text("utf-8")
     assert 'build_pipelines(["billing_credits", "billing_invoices"])' in source
-    # The refresh, then one task that registers inferred columns. The pipeline records its own
-    # counts, status, and errors (an event hook), and framework_runs records the job runs.
-    tasks = _job(bundle)["tasks"]
-    assert [task["task_key"] for task in tasks] == ["refresh_pipeline", "infer_columns"]
-    assert tasks[1]["depends_on"] == [{"task_key": "refresh_pipeline"}]
-    assert tasks[1]["spark_python_task"]["parameters"][2:] == [
-        "billing_credits",
-        "billing_invoices",
-    ]
+    # Only the refresh: the pipeline records its own counts, status, and errors (an event hook),
+    # and framework_runs records the job runs. Both tables declare columns, so nothing is inferred.
+    assert [task["task_key"] for task in _job(bundle)["tasks"]] == ["refresh_pipeline"]
     job = _job(bundle)
     assert "run_as" not in job
     assert job["performance_target"] == "PERFORMANCE_OPTIMIZED"
-    # Only the infer_columns task runs Python, so the job carries the one environment it needs.
-    assert [env["environment_key"] for env in job["environments"]] == ["framework_env"]
+    assert "environments" not in job  # nothing in the job runs Python
     settings = _settings(bundle)
     assert "lff.manifest" in settings
     assert settings["lff.manifest"].endswith(f"{BUILD_DIR}/manifests/billing_daily.json")

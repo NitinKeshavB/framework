@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             for system in load_sources(args.bundle, catalog=args.catalog):
                 for table in system.tables:
                     config = table.config
-                    if not config.rules:
+                    if not config.active_rules:
                         continue
                     bronze = config.table_name("bronze") if args.catalog else None
                     results = check_rules(run, config, table=bronze)

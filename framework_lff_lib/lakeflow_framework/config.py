@@ -135,6 +135,8 @@ class QualityRule:
     name: str
     expression: str
     action: str = "quarantine"
+    # False keeps the rule in the spec and the registry, shown as inactive, but never evaluates it.
+    enabled: bool = True
 
 
 @dataclass
@@ -323,6 +325,12 @@ class PipelineConfig:
         return bool(self.rules) or self.quarantine_requested
 
     @property
+    def active_rules(self) -> list[QualityRule]:
+        """The rules that are evaluated. A rule with ``enabled: false`` is registered, not run."""
+
+        return [rule for rule in self.rules if rule.enabled]
+
+    @property
     def layers(self) -> tuple[str, ...]:
         written = ("raw", "bronze") if self.has_raw else ("bronze",)
         return (*written, "quarantine") if self.has_quarantine else written
@@ -409,6 +417,8 @@ class PipelineConfig:
                         # when the table sets nothing (the two are never both set), so this
                         # document is always valid to read back.
                         **({"on_fail": rule.action} if rule.action != self.on_fail else {}),
+                        # Only when off, so a spec that never uses it keeps its hash.
+                        **({} if rule.enabled else {"enabled": False}),
                     }
                     for rule in self.rules
                 ],
@@ -1691,9 +1701,12 @@ def _rules(
             if item.get("on_fail") is not None
             else default_action
         )
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            errors.append(f"{label}: rule '{name}' enabled must be true or false")
         if len(errors) > before:
             continue
-        rules.append(QualityRule(name, expression, action))
+        rules.append(QualityRule(name, expression, action, enabled))
     return rules
 
 

@@ -78,18 +78,19 @@ def check_rules(
 ) -> list[RuleResult]:
     """Evaluate each declared rule of ``config``. With ``table``, also count the failing rows."""
 
-    results = [RuleResult(config.pipeline_id, rule.name) for rule in config.rules]
+    results = [RuleResult(config.pipeline_id, rule.name) for rule in config.active_rules]
     if not results:
         return results
     row = sample_row(config)
     every = ", ".join(
-        f"coalesce(({rule.expression}), false) AS r{i}" for i, rule in enumerate(config.rules)
+        f"coalesce(({rule.expression}), false) AS r{i}"
+        for i, rule in enumerate(config.active_rules)
     )
     try:
         run(f"SELECT {every} FROM ({row})")
     except RuleCheckError:
         # One rule is wrong. Run them one at a time to say which.
-        for result, rule in zip(results, config.rules, strict=True):
+        for result, rule in zip(results, config.active_rules, strict=True):
             try:
                 run(f"SELECT coalesce(({rule.expression}), false) AS r FROM ({row})")
             except RuleCheckError as exc:
@@ -100,7 +101,7 @@ def check_rules(
 
 
 def _count(run: Runner, config: PipelineConfig, table: str, results: list[RuleResult]) -> None:
-    good = [(i, rule) for i, rule in enumerate(config.rules) if results[i].error is None]
+    good = [(i, rule) for i, rule in enumerate(config.active_rules) if results[i].error is None]
     if not good:
         return
     counts = ", ".join(

@@ -562,9 +562,12 @@ def read_arrivals(
         return None
     meta = f"{require_catalog(catalog)}.framework_meta"
     pid = sql_string(row["dataflow"])
+    # layer and job_name are the ledger's clustering keys (with started_at), so naming them lets
+    # Delta skip files instead of reading every row ever recorded.
     previous = spark.sql(
         f"SELECT unix_timestamp(max(started_at)) AS since FROM {meta}.{LEDGER} "
-        f"WHERE dataflow = {pid} AND update_id NOT LIKE 'backfill-%'"
+        f"WHERE layer = {sql_string(row['layer'])} AND job_name = {sql_string(row['job_name'])} "
+        f"AND dataflow = {pid} AND update_id NOT LIKE 'backfill-%'"
     ).collect()
     since = previous[0]["since"] if previous else None
     cutoff = float(since) - ARRIVAL_SLACK.total_seconds() if since is not None else None

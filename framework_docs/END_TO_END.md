@@ -131,6 +131,7 @@ A pipeline or table has one owner. Before inserting, `registry_sync` looks up th
 | `v_flows` | Each layer flow with relation, path, or table. |
 | `v_tables` | Each securable's domain, team, technical owner, classification, PII, layer, pipeline, job, and load method. |
 | `v_columns`, `v_column_history` | Current and past columns of raw, bronze, and quarantine. |
+| `v_rules`, `v_rule_history` | One row per data quality rule of each table: `rule_name`, `origin` (`declared`, or `key`, `type`, `schema` for the checks the framework adds), `action`, the SQL `expression`, and `enabled` (false for a rule the spec switched off with `enabled: false`; it is registered but not run). `v_rules` has every rule the table has ever had, in its latest state: a rule removed from the spec, or commented out, stays with `enabled = false`. Filter on `enabled` for the ones that run. The history view adds `valid_from`, `valid_to` (NULL while the rule is defined as shown), `is_current` and `is_active` (defined now and enabled). Results (how many rows passed each rule) are not here; they are in the pipeline's event log. |
 | `v_lineage` | Latest link per parent, child, and relation. |
 | `v_ownership_refusals` | Every definition `registry_sync` refused because another owner holds the name, with the holder in `failure_reason`. |
 | `v_job_status` | Each workflow and its latest run from `v_job_runs`: `RUNNING`, `SUCCEEDED`, `FAILED`, or `SKIPPED`, with the termination code. Recorded hourly by `framework_runs`. |

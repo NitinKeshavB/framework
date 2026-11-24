@@ -207,7 +207,8 @@ def compile_rules(config: PipelineConfig) -> list[CompiledRule]:
     if action == "quarantine" and not config.has_quarantine:
         action = "drop"
     rules = [
-        CompiledRule(rule.name, rule.expression, "declared", rule.action) for rule in config.rules
+        CompiledRule(rule.name, rule.expression, "declared", rule.action)
+        for rule in config.active_rules
     ]
     for key in config.primary_keys:
         rules.append(CompiledRule(f"not_null_{key}", f"{key} IS NOT NULL", "key", action))

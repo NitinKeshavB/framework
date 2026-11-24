@@ -61,7 +61,7 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 ## Frozen read API (query these)
 
-**Definitions:** `v_asset_registry_current`, `v_asset_registry_history`, `v_source_systems`, `v_schemas`, `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, `v_columns`, `v_column_history`, `v_lineage`, `v_ownership_conflicts`, `v_ownership_refusals`, `v_metadata_drift`
+**Definitions:** `v_asset_registry_current`, `v_asset_registry_history`, `v_source_systems`, `v_schemas`, `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, `v_columns`, `v_column_history`, `v_rules`, `v_rule_history`, `v_lineage`, `v_ownership_conflicts`, `v_ownership_refusals`, `v_metadata_drift`
 
 **Runs / recon:** `v_job_status`, `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, `v_loads`, `v_ledger_detail`, `v_load_failures`
 

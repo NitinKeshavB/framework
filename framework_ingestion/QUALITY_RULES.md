@@ -29,6 +29,18 @@ raw_to_bronze:
     - { name: end_station_id_length,    expression: "...", on_fail: warn }             # just count
 ```
 
+**Switching a rule off.** Add `enabled: false` to a rule to keep it in the spec without running it. It is still validated and registered, so the registry shows it as inactive, but no row is judged by it and no expectation is counted for it. Remove the line (or set `enabled: true`) to turn it back on. A rule you comment out is different: a YAML comment never reaches the registry, so the rule is not registered at all.
+
+```yaml
+    - { name: start_lat_in_range, expression: "start_lat rlike '^-?[0-9]+([.][0-9]+)?$'", enabled: false }
+```
+
+**Removing a rule.** A rule you delete from the spec, or comment out, is not run. The registry keeps its history, and `v_rules` keeps the rule with `enabled = false` and the expression it last had, so the table shows what was once there. Put it back (or add it again) and it shows `enabled = true`.
+
+In the registry, `v_rules` has one row per rule a table has ever had, with `enabled` true only while the rule is in the spec and not switched off. `v_rule_history` adds `valid_from`, `valid_to`, `is_current` (this is how the rule is defined now) and `is_active` (defined now and enabled). Switching a rule off or on closes one history row and opens another.
+
+The checks the framework adds itself are listed by `origin`: `declared` is your rule, `type` is `cast_<column>` for a column you declared in `columns:`, `key` is a not-null check on a key or the sequence column, and `schema` is `schema_conformance`. A spec that declares no columns gets no `type` rows.
+
 Rules of different actions mix in one table. A row that fails a `quarantine` rule is quarantined even if it also failed a `warn` rule; a row that fails only `drop` and `warn` rules is dropped; a row that fails only `warn` rules loads.
 
 **What `fail` does, for a table loaded from files.** A row that breaks a `fail` rule is kept out of bronze and the load is recorded `FAILED`, but the pipeline and the job do **not** fail:

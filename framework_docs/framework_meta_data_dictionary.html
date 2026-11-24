@@ -283,6 +283,18 @@
         columns: ["table_name", "column_name", "data_type", "valid_from", "valid_to", "is_current"]
       },
       {
+        kind: "view", name: "v_rules",
+        writtenBy: "framework_meta.sql", grain: "One current data quality rule of one table",
+        purpose: "The rules (expectations) that apply to each table now: name, origin, action, and the SQL expression.",
+        columns: ["job_name", "pipeline", "rule_name", "origin", "action", "expression", "enabled"]
+      },
+      {
+        kind: "view", name: "v_rule_history",
+        writtenBy: "framework_meta.sql", grain: "One stretch of versions that carry the same rule",
+        purpose: "Every rule with the dates it applied. A rule that did not change is one row, not one per version.",
+        columns: ["job_name", "pipeline", "rule_name", "origin", "action", "expression", "enabled", "valid_from", "valid_to", "is_current", "is_active"]
+      },
+      {
         kind: "view", name: "v_lineage",
         writtenBy: "framework_meta.sql", grain: "One link row",
         purpose: "Declared pipeline→table write/reject edges from asset_registry_current link rows.",

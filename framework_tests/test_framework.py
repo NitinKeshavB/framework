@@ -590,6 +590,14 @@ def test_ddl_clusters_both_tables_and_names_the_catalog():
     assert "CREATE BLOOMFILTER INDEX" not in text
     assert "v_columns" in text
     assert "v_column_history" in text
+    rules = next(s for s in statements if "framework_meta.v_rule_history AS" in s)
+    assert "explode(v.rules)" in rules and "max_by(valid_to, version_no)" in rules
+    assert "coalesce(rl.enabled, true) AS enabled" in rules  # a rule with no flag is enabled
+    assert "enabled AND max_by(is_current, version_no) AS is_active" in rules
+    v_rules = next(s for s in statements if "framework_meta.v_rules AS" in s)
+    # a removed rule stays, as inactive: the latest row per rule, enabled only while it is active
+    assert "is_active AS enabled" in v_rules and "WHERE latest = 1" in v_rules
+    assert "WHERE is_current" not in v_rules and "valid_from," not in v_rules.split("FROM (")[0]
     assert "valid_from" in text
     assert "valid_to" in text
     assert "is_current" in text
