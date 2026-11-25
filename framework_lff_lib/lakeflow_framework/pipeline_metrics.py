@@ -476,7 +476,7 @@ def file_records(rows: list[dict[str, Any]], recorded_at: datetime) -> list[tupl
     ]
 
 
-def read_files_sql(row: dict[str, Any]) -> str | None:
+def read_files_sql(row: dict[str, Any], rescued: bool = False) -> str | None:
     """One row per file of this run, counted from what the run wrote to bronze and quarantine.
 
     No working table: every row of the run carries ``_batch_id``, and bronze and quarantine are
@@ -484,6 +484,8 @@ def read_files_sql(row: dict[str, Any]) -> str | None:
     rows hold the rules they broke, which is how a ``fail`` rule marks its file. A row dropped by a
     drop rule is kept nowhere, so it is not in any file's count (the table's ``rows_dropped``
     has it). For a table that keeps history by key, bronze counts the rows the run left there.
+    With ``rescued`` (bronze has a ``_rescued_data`` column) the rows that hold rescued values
+    are counted too, so a file that loaded with a new column is flagged.
     """
 
     batch, started, target = row.get("batch_id"), row.get("started_at"), row.get("target_table")
@@ -494,13 +496,14 @@ def read_files_sql(row: dict[str, Any]) -> str | None:
         since = (started.astimezone(UTC) - LOAD_TIME_SLACK).strftime("%Y-%m-%d %H:%M:%S")
         scope += f" AND {INGEST_TIMESTAMP} >= TIMESTAMP '{since}+00:00'"
     none = "CAST(array() AS ARRAY<STRING>)"
+    flag = "CASE WHEN _rescued_data IS NOT NULL THEN 1 ELSE 0 END" if rescued else "0"
     parts = [
         f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 1 AS loaded, 0 AS quarantined, "
-        f"{none} AS failed FROM {target} {scope}"
+        f"{none} AS failed, {flag} AS warned FROM {target} {scope}"
     ]
     if row.get("_quarantine_table"):
         parts.append(
-            f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 0, 1, failed_rules "
+            f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 0, 1, failed_rules, 0 "
             f"FROM {row['_quarantine_table']} {scope}"
         )
     fail_rules = ", ".join(sql_string(name) for name in row.get("_fail_rules") or ())
@@ -512,7 +515,8 @@ def read_files_sql(row: dict[str, Any]) -> str | None:
     )
     return (
         f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, sum(loaded) AS rows_loaded, "
-        f"sum(quarantined) AS rows_quarantined, {blockers} AS blocking_rules, "
+        f"sum(quarantined) AS rows_quarantined, sum(warned) AS rows_warned, "
+        f"{blockers} AS blocking_rules, "
         "array_join(array_sort(array_distinct(flatten(collect_list(failed)))), ', ') "
         "AS failed_rules "
         f"FROM ({' UNION ALL '.join(parts)}) GROUP BY {SRC_FILE_PATH}, {SRC_FILE_NAME} "
@@ -550,9 +554,19 @@ def read_files_table(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
                 + int(data.get("rows_blocked") or 0),
                 "failed_rules": data.get("failed_rules") or "",
                 "blocking_rules": data.get("blocking_rules") or "",
+                "rows_warned": int(data.get("rows_warned") or 0),
             }
         )
     return files
+
+
+def _has_rescued_column(spark: Any, row: dict[str, Any]) -> bool:
+    """Whether bronze has the column Auto Loader rescues into. Parquet and avro do not."""
+
+    try:
+        return "_rescued_data" in spark.table(str(row.get("target_table"))).columns
+    except Exception:
+        return False
 
 
 def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -565,7 +579,7 @@ def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
             # Count from bronze and quarantine instead: a blocked file then shows only its bad
             # rows, but the ledger row is still written.
             log.exception("load metrics: could not read the file counts of %s", row["dataflow"])
-    sql = read_files_sql(row)
+    sql = read_files_sql(row, _has_rescued_column(spark, row))
     if sql is None:
         return []
     files = []
@@ -574,11 +588,16 @@ def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
         loaded = int(data.get("rows_loaded") or 0)
         quarantined = int(data.get("rows_quarantined") or 0)
         blocking = data.get("blocking_rules") or ""
+        warned = int(data.get("rows_warned") or 0)
         files.append(
             {
                 "src_file_path": data.get(SRC_FILE_PATH),
                 "src_file_name": data.get(SRC_FILE_NAME),
-                "status": "FAILED" if blocking else "WARNING" if quarantined else "PROCESSED",
+                "status": "FAILED"
+                if blocking
+                else "WARNING"
+                if quarantined or warned
+                else "PROCESSED",
                 "detail_kind": "file",
                 "rows_read": loaded + quarantined,
                 "rows_inserted": loaded,
@@ -586,6 +605,7 @@ def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
                 "rows_dropped": 0,
                 "failed_rules": data.get("failed_rules") or "",
                 "blocking_rules": blocking,
+                "rows_warned": warned,
             }
         )
     return files
@@ -714,6 +734,21 @@ def mark_failed(row: dict[str, Any], reason: str) -> None:
     row["failure_reason"] = _clip(f"{existing}; {reason}" if existing else reason)
 
 
+def warning_text(item: dict[str, Any]) -> str | None:
+    """What a loaded file's WARNING row says: rows that loaded with a warning, such as a new
+    column kept in ``_rescued_data``."""
+
+    warned = int(item.get("rows_warned") or 0)
+    if not warned or item["status"] == "FAILED":
+        return None
+    names = item.get("failed_rules") or ""
+    return (
+        f"{warned} row(s) loaded with a warning"
+        + (f": {names}" if names else "")
+        + " (values kept in _rescued_data)"
+    )
+
+
 def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, Any]:
     """Fold the per-file counts into the table's ledger row.
 
@@ -730,7 +765,7 @@ def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, A
         item["error_message"] = (
             f"blocked by fail rule(s): {item.get('blocking_rules')}"
             if item["status"] == "FAILED"
-            else None
+            else warning_text(item)
         )
     if files:
         row["files_read"] = len(files)

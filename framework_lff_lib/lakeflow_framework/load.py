@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from lakeflow_framework.config import (
     FORMATS,
     INGEST_TIMESTAMP,
+    SCHEMA_EVOLUTION,
     SRC_FILE_NAME,
     SRC_FILE_PATH,
     SRC_ROW_HASH,
@@ -82,7 +83,7 @@ class AutoLoader(LoadStrategy):
             config.max_files_per_trigger or DEFAULT_MAX_FILES_PER_TRIGGER
         )
         if config.file_format in RESCUE_FORMATS:
-            options["cloudFiles.schemaEvolutionMode"] = "rescue"
+            options["cloudFiles.schemaEvolutionMode"] = SCHEMA_EVOLUTION[config.schema_evolution]
             options["rescuedDataColumn"] = "_rescued_data"
         if config.file_format in {"csv", "delimited"}:
             options["header"] = str(config.header).lower()

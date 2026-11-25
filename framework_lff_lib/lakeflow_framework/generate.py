@@ -267,19 +267,34 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
     # A table that declares no columns gets them registered from bronze after its first load. A
     # table that declares columns has nothing to infer, so a job with none of the first kind has no
     # such task and pays no task start. The task never fails the job (see src/infer_columns.py).
-    undeclared = [config.pipeline_id for config in configs if not config.columns]
-    if undeclared:
-        tasks.append(
-            {
-                "task_key": "infer_columns",
-                "depends_on": [{"task_key": "refresh_pipeline"}],
-                "environment_key": "framework_env",
-                "spark_python_task": {
-                    "python_file": "../../src/infer_columns.py",
-                    "parameters": ["--catalog", "${var.catalog}", *undeclared],
-                },
-            }
-        )
+    # A table whose new columns become real columns (schema_evolution add_new_columns) is read
+    # again after every run, so the registry follows bronze. The others are registered once.
+    undeclared = [config for config in configs if not config.columns]
+    for task_key, flags, members in (
+        ("infer_columns", [], [c for c in undeclared if c.schema_evolution != "add_new_columns"]),
+        (
+            "infer_columns_refresh",
+            ["--refresh"],
+            [c for c in undeclared if c.schema_evolution == "add_new_columns"],
+        ),
+    ):
+        if members:
+            tasks.append(
+                {
+                    "task_key": task_key,
+                    "depends_on": [{"task_key": "refresh_pipeline"}],
+                    "environment_key": "framework_env",
+                    "spark_python_task": {
+                        "python_file": "../../src/infer_columns.py",
+                        "parameters": [
+                            "--catalog",
+                            "${var.catalog}",
+                            *flags,
+                            *[c.pipeline_id for c in members],
+                        ],
+                    },
+                }
+            )
     # A file a ``fail`` rule blocked is moved to a _failed folder under its table's folder, which
     # Auto Loader skips. A blocked file fails the update, so this task runs whether the refresh
     # succeeded or not, and only for a job that has a table with a ``fail`` rule.

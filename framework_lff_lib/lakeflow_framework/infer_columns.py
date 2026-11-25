@@ -13,9 +13,11 @@ are retired like any other definition the spec no longer has.
 
 Registered columns are documentation (comments, tags, lineage). They never feed back into how
 Auto Loader reads the next file. For csv, delimited and json the pipeline runs Auto Loader in
-``rescue`` mode, so a column that appears later is not added to bronze: its values go to
-``_rescued_data``, and the registered columns stay right. They are registered once and not
-refreshed, so a format whose table does gain columns (parquet, avro) would leave them stale.
+``rescue`` mode by default, so a column that appears later is not added to bronze: its values
+go to ``_rescued_data``, and the registered columns stay right, so they are registered once.
+A table that sets ``schema_evolution: add_new_columns`` does gain columns, so its job runs this
+with ``refresh`` after every run (the ``infer_columns_refresh`` task), and the registry follows
+bronze. A parquet or avro table, which also gains columns, is not refreshed.
 """
 
 from __future__ import annotations

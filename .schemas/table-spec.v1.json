@@ -78,6 +78,7 @@
         "multiline": { "type": "boolean" },
         "file_events": { "type": "boolean" },
         "expect_file": { "type": "boolean" },
+        "schema_evolution": { "type": "string", "enum": ["rescue", "add_new_columns", "fail", "none"], "description": "What happens when a file has a column the table does not have. rescue (the default) keeps its values in _rescued_data and loads the row. add_new_columns makes it a column. fail stops the update. none ignores it. For csv, delimited and json." },
         "max_files_per_trigger": { "type": "integer", "minimum": 1 },
         "catalog": { "type": "string" },
         "table": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$" },
@@ -100,8 +101,8 @@
         "watermark_column": { "type": "string" },
         "load_type": {
           "type": "string",
-          "enum": ["insert_only", "scd1", "scd2", "full_refresh"],
-          "description": "How rows are taken. insert_only appends. scd1 upserts on primary_keys by watermark_column. scd2 keeps every version. full_refresh (database tables) mirrors the source and keeps a removed key, closed. Omitted: scd1 when dedup is true, else insert_only for files."
+          "enum": ["append", "scd1", "scd2", "full_refresh"],
+          "description": "How rows are taken. append appends. scd1 upserts on primary_keys by watermark_column. scd2 keeps every version. full_refresh (database tables) mirrors the source and keeps a removed key, closed. Omitted: scd1 when dedup is true, else append for files."
         },
         "on_fail": {
           "type": "string",

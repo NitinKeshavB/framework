@@ -3,6 +3,7 @@ bronze's shape (types included) plus failed_rules."""
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,13 @@ import pytest
 from lakeflow_framework import build_pipeline
 from lakeflow_framework.config import ConfigValidationError, config_from_document
 from lakeflow_framework.metadata import object_rows
-from lakeflow_framework.pipeline import assemble, files_sql, rescued_cast_exprs
+from lakeflow_framework.pipeline import (
+    assemble,
+    files_sql,
+    has_dropping,
+    has_file_counts,
+    rescued_cast_exprs,
+)
 from lakeflow_framework.quality import compile_rules
 from test_pipeline_metrics import dataflow, recorder, run, update_state
 from test_sources import FILE_SOURCE, _config, _Pipelines, _Spark, _volume_spec
@@ -37,9 +44,9 @@ def test_nothing_defined_means_no_quarantine_at_all(tmp_path: Path) -> None:
     assert "quarantine" not in config.layers
     assert not any("qrntn" in name or "quarantine" in name for name in names)
     assert "quarantine" not in {dataset.kind for dataset in assemble(config).datasets}
-    # The framework's own checks drop a bad row instead: it is counted, and kept nowhere.
+    # Nothing is dropped: a value that does not fit, or a new column, is rescued and the row loads.
     builtin = {r.name: r.action for r in compile_rules(config) if r.origin != "declared"}
-    assert builtin == {"cast_thing_id": "drop", "schema_conformance": "drop"}
+    assert builtin == {"cast_thing_id": "warn", "schema_conformance": "warn"}
     # Registry: no quarantine table, flow, or link; the dataflow records none.
     rows = object_rows(config)
     assert not any("quarantine" in row["full_name"] for row in rows)
@@ -47,6 +54,71 @@ def test_nothing_defined_means_no_quarantine_at_all(tmp_path: Path) -> None:
     assert (
         '"quarantine": null' in record["config_json"] or "quarantine" not in record["config_json"]
     )
+
+
+def test_a_new_column_is_rescued_and_loaded_when_there_is_no_quarantine(tmp_path: Path) -> None:
+    config, _ = registered(tmp_path, spec())
+    actions = {r.name: r.action for r in compile_rules(config)}
+    assert actions["schema_conformance"] == "warn"
+
+
+def test_the_user_asking_for_quarantine_or_drop_decides_what_happens_to_a_rescued_row(
+    tmp_path: Path,
+) -> None:
+    quarantined, _ = registered(tmp_path, spec(block=True))
+    assert {r.name: r.action for r in compile_rules(quarantined)}["schema_conformance"] == (
+        "quarantine"
+    )
+    dropping = dataclasses.replace(quarantined, on_fail="drop")
+    assert {r.name: r.action for r in compile_rules(dropping)}["schema_conformance"] == "drop"
+
+
+def test_only_a_row_auto_cdc_cannot_apply_is_dropped_and_counted_per_file(tmp_path: Path) -> None:
+    config, _ = registered(tmp_path, spec())
+    assert not has_dropping(config)  # append: a null key still loads, with a warning
+    keyed = dataclasses.replace(config, load_type="scd1", primary_keys=["thing_id"])
+    actions = {r.name: r.action for r in compile_rules(keyed)}
+    assert actions["not_null_thing_id"] == "drop" and has_dropping(keyed)
+
+
+def test_schema_evolution_chooses_what_auto_loader_does_with_a_new_column(tmp_path: Path) -> None:
+    from lakeflow_framework.load import get_strategy
+    from test_infer_columns import bare_config
+
+    expected = {
+        "rescue": "rescue",
+        "add_new_columns": "addNewColumns",
+        "fail": "failOnNewColumns",
+        "none": "none",
+    }
+    default = bare_config(tmp_path)
+    assert default.schema_evolution == "rescue"
+    assert "schema_evolution" not in default.canonical()["source_to_raw"]["source"]
+    for name, mode in expected.items():
+        config = bare_config(
+            tmp_path, f"  raw_path: things/\n  format: csv\n  schema_evolution: {name}\n"
+        )
+        options = get_strategy("volume_files").options(config)
+        assert options["cloudFiles.schemaEvolutionMode"] == mode
+        assert config_from_document(config.canonical()).schema_evolution == name
+
+
+def test_schema_evolution_is_refused_for_a_value_it_does_not_know_or_a_format_with_its_own_columns(
+    tmp_path: Path,
+) -> None:
+    from lakeflow_framework import ConfigValidationError
+    from test_infer_columns import bare_config
+
+    with pytest.raises(ConfigValidationError, match="schema_evolution must be one of"):
+        bare_config(tmp_path, "  raw_path: things/\n  format: csv\n  schema_evolution: guess\n")
+    with pytest.raises(ConfigValidationError, match="schema_evolution applies to"):
+        bare_config(tmp_path, "  raw_path: things/\n  format: parquet\n  schema_evolution: fail\n")
+
+
+def test_a_table_whose_only_added_check_warns_needs_no_file_dataset(tmp_path: Path) -> None:
+    config, _ = registered(tmp_path, spec())
+    bare = dataclasses.replace(config, columns=[])
+    assert not has_dropping(bare) and not has_file_counts(bare)
 
 
 def test_the_manifest_round_trip_does_not_invent_a_quarantine(tmp_path: Path) -> None:
@@ -137,3 +209,23 @@ def test_a_table_without_quarantine_does_not_take_another_tables_error() -> None
     by_flow = {row["dataflow"]: row for row in rows}
     assert "other table broke" not in by_flow["abs_accounting"]["failure_reason"]
     assert "other table broke" in by_flow["abs_other"]["failure_reason"]
+
+
+def test_a_file_that_loaded_rows_with_rescued_values_is_flagged_warning() -> None:
+    from lakeflow_framework.pipeline_metrics import read_files_sql, warning_text
+
+    row = {
+        "_file_load": True,
+        "batch_id": "b1",
+        "target_table": "c.s.t",
+        "started_at": None,
+    }
+    assert "_rescued_data IS NOT NULL" in read_files_sql(row, rescued=True)
+    assert "_rescued_data" not in read_files_sql(row, rescued=False)
+    assert "sum(warned) AS rows_warned" in read_files_sql(row, rescued=True)
+    item = {"status": "WARNING", "rows_warned": 9, "failed_rules": "schema_conformance"}
+    assert warning_text(item) == (
+        "9 row(s) loaded with a warning: schema_conformance (values kept in _rescued_data)"
+    )
+    assert warning_text({"status": "PROCESSED", "rows_warned": 0}) is None
+    assert "rows_warned" in files_sql("c.s.staged", [])

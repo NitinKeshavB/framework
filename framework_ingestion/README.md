@@ -91,7 +91,7 @@ The spec's `raw_to_bronze` section holds the bronze table, keys, columns, and qu
 
 | `load_type` | What bronze holds | Needs | Notes |
 | --- | --- | --- | --- |
-| `insert_only` | Every row, appended. The default for files | Nothing | A file read twice is not read twice: Auto Loader remembers it |
+| `append` | Every row, appended. The default for files | Nothing | A file read twice is not read twice: Auto Loader remembers it |
 | `scd1` | The latest row per key (an upsert) | `primary_keys` and `watermark_column`; `dedup: true` means the same | `delete_when` keeps a deleted row and flags it (below) |
 | `scd2` | Every version of a row: `__START_AT`, `__END_AT`, and the current row has `__END_AT` empty | `primary_keys` and `watermark_column` | A new version opens only when the data changes, never because a load stamped it again |
 | `full_refresh` | A database table, which follows `source.mode` | The foreign table | With `primary_keys`, a row the source dropped stays, closed (its last version has `__END_AT` set), instead of being deleted. Without keys the table is replaced each run |
@@ -126,7 +126,7 @@ A quarantine table is created only when the spec asks for one:
 | --- | --- | --- |
 | `rules:` (with or without `on_fail`) | `<bronze table>_qrntn` beside bronze, or as the `quarantine:` block says | Follows `raw_to_bronze.on_fail` (default `quarantine`) |
 | Only a `quarantine:` block | As the block says | Quarantined |
-| None of these | None, and no quarantine flow | Dropped, counted in `rows_dropped` |
+| None of these | None, and no quarantine flow | No row is dropped (a table that keeps rows by key drops a row with a null key, counted in `rows_dropped`). A row with a new column, or a value that does not fit, is loaded with the values in `_rescued_data`, and its file shows `WARNING` |
 
 All three are optional: a table that needs no quarantine leaves out `rules`, `on_fail`, and the `quarantine:` block. `on_fail` sets what happens to a row that fails a rule, so it needs `rules`: `./run.sh generate` refuses a spec with `raw_to_bronze.on_fail` and no rules.
 
@@ -284,7 +284,7 @@ This bundle reads from the raw volume. It does not copy files from SFTP or Share
 
 ## Known gaps
 
-- Run on a real workspace: file loads from a volume with Auto Loader on a schedule, the manifest and pipeline upload, the per-update ledger (a load, and a run with no new files), the audit columns, the change feed on `insert_only` bronze, the silver reader in both modes, and registry descriptions.
+- Run on a real workspace: file loads from a volume with Auto Loader on a schedule, the manifest and pipeline upload, the per-update ledger (a load, and a run with no new files), the audit columns, the change feed on `append` bronze, the silver reader in both modes, and registry descriptions.
 - Not yet run on a workspace: the file-arrival trigger, a database source (no foreign catalog yet, so database soft deletes are tested only with unit tests and a stand-in table), `scd1`, `scd2` and `delete_when` on files, and the ledger row for a run that fails.
 - Rebuilding a bronze table (a full refresh) resets its change feed, so every silver table that reads it must rebuild too (see "Silver reads only what is new").
 - `fixed_width` and `yaml` files are not supported from a raw volume yet.

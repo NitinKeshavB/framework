@@ -109,23 +109,26 @@ resources:
       parameters:
         - name: table # the bronze table's full name (its pipeline id works too)
           default: "${var.catalog}.<bronze_schema>.<table>"
-        - name: mode # files, dates, failed or full_refresh
-          default: files
-        - name: files # full volume paths, comma-separated (mode files)
+        - name: mode # backfill: files | dates | failed | full_refresh. rescue: read files again to put rescued values back
+          default: "<files|dates|failed|rescue|full_refresh>"
+        - name: files # full volume paths, comma-separated (modes files and rescue)
           default: "/Volumes/${var.catalog}/<raw_schema>/<volume>/<folder>/<file>.csv"
         - name: date_from # arrival time, YYYY-MM-DD or YYYY-MM-DD HH:MM (mode dates)
           default: ""
         - name: date_to
           default: ""
-        - name: dry_run # true lists the files and changes nothing
+        - name: dry_run # true | false. true lists the files and changes nothing
           default: "true"
-        - name: confirm # true is needed for full_refresh and for no selector at all
+        - name: confirm # true | false. true is needed for full_refresh and for no selector at all
           default: "false"
-        - name: on_fail # quarantine, drop, warn or fail for this run only. Empty keeps the table's own
+        - name: on_fail # quarantine | drop | warn | fail for this run only. Empty keeps the table's own
           default: ""
       tasks:
         - task_key: backfill
           environment_key: framework_env
+          # A reload deletes and rewrites rows, so a failure is never retried on its own: the
+          # ledger says what happened and someone decides.
+          max_retries: 0
           spark_python_task:
             python_file: ../src/backfill.py
             parameters:

@@ -117,6 +117,28 @@ def test_only_a_job_with_a_table_that_declares_no_columns_gets_the_infer_task(bu
     assert [env["environment_key"] for env in job["environments"]] == ["framework_env"]
 
 
+def test_a_table_that_adds_new_columns_has_its_registry_refreshed_after_every_run(
+    bundle: Path,
+) -> None:
+    path = _add_table(
+        bundle,
+        "notes",
+        "collections",
+        **{"raw_path: notes/": "raw_path: notes/\n  schema_evolution: add_new_columns"},
+    )
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text[: text.index("  dedup: true")] + text[text.index("quarantine:") :], encoding="utf-8"
+    )
+    generate(bundle)
+    tasks = {task["task_key"]: task for task in _job(bundle)["tasks"]}
+    assert list(tasks) == ["refresh_pipeline", "infer_columns_refresh"]
+    assert tasks["infer_columns_refresh"]["spark_python_task"]["parameters"][2:] == [
+        "--refresh",
+        "billing_notes",
+    ]
+
+
 def test_a_job_with_a_fail_rule_gets_a_task_that_parks_blocked_files_even_after_a_failure(
     bundle: Path,
 ) -> None:

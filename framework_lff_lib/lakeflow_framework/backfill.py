@@ -9,6 +9,9 @@ Modes:
 - ``files``: the named files.
 - ``dates``: files that arrived (were last modified) between ``date_from`` and ``date_to``.
 - ``failed``: files whose latest ``ledger_detail`` status is FAILED, to try them again.
+- ``rescue``: the named files, read again once the table has gained the column they rescued. A column
+  the table still lacks goes back into ``_rescued_data`` and the file is recorded with a warning, so the
+  same files can be run again later. A value that does not fit its column's type is rescued again.
 - ``full_refresh``: every file again, by refreshing the table's own pipeline with a full refresh.
 
 With none of ``files``, ``dates`` or ``failed``, the selector is empty, which means every file in the
@@ -33,7 +36,9 @@ from typing import Any
 
 from lakeflow_framework.config import (
     BACKFILLED_FOLDER,
+    BATCH_ID,
     FAILED_FOLDER,
+    RESCUED_DATA,
     RULE_ACTIONS,
     SRC_FILE_NAME,
     SRC_FILE_PATH,
@@ -81,7 +86,7 @@ from lakeflow_framework.volume_listing import list_volume_files
 
 log = logging.getLogger(__name__)
 
-MODES = ("files", "dates", "failed", "full_refresh")
+MODES = ("files", "dates", "failed", "rescue", "full_refresh")
 STATE_VOLUME = "backfill_state"
 LAYER = "bronze"
 _FILE_NAME = re.compile(r"^[^/\\{}*?\[\]]+$")
@@ -144,12 +149,17 @@ class Result:
     restored: list[str] = field(default_factory=list)  # files moved back out of _failed to reload
     parked: list[str] = field(default_factory=list)  # files still blocked, moved into _failed again
     set_aside: list[str] = field(default_factory=list)  # loaded here, not read by the pipeline yet
+    not_in_table: list[str] = field(default_factory=list)  # mode rescue: kept in _rescued_data
+    not_in_file: list[str] = field(
+        default_factory=list
+    )  # mode rescue: the table has, the file lacks
+    error: str = ""  # why the load stopped, when it did
 
 
 def is_pattern(value: str) -> bool:
     """True for a value still holding a ``<placeholder>`` the job's default put there."""
 
-    return bool(re.search(r"<[A-Za-z_]+>", value or ""))
+    return bool(re.search(r"<[^<>\s]+>", value or ""))
 
 
 def parse_selection(
@@ -163,23 +173,28 @@ def parse_selection(
     """
 
     mode = (mode or "").strip().lower()
+    if is_pattern(mode):
+        raise BackfillError(
+            f"mode still holds the pattern {mode!r}: choose one of {', '.join(MODES)}"
+        )
     if mode not in MODES:
         raise BackfillError(f"mode must be one of {', '.join(MODES)}, not {mode!r}")
     names = tuple(name.strip() for name in (files or "").split(",") if name.strip())
     # The job's default for ``files`` is a pattern (<raw_schema>, <volume> ...) for the user to edit.
     # In mode files it must have been edited. In any other mode it is not an answer, so it is ignored.
     unedited = [name for name in names if is_pattern(name)]
-    if unedited and mode == "files":
+    if unedited and mode in {"files", "rescue"}:
         raise BackfillError(
             f"files still holds the pattern {unedited[0]!r}: replace the parts in <angle brackets> "
-            "with a real volume path, or clear files to reload every file (with confirm)"
+            "with a real volume path"
+            + (", or clear files to reload every file (with confirm)" if mode == "files" else "")
         )
     if unedited:
         names = tuple(name for name in names if not is_pattern(name))
     start, end = (date_from or "").strip() or None, (date_to or "").strip() or None
-    if mode == "files":
+    if mode in {"files", "rescue"}:
         if start or end:
-            raise BackfillError("mode files takes file names, not dates; use mode dates")
+            raise BackfillError(f"mode {mode} takes file names, not dates; use mode dates")
         for name in names:
             if name.startswith("/"):
                 if not _FILE_PATH.match(name) or "/../" in name or "/./" in name:
@@ -191,6 +206,10 @@ def parse_selection(
                 raise BackfillError(
                     f"{name!r} is not a file name or a full volume path: no patterns or folders"
                 )
+        if mode == "rescue" and not names:
+            raise BackfillError(
+                "mode rescue needs the files to read again: put their full volume paths in files"
+            )
         return Selection(mode, files=names)
     if names:
         raise BackfillError(f"mode {mode} does not take file names")
@@ -212,7 +231,7 @@ def reader_filters(selection: Selection) -> dict[str, str]:
     """File-source options that pick the files. Dates are arrival (modification) times."""
 
     options: dict[str, str] = {}
-    if selection.mode == "files" and selection.files:
+    if selection.mode in {"files", "rescue"} and selection.files:
         # The source filters on a file's name. A file given by full path is then picked out exactly
         # in ``_load``, because another folder can hold a file with the same name.
         names = dict.fromkeys(item.rsplit("/", 1)[-1] for item in selection.files)
@@ -348,7 +367,7 @@ def plan_files(spark: Any, config: PipelineConfig, selection: Selection) -> list
         else None
     )
     # No names means every file, not none.
-    chosen = selection.mode == "files" and bool(selection.files)
+    chosen = selection.mode in {"files", "rescue"} and bool(selection.files)
     names, paths = set(selection.names), set(selection.paths)
 
     def wanted(path: str) -> bool:
@@ -410,6 +429,114 @@ def _failed_files(spark: Any, config: PipelineConfig) -> list[dict[str, Any]]:
     return [{"path": str(row["path"]), "arrived": None, "bytes": None} for row in rows]
 
 
+def _data_columns(spark: Any, config: PipelineConfig) -> list[str]:
+    """The table's own columns: not the ones the framework adds, nor ``_rescued_data``."""
+
+    from lakeflow_framework.metadata import metadata_column_names
+
+    skip = {name.lower() for name in metadata_column_names()} | {RESCUED_DATA}
+    return [name for name in _bronze_columns(spark, config) if name.lower() not in skip]
+
+
+def _bronze_hints(spark: Any, config: PipelineConfig) -> str:
+    """The table's column types, as Auto Loader hints, for a table that declares none.
+
+    The pipeline reads a value that does not fit its column into ``_rescued_data``. A reload that
+    inferred its own types would read the same value as text and fail to write it, so it reads
+    with the table's types as the pipeline does.
+    """
+
+    from lakeflow_framework.load import HINT_FORMATS
+    from lakeflow_framework.metadata import metadata_column_names
+
+    if config.columns or config.fixed_columns or config.file_format not in HINT_FORMATS:
+        return ""
+    skip = {name.lower() for name in metadata_column_names()} | {RESCUED_DATA}
+    try:
+        fields = spark.table(config.table_name("bronze")).schema.fields
+    except Exception:
+        log.exception("could not read the table's types: the reload infers its own")
+        return ""
+    return ", ".join(
+        f"`{field.name}` {field.dataType.simpleString()}"
+        for field in fields
+        if field.name.lower() not in skip
+    )
+
+
+def _bronze_columns(spark: Any, config: PipelineConfig) -> list[str]:
+    return [str(name) for name in spark.table(config.table_name("bronze")).columns]
+
+
+def _still_rescued(spark: Any, config: PipelineConfig, paths: list[str]) -> tuple[int, list[str]]:
+    """After a reload: how many of these files' rows still hold rescued values, and for which columns."""
+
+    rows, names = 0, set()
+    keys = f"filter(map_keys(from_json({RESCUED_DATA}, 'map<string,string>')), key -> key <> '_file_path')"
+    for start in range(0, len(paths), 500):
+        listed = ", ".join(sql_string(path) for path in paths[start : start + 500])
+        found = spark.sql(
+            f"SELECT count(*) AS n, array_distinct(flatten(collect_list(coalesce({keys}, "
+            "CAST(array() AS ARRAY<STRING>))))) AS keys "
+            f"FROM {config.table_name('bronze')} WHERE {RESCUED_DATA} IS NOT NULL "
+            f"AND {SRC_FILE_PATH} IN ({listed})"
+        ).collect()
+        if found:
+            rows += int(found[0]["n"] or 0)
+            names |= {str(key) for key in (found[0]["keys"] or [])}
+    return rows, sorted(names)
+
+
+def _say_what_is_rescued(spark: Any, config: PipelineConfig, result: Result) -> None:
+    """After a reload in mode rescue: say which columns are still kept in ``_rescued_data``."""
+
+    if result.not_in_table:
+        result.warnings.append(
+            f"{len(result.not_in_table)} column(s) in the file(s) are not in the table yet: "
+            f"{', '.join(result.not_in_table)}. Their values are kept in {RESCUED_DATA}. Add them "
+            "to the table (declare them in the spec or set schema_evolution: add_new_columns, "
+            "deploy, run the regular job once), then run this again"
+        )
+    if result.not_in_file:
+        result.warnings.append(
+            f"{len(result.not_in_file)} column(s) the table has are not in the file(s): "
+            f"{', '.join(result.not_in_file)}. They are NULL for these rows"
+        )
+    left, names = _still_rescued(spark, config, result.planned)
+    known = {name.lower() for name in result.not_in_table}
+    other = [name for name in names if name.lower() not in known]
+    if left and other:
+        result.warnings.append(
+            f"rows still hold rescued values for: {', '.join(other)}. A value that does not fit "
+            "its column's type stays rescued: keep the column a string, or change the type and "
+            "run a full_refresh"
+        )
+
+
+def fold_into_rescued(frame: Any, extras: list[str]) -> Any:
+    """Put columns the table does not have back into ``_rescued_data`` and drop them.
+
+    A column that is there now but not in the table cannot be inserted, so its values go where the
+    pipeline would have put them, merged with what Auto Loader already rescued. An empty value is
+    left out, and a row with nothing to rescue keeps ``_rescued_data`` null.
+    """
+
+    def ident(name: str) -> str:
+        return "`" + name.replace("`", "``") + "`"
+
+    pairs = ", ".join(f"{sql_string(name)}, CAST({ident(name)} AS STRING)" for name in extras)
+    merged = (
+        f"map_concat(coalesce(from_json({RESCUED_DATA}, 'map<string,string>'), "
+        "CAST(map() AS MAP<STRING, STRING>)), "
+        f"map_filter(map({pairs}), (key, value) -> value IS NOT NULL))"
+    )
+    dropped = ", ".join([ident(name) for name in extras] + [RESCUED_DATA])
+    return frame.selectExpr(
+        f"* EXCEPT ({dropped})",
+        f"CASE WHEN size({merged}) = 0 THEN NULL ELSE to_json({merged}) END AS {RESCUED_DATA}",
+    )
+
+
 def run_backfill(
     spark: Any,
     catalog: str,
@@ -452,7 +579,7 @@ def run_backfill(
     # A request for files that are not there is a failure to record, not nothing to do. Retrying
     # the failed files (mode failed) with none failed is fine: there is nothing to retry.
     result.none_found = not planned and not result.missing and selection.mode != "failed"
-    if selection.mode in {"files", "failed"} and planned:
+    if selection.mode in {"files", "failed", "rescue"} and planned:
         # Files named by the user (or by the ledger, in mode failed) may be parked in _failed. Only
         # these are brought back. Dates, no selection and a full refresh read the files that are in
         # the folder and leave _failed alone.
@@ -476,9 +603,17 @@ def run_backfill(
         # What is replaced is counted before anything is deleted: the load runs in worker
         # processes, which cannot hand numbers back through memory.
         result.rows_replaced = _count_existing(spark, result.planned, config.table_name("bronze"))
-        _load(spark, config, selection, result, batch=batch, update_id=update_id)
+        try:
+            _load(spark, config, selection, result, batch=batch, update_id=update_id)
+        except Exception as exc:
+            _record_failure(
+                spark, config, result, exc, started=started, update_id=update_id, batch=batch
+            )
+            raise
         # Each micro-batch wrote its files to ledger_detail as it went.
         result.files = _recorded_files(spark, config, update_id)
+        if selection.mode == "rescue":
+            _say_what_is_rescued(spark, config, result)
         recorded = {item["src_file_path"] for item in result.files}
         result.empty = [path for path in result.planned if path not in recorded]
     blocked = blocked_files(result)
@@ -518,7 +653,7 @@ def run_backfill(
 def _not_found(selection: Selection, planned: list[str]) -> list[str]:
     """What was asked for, as it was given, that is not among the planned files."""
 
-    if selection.mode != "files" or not selection.files:
+    if selection.mode not in {"files", "rescue"} or not selection.files:
         return []
     found = {plain_path(path) for path in planned}
     found_names = {path.rsplit("/", 1)[-1] for path in found}
@@ -547,23 +682,41 @@ def _load(
         **reader_filters(selection),
         "cloudFiles.schemaLocation": f"{state}/schema",
     }
-    if selection.mode == "failed":
+    hints = _bronze_hints(spark, config)
+    if hints:
+        options["cloudFiles.schemaHints"] = hints
+    if selection.mode in {"failed", "rescue"}:
         names = sorted({path.rsplit("/", 1)[-1] for path in result.planned})
         options["pathGlobFilter"] = "{" + ",".join(names) + "}"
     # The source filters on a file's name only. A file given by full path, or taken from the ledger
     # in mode failed, is then picked out exactly, so a file of the same name in another folder is not
     # reloaded with it.
     exact = None
-    if selection.paths or selection.mode == "failed":
+    if selection.paths or selection.mode in {"failed", "rescue"}:
         listed = ", ".join(sql_string(plain_path(path)) for path in result.planned)
         exact = f"regexp_replace({SRC_FILE_PATH}, '^(dbfs|file):', '') IN ({listed})"
     reader = spark.readStream.format("cloudFiles")
     for key, value in options.items():
         reader = reader.option(key, value)
-    staged = stage_frame(
-        reader.load(config.path).selectExpr("*", *file_columns(datetime.now(UTC))), config, batch
-    )
+    read = reader.load(config.path)
     bronze = config.table_name("bronze")
+    if selection.mode == "rescue":
+        # What the files have that the table has not yet goes back into _rescued_data, and the file is
+        # recorded with a warning. Once the table has the column, a later run reads it as a column.
+        have = {name.lower() for name in _bronze_columns(spark, config)}
+        if RESCUED_DATA.lower() not in have:
+            raise BackfillError(
+                f"{bronze} has no {RESCUED_DATA} column: its format carries its own columns"
+            )
+        in_file = {name.lower() for name in read.columns}
+        result.not_in_file = [
+            name for name in _data_columns(spark, config) if name.lower() not in in_file
+        ]
+        extras = [name for name in read.columns if name.lower() not in have]
+        if extras:
+            result.not_in_table = extras
+            read = fold_into_rescued(read, extras)
+    staged = stage_frame(read.selectExpr("*", *file_columns(datetime.now(UTC))), config, batch)
     # A table without rules or a quarantine block has no quarantine table: its bad rows are dropped.
     quarantine = config.table_name("quarantine") if config.has_quarantine else None
     targets = [bronze, quarantine] if quarantine else [bronze]
@@ -593,25 +746,43 @@ def _load(
         ).collect()
         files = [_as_file(row) for row in counted]
         paths = [item["src_file_path"] for item in files]
-        _remove(session, paths, *targets)
         blocked = [item["src_file_path"] for item in files if item["status"] == FILE_FAILED]
-        marked = apply_files(dict(stub), files)["_files"]
-        session.createDataFrame(
-            file_records([{**stub, "_files": marked}], _now()), FILE_SCHEMA
-        ).write.mode("append").saveAsTable(ledger)
         good = frame.filter(f"{DQ_RESULT} = 'pass'")
         if blocked:
             # A blocked file loads nothing: its good rows stay out too. Its bad rows go to quarantine.
             keep = session.createDataFrame([(path,) for path in blocked], f"{SRC_FILE_PATH} STRING")
             good = good.join(keep, SRC_FILE_PATH, "left_anti")
         internal = f"{DQ_COLUMN}, {DQ_RESULT}"
-        _insert(session, good.selectExpr(f"* EXCEPT ({internal})"), bronze)
-        if quarantine:
-            # Same shape as the pipeline's quarantine flow (bronze's types plus failed_rules).
-            bad = quarantine_frame(
-                frame.filter(f"{DQ_RESULT} IN ('fail', 'quarantine')"), config, internal
+        # The new rows are written and checked before anything old is deleted: a load that fails
+        # leaves the table as it was (what was written is taken out again). Only then are the old
+        # rows deleted and the file recorded as loaded.
+        try:
+            _insert(session, good.selectExpr(f"* EXCEPT ({internal})"), bronze)
+            if quarantine:
+                # Same shape as the pipeline's quarantine flow (bronze's types plus failed_rules).
+                bad = quarantine_frame(
+                    frame.filter(f"{DQ_RESULT} IN ('fail', 'quarantine')"), config, internal
+                )
+                _insert(session, bad, quarantine)
+            _check_written(
+                session, bronze, batch, paths, sum(int(i["rows_inserted"] or 0) for i in files)
             )
-            _insert(session, bad, quarantine)
+            if quarantine:
+                _check_written(
+                    session,
+                    quarantine,
+                    batch,
+                    paths,
+                    sum(int(i["rows_quarantined"] or 0) for i in files),
+                )
+        except Exception:
+            _discard(session, paths, batch, *targets)
+            raise
+        _remove(session, paths, *targets, keep_batch=batch)
+        marked = apply_files(dict(stub), files)["_files"]
+        session.createDataFrame(
+            file_records([{**stub, "_files": marked}], _now()), FILE_SCHEMA
+        ).write.mode("append").saveAsTable(ledger)
 
     query = (
         staged.writeStream.foreachBatch(process)
@@ -702,23 +873,109 @@ def _as_file(row: Any) -> dict[str, Any]:
     }
 
 
-def _remove(spark: Any, paths: list[str], *tables: str) -> int:
-    """Delete these files' earlier rows. Returns how many bronze rows were replaced."""
+def _remove(spark: Any, paths: list[str], *tables: str, keep_batch: str | None = None) -> int:
+    """Delete these files' earlier rows. Returns how many bronze rows were replaced.
+
+    With ``keep_batch`` the rows that batch has just written stay: only earlier ones go.
+    """
 
     replaced = 0
+    older = (
+        f" AND ({BATCH_ID} IS NULL OR {BATCH_ID} <> {sql_string(keep_batch)})" if keep_batch else ""
+    )
     for start in range(0, len(paths), 500):
         listed = ", ".join(sql_string(path) for path in paths[start : start + 500])
         for number, table in enumerate(tables):
-            done = spark.sql(f"DELETE FROM {table} WHERE {SRC_FILE_PATH} IN ({listed})").collect()
+            done = spark.sql(
+                f"DELETE FROM {table} WHERE {SRC_FILE_PATH} IN ({listed}){older}"
+            ).collect()
             if number == 0 and done:
                 replaced += int(done[0][0] or 0)
     return replaced
 
 
+def _discard(spark: Any, paths: list[str], batch: str, *tables: str) -> None:
+    """Take out the rows this batch wrote for these files, after a load that did not finish.
+
+    The earlier rows were not touched, so this leaves the table as it was. It never hides the
+    failure that brought it here: if it cannot run, it says so and the failure goes on.
+    """
+
+    for table in tables:
+        for start in range(0, len(paths), 500):
+            listed = ", ".join(sql_string(path) for path in paths[start : start + 500])
+            try:
+                spark.sql(
+                    f"DELETE FROM {table} WHERE {BATCH_ID} = {sql_string(batch)} "
+                    f"AND {SRC_FILE_PATH} IN ({listed})"
+                ).collect()
+            except Exception:
+                log.exception("could not take this load's rows out of %s", table)
+
+
+def _check_written(spark: Any, table: str, batch: str, paths: list[str], expected: int) -> None:
+    """Stop, before anything is deleted or recorded, when the table does not hold the rows counted."""
+
+    held = 0
+    for start in range(0, len(paths), 500):
+        listed = ", ".join(sql_string(path) for path in paths[start : start + 500])
+        found = spark.sql(
+            f"SELECT count(*) AS n FROM {table} WHERE {BATCH_ID} = {sql_string(batch)} "
+            f"AND {SRC_FILE_PATH} IN ({listed})"
+        ).collect()
+        held += int(found[0][0] or 0) if found else 0
+    if held != expected:
+        raise BackfillError(
+            f"{table} holds {held} of the {expected} row(s) this load counted, so it is not "
+            "recorded as loaded"
+        )
+
+
 def _insert(spark: Any, frame: Any, table: str) -> None:
+    # A column the table has and the file lacks is NULL for these rows, written out.
+    have = {name.lower() for name in frame.columns}
+    absent = [field for field in spark.table(table).schema.fields if field.name.lower() not in have]
+    if absent:
+        frame = frame.selectExpr(
+            "*",
+            *[
+                f"CAST(NULL AS {field.dataType.simpleString()}) AS `{field.name}`"
+                for field in absent
+            ],
+        )
     view = f"_backfill_rows_{uuid.uuid4().hex}"
     frame.createOrReplaceTempView(view)
     spark.sql(f"INSERT INTO {table} BY NAME SELECT * FROM {view}")
+
+
+def _root_message(exc: BaseException) -> str:
+    """The cause of a failure in a line: a streaming query wraps it in pages of its own text."""
+
+    found = re.findall(r"(\w+(?:Exception|Error)): (.+)", str(exc))
+    if found:
+        kind, text = found[-1]
+        return f"{kind}: {text}"[:400]
+    return (str(exc) or type(exc).__name__)[:400]
+
+
+def _record_failure(
+    spark: Any,
+    config: PipelineConfig,
+    result: Result,
+    exc: BaseException,
+    *,
+    started: datetime,
+    update_id: str,
+    batch: str,
+) -> None:
+    """Record a load that stopped as FAILED, with the files it did finish. The job then fails."""
+
+    result.error = _root_message(exc)
+    try:
+        result.files = _recorded_files(spark, config, update_id)
+        _record(spark, config, result, started=started, update_id=update_id, batch=batch)
+    except Exception:
+        log.exception("could not record the failed backfill %s", update_id)
 
 
 def _record(
@@ -774,6 +1031,8 @@ def _record(
     # written here is the files that left no row of their own: asked for and not there, or read and
     # empty. The job still succeeds; the ledger says it failed.
     row["_files"] = _problem_files(config, result)
+    if result.error:
+        mark_failed(row, f"backfill stopped: {result.error}")
     if row["_files"]:
         row["files_read"] += len(row["_files"])
         row["files_failed"] += len(row["_files"])
@@ -937,7 +1196,13 @@ def warning_text(result: Result) -> str:
     if result.dry_run:
         shown = result.planned[:MAX_LISTED]
         more = len(result.planned) - len(shown)
-        noun = "table(s) would be reset" if result.mode == "full_refresh" else "file(s) selected"
+        noun = (
+            "table(s) would be reset"
+            if result.mode == "full_refresh"
+            else "file(s) to read again"
+            if result.mode == "rescue"
+            else "file(s) selected"
+        )
         text = (
             f"DRY RUN {result.table}: {len(result.planned)} {noun}"
             + (":\n  " + "\n  ".join(shown) if shown else "")
@@ -956,7 +1221,7 @@ def warning_text(result: Result) -> str:
             text += f"\nWARNING: not found, would be recorded FAILED: {', '.join(result.missing)}"
         if result.none_found:
             text += "\nWARNING: no file found for this request, would be recorded FAILED"
-        return text
+        return text + "".join(f"\nWARNING: {warning}" for warning in result.warnings)
     if result.mode == "full_refresh":
         text = (
             f"{result.table}: full refresh update {result.update_id} {result.update_state.lower()}"

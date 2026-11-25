@@ -25,7 +25,7 @@ FILE_EVENT_METHODS = ("autoloader", "volume_files")
 # Liquid clustering takes up to four keys, and none of these types.
 MAX_CLUSTER_KEYS = 4
 # How bronze takes its rows. The audit columns a table carries depend on this.
-LOAD_TYPES = ("insert_only", "scd1", "scd2", "full_refresh")
+LOAD_TYPES = ("append", "scd1", "scd2", "full_refresh")
 MAX_DESCRIPTION_CHARS = 1024
 
 # Audit columns the pipeline adds to bronze and quarantine. They are not data, so none of them
@@ -88,6 +88,17 @@ FAILED_FOLDER = "_failed"
 # does not read it again. Also reserved: no table reads it.
 BACKFILLED_FOLDER = "_backfilled"
 INFER_SCHEMA_MODES = ("typed", "strings")
+# What Auto Loader does when a file brings a column the table does not have.
+# rescue keeps its values in _rescued_data and the schema stays. add_new_columns makes it a
+# column (the update stops once and the retry reads it). fail stops the update until the
+# column is dealt with. none ignores the column.
+SCHEMA_EVOLUTION = {
+    "rescue": "rescue",
+    "add_new_columns": "addNewColumns",
+    "fail": "failOnNewColumns",
+    "none": "none",
+}
+SCHEMA_EVOLUTION_FORMATS = frozenset({"csv", "delimited", "json"})
 # The text formats, where Auto Loader chooses the column types. Parquet and Avro carry their own.
 INFER_SCHEMA_FORMATS = frozenset({"csv", "delimited", "json"})
 SECRET_PARTS = ("account_key", "access_key", "secret", "password", "token")
@@ -168,6 +179,7 @@ class FileSourceOptions:
     json_multiline: bool = False
     file_events: bool = False
     expect_file: bool = False
+    schema_evolution: str = "rescue"
     infer_schema: str | None = None
     fixed_columns: list[FixedColumn] = field(default_factory=list)
 
@@ -228,12 +240,14 @@ class PipelineConfig:
     # rows, is recorded FAILED in the ledger (the job still succeeds). On by default for a table
     # in a scheduled delivery.
     expect_file: bool = False
+    # What happens when a file brings a column the table does not have (see SCHEMA_EVOLUTION).
+    schema_evolution: str = "rescue"
     # How Auto Loader types the columns of a spec that declares none: "typed" infers real types,
     # "strings" keeps every column a string. None leaves it as before (typed). Meaningless once
     # ``columns`` are declared, and refused then.
     infer_schema: str | None = None
     cluster_by: list[str] = field(default_factory=list)
-    load_type: str = "insert_only"
+    load_type: str = "append"
     delete_when: str | None = None
     description: str = ""
     quarantine_description: str = ""
@@ -381,6 +395,11 @@ class PipelineConfig:
             _put(source, "multiline", True if self.json_multiline else None)
             _put(source, "file_events", True if self.file_events else None)
             _put(source, "expect_file", True if self.expect_file else None)
+            _put(
+                source,
+                "schema_evolution",
+                self.schema_evolution if self.schema_evolution != "rescue" else None,
+            )
             _put(source, "infer_schema", self.infer_schema)
             if self.fixed_columns:
                 source["fixed_columns"] = [
@@ -979,6 +998,7 @@ def _validate_one(document: dict[str, Any], label: str) -> tuple[list[str], Pipe
         json_multiline=file_options.json_multiline if file_options else False,
         file_events=file_options.file_events if file_options else False,
         expect_file=file_options.expect_file if file_options else False,
+        schema_evolution=file_options.schema_evolution if file_options else "rescue",
         infer_schema=file_options.infer_schema if file_options else None,
         cluster_by=cluster_by,
         on_fail=on_fail,
@@ -1018,6 +1038,7 @@ _FILE_ONLY_KEYS = frozenset(
         "multiline",
         "file_events",
         "expect_file",
+        "schema_evolution",
         "infer_schema",
         "max_files_per_trigger",
         "fixed_columns",
@@ -1139,6 +1160,18 @@ def _parse_file_source(
         expect_file = False
         ok = False
 
+    schema_evolution = source.get("schema_evolution", "rescue")
+    if schema_evolution not in SCHEMA_EVOLUTION:
+        errors.append(f"{label}: schema_evolution must be one of {', '.join(SCHEMA_EVOLUTION)}")
+        schema_evolution = "rescue"
+        ok = False
+    elif schema_evolution != "rescue" and file_format not in SCHEMA_EVOLUTION_FORMATS:
+        errors.append(
+            f"{label}: schema_evolution applies to {', '.join(sorted(SCHEMA_EVOLUTION_FORMATS))}; "
+            f"{file_format} carries its own columns"
+        )
+        ok = False
+
     infer_schema = source.get("infer_schema")
     if infer_schema is not None:
         if infer_schema not in INFER_SCHEMA_MODES:
@@ -1179,6 +1212,7 @@ def _parse_file_source(
         json_multiline=multiline,
         file_events=file_events,
         expect_file=expect_file,
+        schema_evolution=str(schema_evolution),
         infer_schema=str(infer_schema) if infer_schema else None,
         fixed_columns=fixed_columns,
     )
@@ -1559,7 +1593,7 @@ def _load_type(
     if is_database:
         derived = "full_refresh" if source_mode == "snapshot" else "scd1"
     else:
-        derived = "scd1" if dedup else "insert_only"
+        derived = "scd1" if dedup else "append"
     if value is None:
         return derived
     name = str(value)
@@ -1572,8 +1606,8 @@ def _load_type(
         )
     elif not is_database and name == "full_refresh":
         errors.append(f"{label}: full_refresh is only for database tables")
-    elif not is_database and dedup and name == "insert_only":
-        errors.append(f"{label}: load_type insert_only conflicts with dedup: true")
+    elif not is_database and dedup and name == "append":
+        errors.append(f"{label}: load_type append conflicts with dedup: true")
     else:
         return name
     return derived

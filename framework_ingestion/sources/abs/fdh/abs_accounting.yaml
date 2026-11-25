@@ -1,0 +1,120 @@
+# yaml-language-server: $schema=../../../../.schemas/table-spec.v1.json
+# ABS GL extract: CSV from the abs gl_source_extract volume to bronze, every column as a string.
+# Not written here, because ../source.yaml and the folder already say it: domain, layer, the raw
+# schema (abs_raw), delivery and job (abs_daily), requested_by and team (fdh). Set one here only
+# to override it.
+
+spec_version: 1
+pipeline_id: abs_accounting        # must start with the source system name: abs_, and be unique
+data_domain: gl_accounting           # identifier: letters, digits, underscore
+description: General ledger extract from the abs gl_source_extract volume, all columns as text.
+delivery: evening
+
+# Who owns and hears about this table. Without these the source owner (sonia.rajeev@...) is used.
+technical_owner: nitinkeshav.bolla@allianz.com.au
+notify:
+  on_failure:                        # default is the technical owner
+    - nitinkeshav.bolla@allianz.com.au
+    - chethan.chandrashekar@allianz.com.au
+  # on_success: []
+
+# Sensitivity of this table's data.
+data:
+  classification: confidential # internal | confidential | highly_confidential
+  pii:                               # pii_health | pii_basic | pii_finance | pii_biometric | pii_personal
+    - pii_finance
+
+# The files: /Volumes/<catalog>/abs_raw/<volume>/<raw_path>. The catalog comes from the bundle.
+source:
+  volume: finance_source_extract          # a volume in the abs_raw schema
+  # raw_path: month_end/             # a folder inside the volume; omitted: the files are in the volume itself
+  format: csv                        # csv | delimited | text | json | parquet | avro | excel
+  delimiter: ","                     # required for csv and delimited
+  header: true                       # default true
+  # max_files_per_trigger: 100
+  path_glob: "*.csv"
+  schema_evolution: add_new_columns          # rescue|add_new_columns|fail|none
+
+raw_to_bronze:
+  bronze:
+    schema: abs_bronze               # default is <source>_bronze
+    table: accounting_abs          # default is the pipeline_id
+  # How rows are taken: append (append) | scd1 (upsert on primary_keys) | scd2 (keep history)
+  # | full_refresh (database tables). Omitted: append for files.
+  load_type: append
+
+#   description: Rides that failed a quality rule, with the names of the rules in failed_rules.
+
+# ==================================================================================================
+# EVERY OPTION OF A TABLE SPEC (reference: all commented out, the settings above are the live ones)
+# ==================================================================================================
+# spec_version: 1                    # always 1
+# pipeline_id: abs_gl                # must start with the source system name, unique
+# description: ...                   # what the table holds; becomes the table comment, max 1024
+# data_domain: gl_accounting         # letters, digits, underscore
+# extends: profiles/<name>           # shared defaults (see profiles/README.md)
+# delivery: daily                    # only when the source has several deliveries
+# requested_by: fdh                  # defaults to the folder the spec sits in
+# technical_owner: someone@company   # who owns the table; defaults to the source owner
+# notify:
+#   on_failure: [someone@company]    # default is the technical owner
+#   on_success: []
+# data:
+#   classification: internal         # internal | confidential | highly_confidential
+#   pii: [pii_finance]               # pii_health | pii_basic | pii_finance | pii_biometric | pii_personal
+#
+# source:                            # files from a volume of the source's raw schema
+#   volume: gl_source_extract
+#   raw_path: month_end/             # a folder inside the volume
+#   format: csv                      # csv | delimited | text | json | parquet | avro | excel
+#   delimiter: ","                   # csv and delimited
+#   header: true                     # csv and delimited (default true)
+#   header_rows: 1                   # excel: 0 or 1
+#   data_address: "Sheet1!A1"        # excel
+#   path_glob: "*.csv"               # only files whose name matches
+#   multiline: false                 # json: a document spread over several lines
+#   file_events: false               # use file events instead of listing the folder
+#   expect_file: true                # every run must bring a file with rows. None, or an empty file,
+#                                    # is recorded FAILED in the ledger; the job still succeeds.
+#                                    # Default: true in a scheduled delivery, false otherwise
+#   max_files_per_trigger: 100       # files read per batch
+# source:                            # OR a table in a database (database sources)
+#   table: dbo.customers
+#   mode: snapshot                   # snapshot (mirror; with primary_keys a dropped row is kept, closed) | merge
+#
+# raw_to_bronze:
+#   bronze:
+#     schema: abs_bronze             # default <source>_bronze
+#     table: gl_abs                  # default the pipeline_id
+#     cluster_by: [ride_id]          # up to 4 columns; _ingest_timestamp is always added
+#   load_type: append           # append | scd1 | scd2 | full_refresh
+#   primary_keys: [ride_id]          # scd1, scd2, and database snapshot/merge
+#   watermark_column: started_at     # scd1, scd2: the column that orders changes (must be a column below)
+#   dedup: true                      # the older way to say scd1
+#   delete_when: "status = 'DEL'"    # scd1: keep the row and flag _is_deleted instead of removing it
+#   on_fail: quarantine              # optional, needs rules; quarantine | drop | warn | fail,
+#                                    # for every rule. Omit it if the table needs no quarantine
+#   columns:
+#     - name: ride_id
+#       type: string                 # string, int, decimal(18,2), date, timestamp, ...
+#       description: Unique id of the ride
+#       classification: internal     # overrides the table's, for this column
+#       pii: [pii_personal]
+#   rules:
+#     - name: ride_id_present        # letters, digits, underscore; unique in the table
+#       expression: "ride_id IS NOT NULL"
+#       on_fail: quarantine          # optional, only if raw_to_bronze sets no on_fail
+#
+# quarantine:                        # optional: only to change the defaults
+#   schema: abs_quarantine           # default the bronze schema
+#   table: gl_abs_rejects            # default <bronze table>_qrntn
+#   description: ...
+#
+# tables:                            # several tables in one file: shared settings above, one entry each
+#   - name: abs_ledger
+#     source: { path_glob: "*ledger*.csv" }
+#
+# Added to every bronze and quarantine table by the framework, with no setting: _src_file_path,
+# _src_file_name, _src_row_hash, _batch_id, _ingest_timestamp, and _rescued_data for file formats.
+# Checks added by the framework, which follow raw_to_bronze.on_fail: schema_conformance, cast_<column>,
+# not_null_<key> for primary keys. More on rules: framework_ingestion/QUALITY_RULES.md.

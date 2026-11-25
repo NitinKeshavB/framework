@@ -59,7 +59,9 @@ A table that has a `fail` rule or a `drop` rule has a dataset `<pipeline_id>_fil
 
 A table loaded from a **database** has no files, so `fail` there stops the whole run: no row of the run, good ones included, reaches bronze.
 
-The checks the framework adds itself (`schema_conformance`, `cast_<column>`, `not_null_<key>`) follow `raw_to_bronze.on_fail`, or quarantine when it is not set (drop, when the table has no quarantine). With `on_fail: fail` on `raw_to_bronze`, a value that does not fit its column, or an empty key, is treated as a `fail` row.
+The checks the framework adds itself (`schema_conformance`, `cast_<column>`, `not_null_<key>`) follow `raw_to_bronze.on_fail`, or quarantine when it is not set. A table with no quarantine (no `rules`, no `quarantine:` block) loses no row: `schema_conformance`, `cast_<column>` and `not_null_<key>` only **warn**. A row with a new column, or a value that does not fit its column, loads, with the values kept in `_rescued_data`, and its file shows `WARNING` in `ledger_detail` with the number of rows. The one exception is a table that keeps rows by key (`scd1`, `scd2`): a row with a null key or sequence value cannot be applied, so it is dropped and counted in `rows_dropped`. Ask for quarantine, or set `on_fail`, and every added check follows that.
+
+What a new column does is set by `source.schema_evolution` (csv, delimited, json): `rescue` (the default) keeps its values in `_rescued_data`, `add_new_columns` makes it a column, `fail` stops the update, and `none` ignores it. With `on_fail: fail` on `raw_to_bronze`, a value that does not fit its column, or an empty key, is treated as a `fail` row.
 
 Not available yet: a limit such as "fail only when more than 5% of rows are bad".
 
@@ -74,6 +76,32 @@ A scheduled delivery runs whether or not a file arrived, so a table in one **exp
 | A file arrived with rows | as usual | as usual |
 
 A run with a good file and an empty one loads the good one and still records the load `FAILED`. An empty file is reported once, in the run that found it, not again on the next run. "Since the previous run" means since the previous regular run started, so a backfill does not move it. This looks at the volume's file names, sizes and arrival times only; no file is read. This is one rule for every way a load is recorded: the pipeline's own hook, the hourly catch-up (which replays a run whose ledger write was cut off, using the table's spec in the registry) and the backfill job all record a missing or empty file as `FAILED` for a table that expects a file, and as `COMPLETED` (with a warning only) for a table that does not, such as one fired by a file arriving.
+
+### Putting rescued values back into the table
+
+A row that holds something in `_rescued_data` loaded, but the rescued part is not in a column. There are two
+causes, and they are put right differently.
+
+**A column the table did not have** (a new column in the file). Reload the files once the table has the column:
+
+1. Give the table the column: declare it under `columns:` in the spec, or set `source.schema_evolution:
+   add_new_columns`. Deploy.
+2. Run the regular job once, so the table gains the column.
+3. Run `framework_backfill` with `mode: rescue` and the file's full volume path in `files`, first with `dry_run: true`.
+4. Run it again with `dry_run: false`. Each file's rows are replaced (as in any backfill, labelled `backfill`), now with
+   the column filled and `_rescued_data` empty.
+
+If the table still lacks a column the file has, the run does not stop: the file is read again, the column goes back into
+`_rescued_data`, the file shows `WARNING` in `ledger_detail`, and the job output names the column. Run it again once the
+table has the column.
+A file that is no longer in the volume is recorded as not found, as in any backfill. A table that keeps history by
+key (`scd1`, `scd2`) is reloaded with `full_refresh`, not this mode.
+
+**A value that did not fit its column's type.** A reload does not fix it: the column keeps its type, so the same value
+is rescued again. The run says how many rows still hold rescued values, and for which columns. To avoid it, keep the
+column a string in bronze (`source.infer_schema: strings` for a table with no declared columns, or `type: string` for a
+declared column) and cast it downstream. If the type itself is wrong, change it in the spec, deploy, and run the
+backfill in `full_refresh` mode.
 
 ### Reloading files: backfill
 
@@ -297,7 +325,7 @@ The general shapes: `a IS NULL OR <check>` for an optional column, and `CASE WHE
 
 | Rule | Added when | Fails when |
 | --- | --- | --- |
-| `schema_conformance` | A CSV, delimited, JSON or text file | A value did not fit the declared columns, so it was rescued into `_rescued_data` |
+| `schema_conformance` | A CSV, delimited, JSON or text file | A value did not fit the declared columns, or a column appeared that the table does not have, so it was rescued into `_rescued_data`. Warns only when the table has no quarantine |
 | `cast_<column>` | A column is declared | The value cannot be cast to the declared type. For a `string` column this cannot fail |
 | `not_null_<key>` | `primary_keys` is set | A key is empty |
 | `not_null_<watermark_column>` | `scd1` or `scd2` | The ordering column is empty (a change cannot be ordered without it) |

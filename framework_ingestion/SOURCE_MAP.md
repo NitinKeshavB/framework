@@ -7,7 +7,7 @@ spec and regenerate. `./run.sh bundle:validate` regenerates it first.
 
 | Team or project | Tables | Source systems |
 | --- | --- | --- |
-| fdh | 1 | abs |
+| fdh | 2 | abs |
 
 ## finance / abs
 
@@ -17,14 +17,19 @@ Raw schema: `abs_raw`. Files land in a volume here as delivered, and bronze read
 | Delivery | When |
 | --- | --- |
 | daily | cron `0 0 2 * * ?` |
+| evening | cron `0 0 18 * * ?` |
 
 | Table | Delivery | Requested by | Reads | Load | Bronze | Technical owner |
 | --- | --- | --- | --- | --- | --- | --- |
+| abs_accounting | evening | fdh | volume abs_raw.finance_source_extract/ (csv) | volume_files | abs_bronze.accounting_abs | nitinkeshav.bolla@allianz.com.au |
 | abs_gl | daily | fdh | volume abs_raw.gl_source_extract/ (csv) | volume_files | abs_bronze.gl_abs | nitinkeshav.bolla@allianz.com.au |
 
 ```mermaid
 flowchart LR
   abs_daily{{daily}}
+  abs_evening{{evening}}
+  abs_evening -->|fdh| abs_accounting[abs_accounting]
+  abs_accounting --> abs_bronze_accounting_abs[abs_bronze.accounting_abs]
   abs_daily -->|fdh| abs_gl[abs_gl]
   abs_gl --> abs_bronze_gl_abs[abs_bronze.gl_abs]
 ```

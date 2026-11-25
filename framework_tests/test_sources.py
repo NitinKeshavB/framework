@@ -265,7 +265,7 @@ def test_the_batch_id_is_one_value_for_the_whole_run() -> None:
 
 
 def test_load_type_is_derived_from_the_older_settings_and_checked(tmp_path: Path) -> None:
-    assert _config(tmp_path, FILE_SOURCE, "a.yaml", _volume_spec()).load_type == "insert_only"
+    assert _config(tmp_path, FILE_SOURCE, "a.yaml", _volume_spec()).load_type == "append"
     dedup = _volume_spec(
         extra="  dedup: true\n  primary_keys: [thing_id]\n  watermark_column: thing_id"
     )
@@ -279,7 +279,7 @@ def test_load_type_is_derived_from_the_older_settings_and_checked(tmp_path: Path
         ("  load_type: nope", "load_type must be one of"),
         ("  load_type: full_refresh", "only for database tables"),
         ("  load_type: scd1", "dedup requires primary_keys"),
-        ("  load_type: insert_only\n  dedup: true", "conflicts with dedup"),
+        ("  load_type: append\n  dedup: true", "conflicts with dedup"),
     ):
         with pytest.raises(ConfigValidationError, match=message):
             _config(tmp_path, FILE_SOURCE, "d.yaml", _volume_spec(extra=bad))
@@ -364,7 +364,7 @@ def test_table_descriptions_are_captured_and_become_the_table_comment(tmp_path: 
         if row["object_kind"] in {"streaming_table", "table", "materialized_view"}
     }
     assert records["framework_dev.files_bronze.things"]["description"] == "Things from the files"
-    assert records["framework_dev.files_quarantine.things_qrntn"]["load_type"] == "insert_only"
+    assert records["framework_dev.files_quarantine.things_qrntn"]["load_type"] == "append"
     assert (
         config.content_hash()
         != _config(tmp_path, FILE_SOURCE, "g.yaml", _volume_spec()).content_hash()

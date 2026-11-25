@@ -53,7 +53,7 @@ def test_a_listed_path_matches_the_path_bronze_stores() -> None:
 
 def test_an_unknown_mode_is_refused_with_the_choices() -> None:
     with pytest.raises(
-        BackfillError, match="mode must be one of files, dates, failed, full_refresh"
+        BackfillError, match="mode must be one of files, dates, failed, rescue, full_refresh"
     ):
         parse_selection("everything")
 
@@ -126,12 +126,12 @@ def test_the_job_shows_patterns_for_the_user_to_edit() -> None:
     defaults = job_defaults()
     assert defaults["table"] == "aal_dev_fdh.<bronze_schema>.<table>"
     assert defaults["files"] == "/Volumes/aal_dev_fdh/<raw_schema>/<volume>/<folder>/<file>.csv"
+    # the mode lists every choice, so it must be picked: the default is refused as it stands
+    assert defaults["mode"] == "<files|dates|failed|rescue|full_refresh>"
+    with pytest.raises(BackfillError, match="mode still holds the pattern.*choose one of"):
+        parse_selection(defaults["mode"])
     # nothing else changes: a run is a dry run until someone says otherwise
-    assert (defaults["mode"], defaults["dry_run"], defaults["confirm"]) == (
-        "files",
-        "true",
-        "false",
-    )
+    assert (defaults["dry_run"], defaults["confirm"]) == ("true", "false")
     assert defaults["date_from"] == "" and defaults["date_to"] == ""
 
 
@@ -190,6 +190,7 @@ def test_the_job_has_an_on_fail_parameter_that_is_empty_by_default_and_passed_to
     assert {item["name"]: item["default"] for item in job["parameters"]}["on_fail"] == ""
     task_parameters = job["tasks"][0]["spark_python_task"]["parameters"]
     assert task_parameters[-1] == "{{job.parameters.on_fail}}" and len(task_parameters) == 9
+    assert "rescued_columns" not in {item["name"] for item in job["parameters"]}
 
 
 def test_on_fail_gives_every_rule_and_every_added_check_one_action_for_the_run(
@@ -769,3 +770,293 @@ def test_full_refresh_and_a_run_with_no_selector_need_confirmation(
     dry = backfill.run_backfill(spark, "c", "files_things", Selection("full_refresh"), dry_run=True)
     assert dry.dry_run and any(name.endswith("files_things_staged") for name in dry.planned)
     assert not any(statement.startswith("DELETE") for statement in spark.statements)
+
+
+# --- mode rescue: read named files again, and keep what the table lacks in _rescued_data -------
+
+
+class _Collected:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+    def collect(self) -> list[dict]:
+        return self.rows
+
+
+class _RescueSpark:
+    """bronze has these columns. ``left`` answers the check made after a reload."""
+
+    def __init__(self, columns: list[str], left: list[dict] | None = None) -> None:
+        self.columns, self.left, self.queries = columns, left or [], []
+
+    def table(self, _name: str):
+        return type("Frame", (), {"columns": self.columns})()
+
+    def sql(self, query: str) -> _Collected:
+        self.queries.append(query)
+        return _Collected(self.left)
+
+
+BRONZE_COLUMNS = ["thing_id", "_rescued_data", "_src_file_path"]
+PATH = "/Volumes/c/s/v/things/a.csv"
+
+
+def test_mode_rescued_takes_file_names_and_nothing_else() -> None:
+    named = parse_selection("rescue", "a.csv,/Volumes/c/s/v/things/b.csv")
+    assert named.mode == "rescue" and named.files == ("a.csv", "/Volumes/c/s/v/things/b.csv")
+    with pytest.raises(BackfillError, match="needs the files to read again"):
+        parse_selection("rescue")
+    with pytest.raises(BackfillError, match="takes file names, not dates"):
+        parse_selection("rescue", "a.csv", date_from="2026-11-01")
+    with pytest.raises(TypeError):
+        parse_selection("rescue", "a.csv", rescued_columns="a")  # type: ignore[call-arg]
+
+
+def test_the_files_pattern_the_job_defaults_to_must_be_edited_in_mode_rescued() -> None:
+    pattern = "/Volumes/c/<raw_schema>/<volume>/<folder>/<file>.csv"
+    with pytest.raises(BackfillError, match="still holds the pattern"):
+        parse_selection("rescue", pattern)
+
+
+class _Frame:
+    def __init__(self) -> None:
+        self.exprs: tuple[str, ...] = ()
+
+    def selectExpr(self, *exprs: str):
+        self.exprs = exprs
+        return self
+
+
+def test_columns_the_table_lacks_go_back_into_rescued_data_and_leave_the_row() -> None:
+    frame = _Frame()
+    backfill.fold_into_rescued(frame, ["sample_column_1", "odd`name"])
+    except_list, rescued = frame.exprs
+    assert except_list == "* EXCEPT (`sample_column_1`, `odd``name`, _rescued_data)"
+    assert "map('sample_column_1', CAST(`sample_column_1` AS STRING), 'odd`name'" in rescued
+    assert "map_filter(" in rescued and "value IS NOT NULL" in rescued
+    assert "from_json(_rescued_data, 'map<string,string>')" in rescued  # merged, not replaced
+    assert rescued.startswith("CASE WHEN size(") and rescued.endswith("AS _rescued_data")
+
+
+def test_a_column_the_table_still_lacks_is_a_warning_that_says_to_run_it_again(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    result = Result("files_things", "rescue", planned=[PATH], not_in_table=["sample_column_1"])
+    backfill._say_what_is_rescued(
+        _RescueSpark(BRONZE_COLUMNS, left=[{"n": 9, "keys": ["sample_column_1"]}]), config, result
+    )
+    (warning,) = result.warnings
+    assert "1 column(s) in the file(s) are not in the table yet: sample_column_1" in warning
+    assert "kept in _rescued_data" in warning and "then run this again" in warning
+
+
+def test_a_value_that_does_not_fit_its_type_is_reported_apart_from_a_missing_column(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    result = Result("files_things", "rescue", planned=[PATH], not_in_table=["new_col"])
+    backfill._say_what_is_rescued(
+        _RescueSpark(BRONZE_COLUMNS, left=[{"n": 3, "keys": ["new_col", "started_at"]}]),
+        config,
+        result,
+    )
+    assert len(result.warnings) == 2
+    assert "rows still hold rescued values for: started_at" in result.warnings[1]
+    assert "new_col" not in result.warnings[1]
+
+
+def test_nothing_is_said_when_the_reload_left_nothing_rescued(tmp_path: Path) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    result = Result("files_things", "rescue", planned=[PATH])
+    backfill._say_what_is_rescued(_RescueSpark(BRONZE_COLUMNS), config, result)
+    assert result.warnings == []
+
+
+def _dry_run(tmp_path: Path, monkeypatch, files: str, present=(PATH,)):
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    monkeypatch.setattr(backfill, "load_config", lambda *_args: config)
+    monkeypatch.setattr(
+        backfill,
+        "list_volume_files",
+        lambda *_args: [
+            {"file_path": path, "arrived_at": None, "file_bytes": 1} for path in present
+        ],
+    )
+    monkeypatch.setattr(backfill, "list_parked", lambda _root: [])
+    monkeypatch.setattr(backfill, "list_aside", lambda _root: [])
+    return backfill.run_backfill(
+        _RescueSpark(BRONZE_COLUMNS),
+        "c",
+        "files_things",
+        parse_selection("rescue", files),
+        dry_run=True,
+    )
+
+
+def test_the_dry_run_lists_the_named_files_and_reads_nothing_from_the_table(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result = _dry_run(tmp_path, monkeypatch, "a.csv")
+    assert result.planned == [PATH]
+    assert "1 file(s) to read again" in warning_text(result)
+
+
+def test_a_named_file_that_is_not_there_is_recorded_as_missing(tmp_path: Path, monkeypatch) -> None:
+    result = _dry_run(tmp_path, monkeypatch, "gone.csv", present=())
+    assert result.missing == ["gone.csv"]
+    assert "not found, would be recorded FAILED: gone.csv" in warning_text(result)
+
+
+# --- a backfill never says it loaded what it did not ------------------------------------------
+
+
+class _Field:
+    def __init__(self, name: str, kind: str) -> None:
+        self.name = name
+        self.dataType = type("Type", (), {"simpleString": lambda _self: kind})()
+
+
+class _TypedSpark:
+    """A table with these (name, type) columns. ``count`` answers a count query."""
+
+    def __init__(self, fields: list[tuple[str, str]], count: int = 0) -> None:
+        self.fields, self.count, self.queries = [_Field(*item) for item in fields], count, []
+
+    def table(self, _name: str):
+        fields = self.fields
+        return type(
+            "Table",
+            (),
+            {
+                "schema": type("Schema", (), {"fields": fields})(),
+                "columns": [f.name for f in fields],
+            },
+        )()
+
+    def sql(self, query: str) -> _Collected:
+        self.queries.append(query)
+        return _Collected([(self.count,)])
+
+
+def test_a_table_that_holds_fewer_rows_than_were_counted_is_not_recorded_as_loaded() -> None:
+    spark = _TypedSpark([("a", "string")], count=7)
+    backfill._check_written(spark, "c.s.t", "b1", [PATH], 7)  # as counted: fine
+    with pytest.raises(BackfillError, match="holds 7 of the 9 row"):
+        backfill._check_written(spark, "c.s.t", "b1", [PATH], 9)
+    assert "_batch_id = 'b1'" in spark.queries[0] and "_src_file_path IN" in spark.queries[0]
+
+
+def test_only_rows_an_earlier_load_wrote_are_deleted_after_the_new_ones_are_in() -> None:
+    spark = _TypedSpark([("a", "string")])
+    backfill._remove(spark, [PATH], "c.s.bronze", keep_batch="b1")
+    assert "_batch_id IS NULL OR _batch_id <> 'b1'" in spark.queries[0]
+    backfill._remove(_s := _TypedSpark([("a", "string")]), [PATH], "c.s.bronze")
+    assert "_batch_id" not in _s.queries[0]
+
+
+def test_a_failed_load_takes_its_own_new_rows_out_and_touches_nothing_older() -> None:
+    spark = _TypedSpark([("a", "string")])
+    backfill._discard(spark, [PATH], "b1", "c.s.bronze", "c.s.quarantine")
+    assert [q.split(" WHERE ")[0] for q in spark.queries] == [
+        "DELETE FROM c.s.bronze",
+        "DELETE FROM c.s.quarantine",
+    ]
+    assert all("_batch_id = 'b1'" in query for query in spark.queries)
+
+
+def test_the_new_rows_are_written_and_checked_before_the_old_ones_are_deleted() -> None:
+    import inspect
+
+    source = inspect.getsource(backfill._load)
+    insert, check = source.index("_insert(session, good"), source.index("_check_written(")
+    remove, record = source.index("_remove(session"), source.index("file_records(")
+    assert insert < check < remove < record  # nothing is deleted or recorded before it is proven
+    assert "_discard(session" in source
+
+
+def test_a_column_the_table_has_and_the_file_lacks_is_written_as_null() -> None:
+    spark = _TypedSpark([("ride_id", "string"), ("col1", "double"), ("sample_column_1", "string")])
+    seen: dict = {}
+
+    class Frame:
+        columns = ["ride_id"]
+
+        def selectExpr(self, *exprs: str):
+            seen["exprs"] = exprs
+            return self
+
+        def createOrReplaceTempView(self, name: str) -> None:
+            seen["view"] = name
+
+    backfill._insert(spark, Frame(), "c.s.bronze")
+    assert seen["exprs"] == (
+        "*",
+        "CAST(NULL AS double) AS `col1`",
+        "CAST(NULL AS string) AS `sample_column_1`",
+    )
+    assert spark.queries[-1].startswith("INSERT INTO c.s.bronze BY NAME")
+
+
+def test_a_reload_reads_with_the_tables_own_types_so_a_value_that_does_not_fit_is_rescued(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    undeclared = dataclasses.replace(config, columns=[])
+    spark = _TypedSpark(
+        [
+            ("ride_id", "string"),
+            ("started_at", "timestamp"),
+            ("_rescued_data", "string"),
+            ("_src_file_path", "string"),
+            ("_batch_id", "string"),
+        ]
+    )
+    assert backfill._bronze_hints(spark, undeclared) == "`ride_id` string, `started_at` timestamp"
+    assert backfill._bronze_hints(spark, config) == ""  # declared columns already are the hints
+
+
+def test_a_stopped_load_is_recorded_failed_with_the_cause_not_the_pages_around_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    written: list[dict] = []
+    monkeypatch.setattr(backfill, "write_rows", lambda _s, _c, rows: written.extend(rows) or 1)
+    monkeypatch.setattr(backfill, "_recorded_files", lambda *_a: [])
+    monkeypatch.setattr(backfill, "_known_pipeline", lambda *_a: None)
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    result = Result("files_things", "files", planned=[PATH])
+    error = RuntimeError(
+        "[STREAM_FAILED] Query terminated with exception: [PYTHON_EXCEPTION] Traceback ...\n"
+        "pyspark.errors.exceptions.connect.DateTimeException: [CAST_INVALID_INPUT] The value "
+        "'43:33.0' of the type STRING cannot be cast to TIMESTAMP\nJVM stacktrace:"
+    )
+    backfill._record_failure(
+        _RescueSpark(BRONZE_COLUMNS),
+        config,
+        result,
+        error,
+        started=datetime(2026, 11, 25, tzinfo=UTC),
+        update_id="backfill-1",
+        batch="b1",
+    )
+    (row,) = written
+    assert row["target_status"] == "FAILED"
+    assert row["failure_reason"].startswith(
+        "backfill stopped: DateTimeException: [CAST_INVALID_INPUT]"
+    )
+    assert "STREAM_FAILED" not in row["failure_reason"]
+
+
+def test_the_backfill_task_is_never_retried_on_its_own() -> None:
+    import yaml
+
+    job = yaml.safe_load(JOB.read_text(encoding="utf-8"))["resources"]["jobs"]["framework_backfill"]
+    assert job["tasks"][0]["max_retries"] == 0
+
+
+def test_a_file_that_lacks_columns_the_table_has_says_so(tmp_path: Path) -> None:
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    result = Result("files_things", "rescue", planned=[PATH], not_in_file=["col1", "col2"])
+    backfill._say_what_is_rescued(_RescueSpark(BRONZE_COLUMNS), config, result)
+    assert "2 column(s) the table has are not in the file(s): col1, col2" in result.warnings[0]
+    assert "NULL for these rows" in result.warnings[0]

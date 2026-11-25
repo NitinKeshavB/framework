@@ -699,9 +699,12 @@ def has_blocking(config: PipelineConfig) -> bool:
 
 
 def has_dropping(config: PipelineConfig) -> bool:
-    """True when a rule of this file table drops a row: kept in no table, so no file count can see it."""
+    """True when a rule of this file table drops a row: kept in no table, so no file count can see it.
 
-    return is_file_load(config) and any(rule.action == "drop" for rule in config.active_rules)
+    The checks the framework adds count too: a table with no quarantine drops a row with no key.
+    """
+
+    return is_file_load(config) and any(rule.action == "drop" for rule in compile_rules(config))
 
 
 def has_file_counts(config: PipelineConfig) -> bool:
@@ -754,8 +757,10 @@ def files_sql(
         f"count_if({DQ_RESULT} IN {lost_bad}) AS rows_dropped, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 "
         f"THEN count_if({DQ_RESULT} = 'pass') ELSE 0 END AS rows_blocked, "
+        f"count_if({DQ_RESULT} = 'pass' AND size({DQ_COLUMN}) > 0) AS rows_warned, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN '{FILE_FAILED}' "
-        f"WHEN count_if({DQ_RESULT} <> 'pass') > 0 THEN '{FILE_WARNING}' "
+        f"WHEN count_if({DQ_RESULT} <> 'pass' OR size({DQ_COLUMN}) > 0) > 0 "
+        f"THEN '{FILE_WARNING}' "
         f"ELSE '{FILE_PROCESSED}' END AS {FILE_STATUS}, "
         f"{blockers} AS blocking_rules, "
         f"array_join(array_sort(array_distinct(flatten(collect_list({DQ_COLUMN})))), ', ') "
