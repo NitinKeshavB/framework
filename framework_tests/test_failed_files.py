@@ -610,3 +610,92 @@ def test_copy_into_and_ctas_must_read_a_folder_below_the_volume_root() -> None:
     # Auto Loader on a volume (volume_files) skips the underscore folder itself, so the root is fine
     assert _failed_folder_problem(root, "volume_files") is None
     assert "reserved" in _failed_folder_problem(root + "_failed/x/", "volume_files")
+
+
+# --- a blocked file is parked even when the ledger row was never written -------------------------
+
+
+class _Ledgers:
+    """The ledger says nothing about this run. The pipeline's per-file table names the blocked file."""
+
+    def __init__(self, ledger: list[str], per_file: list[str] | None, queries: list[str]) -> None:
+        self.ledger, self.per_file, self.queries = ledger, per_file, queries
+
+    def sql(self, statement: str) -> _Result:
+        self.queries.append(statement)
+        if "abs_gl_files" in statement:
+            if self.per_file is None:
+                raise RuntimeError("table not found")
+            return _Result([{"src_file_path": path} for path in self.per_file])
+        return _Result([{"src_file_path": path} for path in self.ledger])
+
+
+def _folder_config(monkeypatch, root: Path) -> None:
+    class Config:
+        path = str(root / "invoices") + "/"
+
+    monkeypatch.setattr("lakeflow_framework.backfill.load_config", lambda *_args: Config())
+
+
+def test_the_per_file_table_of_the_pipeline_names_a_blocked_file_the_ledger_has_not_heard_of(
+    volume: Path, monkeypatch
+) -> None:
+    from lakeflow_framework.failed_files import blocked_files_table_sql
+
+    sql = blocked_files_table_sql("aal_dev_fdh", "abs_gl")
+    assert "aal_dev_fdh.framework_meta.abs_gl_files" in sql and "file_status = 'FAILED'" in sql
+    bad = make(volume, "invoices/bad.csv")
+    _folder_config(monkeypatch, volume)
+    spark = _Ledgers(ledger=[], per_file=[str(bad)], queries=[])
+    assert park_failed_files(spark, "aal_dev_fdh", ["abs_gl"]) == {
+        "abs_gl": [str(volume / "_failed" / "invoices" / "bad.csv")]
+    }
+    assert not bad.exists()
+
+
+def test_a_file_both_sources_name_is_moved_once(volume: Path, monkeypatch) -> None:
+    bad = make(volume, "invoices/bad.csv")
+    _folder_config(monkeypatch, volume)
+    spark = _Ledgers(ledger=[str(bad)], per_file=[str(bad)], queries=[])
+    moved = park_failed_files(spark, "aal_dev_fdh", ["abs_gl"])
+    assert moved == {"abs_gl": [str(volume / "_failed" / "invoices" / "bad.csv")]}
+
+
+def test_a_per_file_table_that_cannot_be_read_leaves_the_ledger_to_decide(
+    volume: Path, monkeypatch
+) -> None:
+    bad = make(volume, "invoices/bad.csv")
+    _folder_config(monkeypatch, volume)
+    spark = _Ledgers(ledger=[str(bad)], per_file=None, queries=[])
+    moved = park_failed_files(spark, "aal_dev_fdh", ["abs_gl"])
+    assert moved == {"abs_gl": [str(volume / "_failed" / "invoices" / "bad.csv")]}
+
+
+def test_a_job_records_its_own_update_before_it_parks_and_only_looks_at_its_own_tables() -> None:
+    from lakeflow_framework import load_catchup
+    from lakeflow_framework.pipeline_metrics import Dataflow
+
+    flow = Dataflow(
+        pipeline_id="abs_tax",
+        owner_kind="source_system",
+        owner="abs",
+        staged="s",
+        target="t",
+        quarantine="q",
+    )
+    seen: list[str] = []
+
+    class Spark:
+        def sql(self, statement: str):
+            seen.append(statement)
+            return type("Rows", (), {"collect": lambda _s: []})()
+
+    original = load_catchup._dataflows
+    load_catchup._dataflows = lambda *_a: [flow]
+    try:
+        assert load_catchup._catch_up_job(Spark(), "c", "c.m", "c.e.log", "job", 7, ["abs_gl"]) == 0
+        assert seen == []  # another table's job: no query at all
+        load_catchup._catch_up_job(Spark(), "c", "c.m", "c.e.log", "job", 7, ["abs_tax"])
+        assert any("update_progress" in query for query in seen)  # this job is looked at
+    finally:
+        load_catchup._dataflows = original

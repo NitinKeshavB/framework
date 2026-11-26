@@ -30,6 +30,7 @@ from lakeflow_framework.config import (
     MANIFEST_SETTING,
     MAX_CLUSTER_KEYS,
     RESCUED_DATA,
+    SCHEMA_EVOLUTION_FORMATS,
     SPECS_SETTING,
     SRC_FILE_NAME,
     SRC_FILE_PATH,
@@ -38,7 +39,13 @@ from lakeflow_framework.config import (
     config_from_document,
     validate_configs,
 )
-from lakeflow_framework.load import ROW_HASH_EXPR, _projection, get_strategy, projection_exprs
+from lakeflow_framework.load import (
+    RESCUE_FORMATS,
+    ROW_HASH_EXPR,
+    _projection,
+    get_strategy,
+    projection_exprs,
+)
 from lakeflow_framework.pipeline_metrics import Dataflow, UpdateRecorder
 from lakeflow_framework.pipeline_metrics import install as install_recorder
 from lakeflow_framework.quality import (
@@ -52,6 +59,7 @@ from lakeflow_framework.quality import (
     quarantine_where,
     result_sql,
     valid_where,
+    with_columns,
 )
 from lakeflow_framework.sqlnames import require_catalog, sql_string
 
@@ -358,6 +366,11 @@ def _install_recorder(
                 build_error=error,
                 file_load=is_file_load(config),
                 expect_file=is_file_load(config) and config.expect_file,
+                adds_columns=(
+                    is_file_load(config)
+                    and config.schema_evolution == "add_new_columns"
+                    and config.file_format in SCHEMA_EVOLUTION_FORMATS
+                ),
                 fail_rules=tuple(blocking_rules(compile_rules(config))),
                 blocked_check=blocked_check_name(config) if has_blocking(config) else "",
                 files=(
@@ -707,19 +720,58 @@ def has_dropping(config: PipelineConfig) -> bool:
     return is_file_load(config) and any(rule.action == "drop" for rule in compile_rules(config))
 
 
+def stops_on_drift(config: PipelineConfig) -> bool:
+    """True when a new column in a file stops the update (``schema_evolution: fail``)."""
+
+    return (
+        is_file_load(config)
+        and config.schema_evolution == "fail"
+        and config.file_format in SCHEMA_EVOLUTION_FORMATS
+    )
+
+
+def has_warning(config: PipelineConfig) -> bool:
+    """True when a rule of this file table keeps a row that broke it, with a warning.
+
+    Bronze does not say which rules a row broke, so only the staged rows can tell a file's ledger
+    row which rows were kept in spite of a rule. Only the table's own rules count: a new column or
+    a rescued value shows in ``_rescued_data``, which bronze keeps.
+    """
+
+    return is_file_load(config) and any(rule.action == "warn" for rule in config.active_rules)
+
+
 def has_file_counts(config: PipelineConfig) -> bool:
     """True when the table needs the per-file dataset, for exact counts in ``ledger_detail``.
 
     A blocked file's good rows and a row a ``drop`` rule removed are read and then kept nowhere, so
-    bronze and quarantine cannot give a file's ``rows_read`` or ``rows_dropped``. Only this
-    dataset can. A table that has neither gets no extra dataset.
+    bronze and quarantine cannot give a file's ``rows_read`` or ``rows_dropped``. A row a ``warn``
+    rule kept is in bronze, but nothing there says it broke the rule. Only this dataset can say. A
+    table with none of these gets no extra dataset.
     """
 
-    return has_blocking(config) or has_dropping(config)
+    return has_blocking(config) or has_dropping(config) or has_warning(config)
+
+
+def _rescued_keys(column: str) -> str:
+    """Which columns hold a rescued value in a group of rows, as text."""
+
+    return (
+        # collect_list leaves out a NULL, so a row with nothing rescued adds nothing to the group
+        "array_join(array_sort(array_distinct(flatten(collect_list("
+        f"CASE WHEN {column} IS NOT NULL THEN "
+        f"filter(map_keys(from_json({column}, 'map<string,string>')), key -> key <> '_file_path') END"
+        ")))), ', ')"
+    )
 
 
 def files_sql(
-    staged: str, blocking: list[str], *, this_run: bool = True, quarantine: bool = True
+    staged: str,
+    blocking: list[str],
+    *,
+    this_run: bool = True,
+    quarantine: bool = True,
+    rescued: bool = False,
 ) -> str:
     """One row per file: counts and status, from the staged rows.
 
@@ -746,6 +798,7 @@ def files_sql(
         if blocking
         else "''"
     )
+    keys = _rescued_keys("_rescued_data") if rescued else "''"
     kept_bad = "('fail', 'quarantine')" if quarantine else "('quarantine')"
     lost_bad = "('drop')" if quarantine else "('drop', 'fail')"
     return (
@@ -758,6 +811,7 @@ def files_sql(
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 "
         f"THEN count_if({DQ_RESULT} = 'pass') ELSE 0 END AS rows_blocked, "
         f"count_if({DQ_RESULT} = 'pass' AND size({DQ_COLUMN}) > 0) AS rows_warned, "
+        f"{keys} AS rescued_keys, "
         f"CASE WHEN count_if({DQ_RESULT} = 'fail') > 0 THEN '{FILE_FAILED}' "
         f"WHEN count_if({DQ_RESULT} <> 'pass' OR size({DQ_COLUMN}) > 0) > 0 "
         f"THEN '{FILE_WARNING}' "
@@ -862,6 +916,10 @@ def stage_frame(frame: Any, config: PipelineConfig, batch: str | None = None) ->
     same way whichever loaded it. ``frame`` already has ``file_columns`` added."""
 
     rules = compile_rules(config)
+    # What the file really has decides what is a new column and what a value that did not fit.
+    columns = getattr(frame, "columns", None)
+    if columns is not None:
+        rules = with_columns(rules, columns)
     staged = frame.selectExpr(
         "*", *_audit_exprs(config, batch), f"{failed_rules_sql(rules)} AS {DQ_COLUMN}"
     )
@@ -952,6 +1010,7 @@ def _register(graph: Graph, pipelines: Any, spark: Any, config: PipelineConfig) 
                     staged.name,
                     files_dataset.detail["blocking"],
                     quarantine=config.has_quarantine,
+                    rescued=config.file_format in RESCUE_FORMATS,
                 )
             )
 

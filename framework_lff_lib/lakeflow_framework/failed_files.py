@@ -24,8 +24,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lakeflow_framework.config import BACKFILLED_FOLDER, FAILED_FOLDER
-from lakeflow_framework.sqlnames import require_catalog, sql_string
+from lakeflow_framework.config import BACKFILLED_FOLDER, FAILED_FOLDER, SRC_FILE_PATH
+from lakeflow_framework.sqlnames import require_catalog, require_identifier, sql_string
 from lakeflow_framework.sqlnames import spark_rows as _rows
 
 log = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ PARKING_FOLDERS = (FAILED_FOLDER, BACKFILLED_FOLDER)
 _VOLUME = re.compile(r"^(/Volumes/[\w\-]+/[\w\-]+/[\w\-]+)(/.*)?$")
 # The error_message ledger_detail gives a file blocked by a fail rule (see apply_files).
 BLOCKED_MESSAGE = "blocked by fail rule"
+# A file whose new columns stopped the update (schema_evolution fail). Kept in step with
+# pipeline_metrics.DRIFT_MESSAGE, which writes it.
+DRIFT_MESSAGE = "schema drift"
 LOOKBACK_DAYS = 30
 
 
@@ -216,15 +219,34 @@ def blocked_paths_sql(catalog: str, pipeline_id: str) -> str:
         f"AND src_file_path IS NOT NULL AND recorded_at >= current_timestamp() - INTERVAL "
         f"{LOOKBACK_DAYS} DAYS "
         "QUALIFY row_number() OVER (PARTITION BY src_file_path ORDER BY recorded_at DESC) = 1 "
-        f"AND status = 'FAILED' AND error_message LIKE {sql_string(BLOCKED_MESSAGE + '%')}"
+        f"AND status = 'FAILED' AND (error_message LIKE {sql_string(BLOCKED_MESSAGE + '%')} "
+        f"OR error_message LIKE {sql_string(DRIFT_MESSAGE + '%')})"
+    )
+
+
+def blocked_files_table_sql(catalog: str, pipeline_id: str) -> str:
+    """The files the pipeline's own per-file table says its latest run blocked.
+
+    That table is built during the update, so it knows a blocked file even when the ledger row
+    for the run was never written.
+    """
+
+    from lakeflow_framework.pipeline import FILE_FAILED, FILE_STATUS
+
+    meta = f"{require_catalog(catalog)}.framework_meta"
+    return (
+        f"SELECT {SRC_FILE_PATH} AS src_file_path FROM {meta}.{require_identifier(pipeline_id)}_files "
+        f"WHERE {FILE_STATUS} = {sql_string(FILE_FAILED)}"
     )
 
 
 def park_failed_files(spark: Any, catalog: str, pipeline_ids: list[str]) -> dict[str, list[str]]:
     """Move every blocked file of these tables into its ``_failed`` folder. Returns what moved.
 
-    The ledger is the list: a file moves when its latest status is FAILED for a blocking rule and
-    it is still among the good files. Running it again moves nothing more.
+    A file moves when its latest ledger status is FAILED for a blocking rule, or when the
+    pipeline's own per-file table says its latest run blocked it, and it is still among the
+    good files. The second source does not wait for the ledger row. Running it again moves
+    nothing more.
     """
 
     from lakeflow_framework.backfill import load_config
@@ -233,10 +255,13 @@ def park_failed_files(spark: Any, catalog: str, pipeline_ids: list[str]) -> dict
     for pipeline_id in pipeline_ids:
         config = load_config(spark, catalog, pipeline_id)
         found = _rows(spark.sql(blocked_paths_sql(catalog, pipeline_id)))
+        try:
+            found += _rows(spark.sql(blocked_files_table_sql(catalog, pipeline_id)))
+        except Exception:
+            log.warning("%s: could not read the per-file table; using the ledger only", pipeline_id)
+        paths = list(dict.fromkeys(str(row["src_file_path"]) for row in found))
         moved[pipeline_id] = [
-            str(target)
-            for row in found
-            if (target := move_failed(config.path, str(row["src_file_path"]))) is not None
+            str(target) for path in paths if (target := move_failed(config.path, path)) is not None
         ]
     return moved
 

@@ -56,8 +56,10 @@ def test_a_spec_that_says_nothing_quarantines_exactly_as_before(tmp_path: Path) 
     assert config.on_fail == "quarantine"
     assert {rule.action for rule in config.rules} == {"quarantine"}
     rules = compile_rules(config)
-    assert valid_where(rules) == "size(_dq_failed_rules) = 0"
-    assert quarantine_where(rules) == "size(_dq_failed_rules) > 0"
+    # A new column only warns, so it is the one rule that does not keep a row out of bronze.
+    assert [r.name for r in rules if r.action == "warn"] == ["new_columns"]
+    assert "new_columns" not in valid_where(rules) and "schema_conformance" in valid_where(rules)
+    assert "new_columns" not in quarantine_where(rules)
     assert fail_expectations(rules) == {}
     assert "on_fail" not in config.canonical()["raw_to_bronze"]
     assert all("on_fail" not in r for r in config.canonical()["raw_to_bronze"]["rules"])
@@ -73,6 +75,7 @@ def test_on_fail_on_the_table_sets_every_rule_and_every_built_in_check(tmp_path:
     assert {r.name: r.action for r in compile_rules(config) if r.origin != "declared"} == {
         "cast_thing_id": "drop",
         "schema_conformance": "drop",
+        "new_columns": "warn",  # a new column is rescued and warned, whatever on_fail says
     }
 
 
@@ -84,8 +87,12 @@ def test_on_fail_on_the_rules_sets_only_those_rules(tmp_path: Path) -> None:
         "id_format": "warn",  # its own
     }
     # The framework's own checks: quarantine, since the table sets nothing.
-    builtin = {r.action for r in compile_rules(config) if r.origin != "declared"}
-    assert builtin == {"quarantine"}
+    builtin = {r.name: r.action for r in compile_rules(config) if r.origin != "declared"}
+    assert builtin == {
+        "cast_thing_id": "quarantine",
+        "schema_conformance": "quarantine",
+        "new_columns": "warn",
+    }
 
 
 def test_on_fail_in_both_places_is_refused(tmp_path: Path) -> None:
@@ -204,13 +211,25 @@ def test_a_table_that_drops_rows_gets_the_per_file_dataset_and_nothing_else(
         assert "files" in kinds and "valid" not in kinds and "blocked_check" not in kinds
 
 
-def test_a_table_that_only_quarantines_or_warns_gets_no_per_file_dataset(tmp_path: Path) -> None:
+def test_a_table_that_only_quarantines_gets_no_per_file_dataset(tmp_path: Path) -> None:
     from lakeflow_framework.pipeline import has_file_counts
 
-    for text in (spec(rule_level="quarantine"), spec(rule_level="warn"), spec(table_level="warn")):
+    config, _spark, pipelines = build(tmp_path, spec(rule_level="quarantine"))
+    assert not has_file_counts(config)
+    assert not [name for name in pipelines.names if name.endswith("_files")]
+
+
+def test_a_table_with_a_warn_rule_gets_the_per_file_dataset_to_flag_the_rows_it_kept(
+    tmp_path: Path,
+) -> None:
+    # A row a warn rule kept is in bronze, which does not say it broke the rule. Only the staged
+    # rows do, so the file's ledger row can show WARNING.
+    from lakeflow_framework.pipeline import has_file_counts
+
+    for text in (spec(rule_level="warn"), spec(table_level="warn")):
         config, _spark, pipelines = build(tmp_path, text)
-        assert not has_file_counts(config)
-        assert not [name for name in pipelines.names if name.endswith("_files")]
+        assert has_file_counts(config)
+        assert [name for name in pipelines.names if name.endswith("_files")]
 
 
 def test_a_rule_switched_off_does_not_make_a_table_a_dropping_one(tmp_path: Path) -> None:
@@ -288,3 +307,51 @@ def test_the_registry_records_each_rules_action(tmp_path: Path) -> None:
     rules = {r["name"]: r["action"] for r in json.loads(pipeline["config_json"])["rules"]}
     assert rules["id_present"] == "quarantine" and rules["id_format"] == "warn"
     assert rules["schema_conformance"] == "quarantine"
+
+
+# --- a new column is rescued and warned about, whatever on_fail says -----------------------------
+
+
+def test_a_new_column_never_blocks_a_file_even_on_a_table_set_to_fail(tmp_path: Path) -> None:
+    from lakeflow_framework.quality import blocking_rules
+
+    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec(table_level="fail"))
+    actions = {r.name: r.action for r in compile_rules(config) if r.origin == "schema"}
+    assert actions == {"schema_conformance": "fail", "new_columns": "warn"}
+    # only a value that did not fit blocks the file: the new column is not among the blockers
+    assert "new_columns" not in blocking_rules(compile_rules(config))
+    assert "schema_conformance" in blocking_rules(compile_rules(config))
+
+
+def test_the_two_schema_checks_split_the_rescued_keys_by_the_columns_the_data_has() -> None:
+    from lakeflow_framework.quality import schema_expressions, with_columns
+
+    conforms, no_new = schema_expressions(["ride_id", "Started_At"])
+    assert "array_intersect" in conforms and "array('ride_id', 'started_at')" in conforms
+    assert "array_except" in no_new and "array('_file_path')" in no_new  # the file's own path
+    assert "array('ride_id', 'started_at')" in no_new
+    both = {"schema_conformance": "x", "new_columns": "y", "other": "z"}
+    from lakeflow_framework.quality import CompiledRule
+
+    rules = [CompiledRule(name, expression, "schema") for name, expression in both.items()]
+    swapped = {r.name: r.expression for r in with_columns(rules, ["a", "b"])}
+    assert swapped["other"] == "z" and "array('a', 'b')" in swapped["new_columns"]
+    assert swapped["schema_conformance"] != "x"
+
+
+def test_a_column_name_with_a_quote_cannot_break_the_check() -> None:
+    from lakeflow_framework.quality import schema_expressions
+
+    conforms, _ = schema_expressions(["o'brien"])
+    assert "'o''brien'" in conforms
+
+
+def test_only_a_table_that_rescues_new_columns_has_the_new_columns_check(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    config = _config(tmp_path, FILE_SOURCE, "a.yaml", spec())
+    assert "new_columns" in {r.name for r in compile_rules(config)}
+    for mode in ("add_new_columns", "fail", "none"):
+        other = replace(config, schema_evolution=mode)
+        assert "new_columns" not in {r.name for r in compile_rules(other)}
+        assert "schema_conformance" in {r.name for r in compile_rules(other)}

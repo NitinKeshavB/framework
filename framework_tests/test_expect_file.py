@@ -109,7 +109,16 @@ def test_the_check_lists_the_volume_and_reads_only_the_ledger_tables(
     assert arrivals[0]["has_rows"] is False and arrivals[0]["recorded_before"] is False
     ledger_query = next(q for q in spark.queries if "max(started_at)" in q)
     assert "update_id NOT LIKE 'backfill-%'" in ledger_query  # a backfill does not move it
-    assert all("framework_meta.load_ledger" in q or "ledger_detail" in q for q in spark.queries)
+    # The ledger tables, and one narrow look at the table and its quarantine for a file nobody
+    # counted: it may have been read by an update whose ledger row was never written.
+    others = [
+        q
+        for q in spark.queries
+        if "framework_meta.load_ledger" not in q and "ledger_detail" not in q
+    ]
+    assert len(others) == 2 and all(
+        "_ingest_timestamp >=" in q and "/v/new.csv" in q for q in others
+    )
     assert read_arrivals(spark, "aal_dev_fdh", {**row, "_expect_file": False}, []) is None
 
 

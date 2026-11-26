@@ -202,7 +202,10 @@ def test_on_fail_gives_every_rule_and_every_added_check_one_action_for_the_run(
     assert blocking_rules(compile_rules(config)) == ["id_format"]  # the table's own: fail
     changed = backfill.with_on_fail(config, "quarantine")
     assert blocking_rules(compile_rules(changed)) == []  # nothing blocks a file now
-    assert {rule.action for rule in compile_rules(changed)} == {"quarantine"}
+    assert {r.name: r.action for r in compile_rules(changed) if r.name == "new_columns"} == {
+        "new_columns": "warn"  # a new column is rescued and warned, whatever on_fail says
+    }
+    assert {r.action for r in compile_rules(changed) if r.name != "new_columns"} == {"quarantine"}
     assert [rule.action for rule in config.rules] == [
         "quarantine",
         "fail",
@@ -1060,3 +1063,61 @@ def test_a_file_that_lacks_columns_the_table_has_says_so(tmp_path: Path) -> None
     backfill._say_what_is_rescued(_RescueSpark(BRONZE_COLUMNS), config, result)
     assert "2 column(s) the table has are not in the file(s): col1, col2" in result.warnings[0]
     assert "NULL for these rows" in result.warnings[0]
+
+
+# --- mode failed with file names: retry only those ---------------------------------------------
+
+FAILED_A = "/Volumes/framework_dev/files_raw/landing/things/a.csv"
+FAILED_B = "/Volumes/framework_dev/files_raw/landing/things/b.csv"
+
+
+def _failed_run(tmp_path: Path, monkeypatch, files: str, dry_run: bool = True):
+    config = _config(tmp_path, FILE_SOURCE, "files_things.yaml", _volume_spec())
+    monkeypatch.setattr(backfill, "load_config", lambda *_args: config)
+    monkeypatch.setattr(backfill, "list_parked", lambda _root: [])
+    monkeypatch.setattr(backfill, "list_aside", lambda _root: [])
+    spark = _RescueSpark(BRONZE_COLUMNS, left=[{"path": FAILED_A}, {"path": FAILED_B}])
+    return backfill.run_backfill(
+        spark, "c", "files_things", parse_selection("failed", files), dry_run=dry_run
+    )
+
+
+def test_mode_failed_takes_file_names_but_still_needs_none() -> None:
+    assert parse_selection("failed").files == ()
+    assert parse_selection("failed", "a.csv,/Volumes/c/s/v/things/b.csv").files == (
+        "a.csv",
+        "/Volumes/c/s/v/things/b.csv",
+    )
+    with pytest.raises(BackfillError, match="takes file names, not dates"):
+        parse_selection("failed", "a.csv", date_from="2026-11-01")
+
+
+def test_naming_files_in_mode_failed_retries_only_those(tmp_path: Path, monkeypatch) -> None:
+    everything = _failed_run(tmp_path, monkeypatch, "")
+    assert everything.planned == [FAILED_A, FAILED_B]
+    by_name = _failed_run(tmp_path, monkeypatch, "b.csv")
+    assert by_name.planned == [FAILED_B] and by_name.not_failed == []
+    by_path = _failed_run(tmp_path, monkeypatch, FAILED_A)
+    assert by_path.planned == [FAILED_A]
+
+
+def test_a_named_file_that_did_not_fail_is_said_in_the_dry_run(tmp_path: Path, monkeypatch) -> None:
+    result = _failed_run(tmp_path, monkeypatch, "a.csv,fine.csv")
+    assert result.planned == [FAILED_A] and result.not_failed == ["fine.csv"]
+    assert result.missing == [] and not result.none_found  # no ledger row for a file never failed
+    text = warning_text(result)
+    assert "this would be refused: 1 named file(s) did not fail: fine.csv" in text
+    assert "Use mode files to reload a file that did not fail" in text
+
+
+def test_a_real_run_naming_a_file_that_did_not_fail_is_refused_before_anything_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    with pytest.raises(BackfillError, match="1 named file.s. did not fail: fine.csv"):
+        _failed_run(tmp_path, monkeypatch, "a.csv,fine.csv", dry_run=False)
+    # nothing was moved, deleted or recorded: the only query was the ledger lookup
+    # (the fake counts every query it is given)
+
+
+def test_the_files_pattern_the_job_defaults_to_is_ignored_in_mode_failed() -> None:
+    assert parse_selection("failed", job_defaults()["files"]).files == ()

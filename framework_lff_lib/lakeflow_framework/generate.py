@@ -298,9 +298,12 @@ def _job_resource(system: SourceSystem, delivery: str, tables: list[SourceTable]
     # A file a ``fail`` rule blocked is moved to a _failed folder under its table's folder, which
     # Auto Loader skips. A blocked file fails the update, so this task runs whether the refresh
     # succeeded or not, and only for a job that has a table with a ``fail`` rule.
-    from lakeflow_framework.pipeline import has_blocking
+    from lakeflow_framework.pipeline import has_blocking, stops_on_drift
 
-    blocking = [config.pipeline_id for config in configs if has_blocking(config)]
+    # A table whose new columns stop the update (schema_evolution fail) parks that file too.
+    blocking = [
+        config.pipeline_id for config in configs if has_blocking(config) or stops_on_drift(config)
+    ]
     if blocking:
         tasks.append(
             {

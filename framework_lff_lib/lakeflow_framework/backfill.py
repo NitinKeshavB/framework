@@ -8,7 +8,8 @@ Modes:
 
 - ``files``: the named files.
 - ``dates``: files that arrived (were last modified) between ``date_from`` and ``date_to``.
-- ``failed``: files whose latest ``ledger_detail`` status is FAILED, to try them again.
+- ``failed``: files whose latest ``ledger_detail`` status is FAILED, to try them again. Name files
+  to retry only those: a named file that did not fail is left alone, with a warning.
 - ``rescue``: the named files, read again once the table has gained the column they rescued. A column
   the table still lacks goes back into ``_rescued_data`` and the file is recorded with a warning, so the
   same files can be run again later. A value that does not fit its column's type is rescued again.
@@ -38,6 +39,7 @@ from lakeflow_framework.config import (
     BACKFILLED_FOLDER,
     BATCH_ID,
     FAILED_FOLDER,
+    INGEST_TIMESTAMP,
     RESCUED_DATA,
     RULE_ACTIONS,
     SRC_FILE_NAME,
@@ -56,7 +58,7 @@ from lakeflow_framework.failed_files import (
     restore_failed,
     unparked_path,
 )
-from lakeflow_framework.load import get_strategy
+from lakeflow_framework.load import RESCUE_FORMATS, get_strategy
 from lakeflow_framework.pipeline import (
     FILE_FAILED,
     FILE_STATUS,
@@ -75,6 +77,7 @@ from lakeflow_framework.pipeline_metrics import (
     EMPTY_FILE,
     FILE_LEDGER,
     FILE_SCHEMA,
+    LOAD_TIME_SLACK,
     apply_files,
     file_records,
     mark_failed,
@@ -150,6 +153,7 @@ class Result:
     parked: list[str] = field(default_factory=list)  # files still blocked, moved into _failed again
     set_aside: list[str] = field(default_factory=list)  # loaded here, not read by the pipeline yet
     not_in_table: list[str] = field(default_factory=list)  # mode rescue: kept in _rescued_data
+    not_failed: list[str] = field(default_factory=list)  # mode failed: named, but did not fail
     not_in_file: list[str] = field(
         default_factory=list
     )  # mode rescue: the table has, the file lacks
@@ -192,7 +196,7 @@ def parse_selection(
     if unedited:
         names = tuple(name for name in names if not is_pattern(name))
     start, end = (date_from or "").strip() or None, (date_to or "").strip() or None
-    if mode in {"files", "rescue"}:
+    if mode in {"files", "rescue", "failed"}:
         if start or end:
             raise BackfillError(f"mode {mode} takes file names, not dates; use mode dates")
         for name in names:
@@ -355,7 +359,16 @@ def plan_files(spark: Any, config: PipelineConfig, selection: Selection) -> list
     """The files the selection picks, by path, arrival time and size. Reads no file content."""
 
     if selection.mode == "failed":
-        return _failed_files(spark, config)
+        failed = _failed_files(spark, config)
+        if not selection.files:
+            return failed
+        # Only the failed files that were named, by full path or by name.
+        names, paths = set(selection.names), set(selection.paths)
+        return [
+            item
+            for item in failed
+            if item["path"].rsplit("/", 1)[-1] in names or plain_path(item["path"]) in paths
+        ]
     after = (
         datetime.fromisoformat(_stamp(selection.date_from)).replace(tzinfo=UTC)
         if selection.date_from
@@ -487,6 +500,31 @@ def _still_rescued(spark: Any, config: PipelineConfig, paths: list[str]) -> tupl
     return rows, sorted(names)
 
 
+def _say_what_was_kept(result: Result) -> None:
+    """With ``on_fail`` set to warn for the run, rows that broke a rule are loaded. Say so.
+
+    The file's ledger row is WARNING and names the rules. The job's own output says it too,
+    so a run that put rows in the table that the table's rules would have kept out is plain.
+    """
+
+    if result.on_fail != "warn":
+        return
+    broken = {}
+    for item in result.files:
+        rules = [
+            name
+            for name in str(item.get("failed_rules") or "").split(", ")
+            if name and name not in ("new_columns", "schema_conformance")
+        ]
+        if rules:
+            broken[str(item.get("src_file_name"))] = rules
+    if broken:
+        result.warnings.append(
+            "rows that broke rule(s) were loaded into the table, because on_fail was warn for this "
+            "run: " + "; ".join(f"{name} ({', '.join(rules)})" for name, rules in broken.items())
+        )
+
+
 def _say_what_is_rescued(spark: Any, config: PipelineConfig, result: Result) -> None:
     """After a reload in mode rescue: say which columns are still kept in ``_rescued_data``."""
 
@@ -575,7 +613,23 @@ def run_backfill(
         )
     planned = plan_files(spark, config, selection)
     result.planned = [item["path"] for item in planned]
-    result.missing = _not_found(selection, result.planned)
+    unmatched = _not_found(selection, result.planned)
+    if selection.mode == "failed":
+        # A file named in mode failed that did not fail: this mode retries failures, so the run is
+        # refused whole, before anything is changed, and the job run shows as failed with the files
+        # named. A dry run says the same as a warning. It is not "not found", so no ledger row either.
+        result.not_failed = unmatched
+        if unmatched:
+            problem = (
+                f"{len(unmatched)} named file(s) did not fail: {', '.join(unmatched[:MAX_LISTED])}. "
+                "Mode failed retries only files the ledger shows as FAILED. Use mode files to reload "
+                "a file that did not fail, or take these out of files"
+            )
+            if not dry_run:
+                raise BackfillError(problem)
+            result.warnings.append(f"this would be refused: {problem}")
+    else:
+        result.missing = unmatched
     # A request for files that are not there is a failure to record, not nothing to do. Retrying
     # the failed files (mode failed) with none failed is fine: there is nothing to retry.
     result.none_found = not planned and not result.missing and selection.mode != "failed"
@@ -612,6 +666,7 @@ def run_backfill(
             raise
         # Each micro-batch wrote its files to ledger_detail as it went.
         result.files = _recorded_files(spark, config, update_id)
+        _say_what_was_kept(result)
         if selection.mode == "rescue":
             _say_what_is_rescued(spark, config, result)
         recorded = {item["src_file_path"] for item in result.files}
@@ -653,7 +708,7 @@ def run_backfill(
 def _not_found(selection: Selection, planned: list[str]) -> list[str]:
     """What was asked for, as it was given, that is not among the planned files."""
 
-    if selection.mode not in {"files", "rescue"} or not selection.files:
+    if selection.mode not in {"files", "rescue", "failed"} or not selection.files:
         return []
     found = {plain_path(path) for path in planned}
     found_names = {path.rsplit("/", 1)[-1] for path in found}
@@ -742,7 +797,13 @@ def _load(
         view = f"_backfill_{uuid.uuid4().hex}"
         frame.createOrReplaceTempView(view)
         counted = session.sql(
-            files_sql(view, blocking, this_run=False, quarantine=quarantine is not None)
+            files_sql(
+                view,
+                blocking,
+                this_run=False,
+                quarantine=quarantine is not None,
+                rescued=config.file_format in RESCUE_FORMATS,
+            )
         ).collect()
         files = [_as_file(row) for row in counted]
         paths = [item["src_file_path"] for item in files]
@@ -765,7 +826,12 @@ def _load(
                 )
                 _insert(session, bad, quarantine)
             _check_written(
-                session, bronze, batch, paths, sum(int(i["rows_inserted"] or 0) for i in files)
+                session,
+                bronze,
+                batch,
+                paths,
+                sum(int(i["rows_inserted"] or 0) for i in files),
+                since=stub["started_at"],
             )
             if quarantine:
                 _check_written(
@@ -774,9 +840,10 @@ def _load(
                     batch,
                     paths,
                     sum(int(i["rows_quarantined"] or 0) for i in files),
+                    since=stub["started_at"],
                 )
         except Exception:
-            _discard(session, paths, batch, *targets)
+            _discard(session, paths, batch, *targets, since=stub["started_at"])
             raise
         _remove(session, paths, *targets, keep_batch=batch)
         marked = apply_files(dict(stub), files)["_files"]
@@ -869,6 +936,8 @@ def _as_file(row: Any) -> dict[str, Any]:
         "rows_dropped": dropped,
         "failed_rules": data["failed_rules"],
         "blocking_rules": data["blocking_rules"],
+        "rows_warned": int(data.get("rows_warned") or 0),
+        "rescued_keys": data.get("rescued_keys") or "",
         "load_kind": "backfill",
     }
 
@@ -894,7 +963,21 @@ def _remove(spark: Any, paths: list[str], *tables: str, keep_batch: str | None =
     return replaced
 
 
-def _discard(spark: Any, paths: list[str], batch: str, *tables: str) -> None:
+def _recent(since: datetime | None) -> str:
+    """A bound on the load time, so a check on rows this load just wrote skips older files.
+
+    The tables are clustered on ``_ingest_timestamp``. A clock a little behind the cluster's
+    must not hide a row, so the bound is a few minutes before the load began."""
+
+    if since is None:
+        return ""
+    start = (since.astimezone(UTC) - LOAD_TIME_SLACK).strftime("%Y-%m-%d %H:%M:%S")
+    return f" AND {INGEST_TIMESTAMP} >= TIMESTAMP '{start}+00:00'"
+
+
+def _discard(
+    spark: Any, paths: list[str], batch: str, *tables: str, since: datetime | None = None
+) -> None:
     """Take out the rows this batch wrote for these files, after a load that did not finish.
 
     The earlier rows were not touched, so this leaves the table as it was. It never hides the
@@ -907,13 +990,20 @@ def _discard(spark: Any, paths: list[str], batch: str, *tables: str) -> None:
             try:
                 spark.sql(
                     f"DELETE FROM {table} WHERE {BATCH_ID} = {sql_string(batch)} "
-                    f"AND {SRC_FILE_PATH} IN ({listed})"
+                    f"AND {SRC_FILE_PATH} IN ({listed}){_recent(since)}"
                 ).collect()
             except Exception:
                 log.exception("could not take this load's rows out of %s", table)
 
 
-def _check_written(spark: Any, table: str, batch: str, paths: list[str], expected: int) -> None:
+def _check_written(
+    spark: Any,
+    table: str,
+    batch: str,
+    paths: list[str],
+    expected: int,
+    since: datetime | None = None,
+) -> None:
     """Stop, before anything is deleted or recorded, when the table does not hold the rows counted."""
 
     held = 0
@@ -921,7 +1011,7 @@ def _check_written(spark: Any, table: str, batch: str, paths: list[str], expecte
         listed = ", ".join(sql_string(path) for path in paths[start : start + 500])
         found = spark.sql(
             f"SELECT count(*) AS n FROM {table} WHERE {BATCH_ID} = {sql_string(batch)} "
-            f"AND {SRC_FILE_PATH} IN ({listed})"
+            f"AND {SRC_FILE_PATH} IN ({listed}){_recent(since)}"
         ).collect()
         held += int(found[0][0] or 0) if found else 0
     if held != expected:

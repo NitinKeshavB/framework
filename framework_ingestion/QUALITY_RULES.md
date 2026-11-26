@@ -39,7 +39,7 @@ raw_to_bronze:
 
 In the registry, `v_rules` has one row per rule a table has ever had, with `enabled` true only while the rule is in the spec and not switched off. `v_rule_history` adds `valid_from`, `valid_to`, `is_current` (this is how the rule is defined now) and `is_active` (defined now and enabled). Switching a rule off or on closes one history row and opens another.
 
-The checks the framework adds itself are listed by `origin`: `declared` is your rule, `type` is `cast_<column>` for a column you declared in `columns:`, `key` is a not-null check on a key or the sequence column, and `schema` is `schema_conformance`. A spec that declares no columns gets no `type` rows.
+The checks the framework adds itself are listed by `origin`: `declared` is your rule, `type` is `cast_<column>` for a column you declared in `columns:`, `key` is a not-null check on a key or the sequence column, and `schema` is `schema_conformance` (a value that did not fit its column) and `new_columns` (a column the table does not have). A spec that declares no columns gets no `type` rows.
 
 Rules of different actions mix in one table. A row that fails a `quarantine` rule is quarantined even if it also failed a `warn` rule; a row that fails only `drop` and `warn` rules is dropped; a row that fails only `warn` rules loads.
 
@@ -55,11 +55,13 @@ Rules of different actions mix in one table. A row that fails a `quarantine` rul
 
 Nothing reads `_failed`. Auto Loader and the file listing skip a folder that starts with an underscore. On top of that, validation refuses a spec whose `raw_path` includes `_failed`, and refuses `copy_into`, `ctas` and `autoloader` reading the root of a volume, because those would contain it. Read a folder below the volume root instead.
 
-A table that has a `fail` rule or a `drop` rule has a dataset `<pipeline_id>_files` (published in `framework_meta`), one row per file of the latest run. A table with a `fail` rule also has `<pipeline_id>_blocked_check` (private), and the two together hold a blocked file back. A table with neither has no extra dataset. `<pipeline_id>_files` has one row per file of the latest run, and it is where `ledger_detail` gets exact counts for a table with a `fail` or `drop` rule, because a row a rule drops and the good rows of a blocked file are kept in no other table. A file that loses 2 of its 3 rows to a `drop` rule shows `rows_read` 3, `rows_inserted` 1 and `rows_dropped` 2. For a blocked file: a blocked file of 80,000 rows with 3 bad ones shows `rows_read` 80,000, `rows_quarantined` 3 and `rows_dropped` 79,997, status `FAILED`.
+A table that has a `fail`, `drop` or `warn` rule has a dataset `<pipeline_id>_files` (published in `framework_meta`), one row per file of the latest run. It is how a file's ledger row can say which rows were held back or kept in spite of a rule: a row a `warn` rule kept is in bronze, which does not say it broke the rule, so the file shows `WARNING` in `ledger_detail` with the rule names only when this dataset exists. A table with a `fail` rule also has `<pipeline_id>_blocked_check` (private), and the two together hold a blocked file back. A table with none of these has no extra dataset. `<pipeline_id>_files` has one row per file of the latest run, and it is where `ledger_detail` gets exact counts for a table with a `fail` or `drop` rule, because a row a rule drops and the good rows of a blocked file are kept in no other table. A file that loses 2 of its 3 rows to a `drop` rule shows `rows_read` 3, `rows_inserted` 1 and `rows_dropped` 2. For a blocked file: a blocked file of 80,000 rows with 3 bad ones shows `rows_read` 80,000, `rows_quarantined` 3 and `rows_dropped` 79,997, status `FAILED`.
 
 A table loaded from a **database** has no files, so `fail` there stops the whole run: no row of the run, good ones included, reaches bronze.
 
 The checks the framework adds itself (`schema_conformance`, `cast_<column>`, `not_null_<key>`) follow `raw_to_bronze.on_fail`, or quarantine when it is not set. A table with no quarantine (no `rules`, no `quarantine:` block) loses no row: `schema_conformance`, `cast_<column>` and `not_null_<key>` only **warn**. A row with a new column, or a value that does not fit its column, loads, with the values kept in `_rescued_data`, and its file shows `WARNING` in `ledger_detail` with the number of rows. The one exception is a table that keeps rows by key (`scd1`, `scd2`): a row with a null key or sequence value cannot be applied, so it is dropped and counted in `rows_dropped`. Ask for quarantine, or set `on_fail`, and every added check follows that.
+
+One of them never follows `on_fail`: `new_columns`. A column that appears in a file is rescued, the row loads, and the load carries a warning, even on a table set to `fail`. Only a value that does not fit an existing column (`schema_conformance`, `cast_<column>`) is judged by `on_fail`. Set `schema_evolution: fail` for a table where a new column must stop the load.
 
 What a new column does is set by `source.schema_evolution` (csv, delimited, json): `rescue` (the default) keeps its values in `_rescued_data`, `add_new_columns` makes it a column, `fail` stops the update, and `none` ignores it. With `on_fail: fail` on `raw_to_bronze`, a value that does not fit its column, or an empty key, is treated as a `fail` row.
 
@@ -76,6 +78,23 @@ A scheduled delivery runs whether or not a file arrived, so a table in one **exp
 | A file arrived with rows | as usual | as usual |
 
 A run with a good file and an empty one loads the good one and still records the load `FAILED`. An empty file is reported once, in the run that found it, not again on the next run. "Since the previous run" means since the previous regular run started, so a backfill does not move it. This looks at the volume's file names, sizes and arrival times only; no file is read. This is one rule for every way a load is recorded: the pipeline's own hook, the hourly catch-up (which replays a run whose ledger write was cut off, using the table's spec in the registry) and the backfill job all record a missing or empty file as `FAILED` for a table that expects a file, and as `COMPLETED` (with a warning only) for a table that does not, such as one fired by a file arriving.
+
+### A column that appears in a file
+
+What the table does with a new column is set by `source.schema_evolution`:
+
+- `rescue` (the default): the values are kept in `_rescued_data` and the row loads. The load carries a warning, and
+  the file shows `WARNING` in `ledger_detail`, naming the columns. A rescued column has no type and is not a column of the table: to make it one, set `infer_schema: strings` with `schema_evolution: add_new_columns`, or declare it under `columns:` with its type. The warning says so.
+- `add_new_columns`: the table gains the column. **Keep `infer_schema: strings`** (for a table with no declared columns)
+  so every new column is added as text and a later value can never fail to fit. If you do not, declare each new column
+  under `columns:` to give it a type. For a table with declared columns, a new column is added as text until you declare it.
+  `./run.sh generate` warns about a table that does neither. Each time a column is added, the files of that run show
+  `WARNING` in `ledger_detail`, with the column and its type: `new column(s) added to the table: sample_column_1 string`.
+- `fail`: the update stops and nothing of the run loads (the job run fails). The load is `FAILED` with the reason `schema drift: <file> has new column(s) the table does not have: <name> (<type>), ...`, which also gives the lines to add under `raw_to_bronze.columns` with each column's type as the file was read. The file shows `FAILED` in `ledger_detail` with the same, and the job moves it to `_failed` so it is not read again. To load it: add the columns with the data type each should have, deploy, and run `framework_backfill` with mode `failed` and the file's path. Other files of the same run are not marked: the next run reads them. `none`: the column is ignored.
+
+A new column is part of the row hash `_src_row_hash`, which covers every column the source gave the row: a column the
+table has, or the values of one that was rescued (they are inside `_rescued_data`). A column whose value is empty is left
+out of the hash, as before.
 
 ### Putting rescued values back into the table
 
@@ -325,7 +344,8 @@ The general shapes: `a IS NULL OR <check>` for an optional column, and `CASE WHE
 
 | Rule | Added when | Fails when |
 | --- | --- | --- |
-| `schema_conformance` | A CSV, delimited, JSON or text file | A value did not fit the declared columns, or a column appeared that the table does not have, so it was rescued into `_rescued_data`. Warns only when the table has no quarantine |
+| `schema_conformance` | A CSV, delimited, JSON or text file | A value did not fit a column the table has, so it was rescued into `_rescued_data`. Follows `on_fail` (warns only when the table has no quarantine) |
+| `new_columns` | A CSV, delimited or JSON file, with `schema_evolution: rescue` | The file has a column the table does not have, so its values were rescued into `_rescued_data`. Always a warning, never `fail`, `drop` or `quarantine`: the row loads and the file shows `WARNING` in `ledger_detail`, naming the columns |
 | `cast_<column>` | A column is declared | The value cannot be cast to the declared type. For a `string` column this cannot fail |
 | `not_null_<key>` | `primary_keys` is set | A key is empty |
 | `not_null_<watermark_column>` | `scd1` or `scd2` | The ordering column is empty (a change cannot be ordered without it) |

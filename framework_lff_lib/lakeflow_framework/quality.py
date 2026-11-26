@@ -10,9 +10,10 @@ principal only the source's own volume / foreign catalog / bronze schema.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 
-from lakeflow_framework.config import PipelineConfig
+from lakeflow_framework.config import SCHEMA_EVOLUTION_FORMATS, PipelineConfig
 from lakeflow_framework.load import RESCUE_FORMATS
 
 # Each rule is evaluated once, into this column. Pass, fail, and expectations all read it.
@@ -195,9 +196,60 @@ def assert_safe_rule_expression(
         errors.append(f"{label}: rule '{name}' ends in the middle of a condition (after {last!r})")
 
 
+# The keys of what Auto Loader rescued, lower case. The rescued JSON also holds the file's own path.
+_RESCUED_KEYS = (
+    "transform(map_keys(from_json(_rescued_data, 'map<string,string>')), key -> lower(key))"
+)
+_RESCUED_PARSES = "from_json(_rescued_data, 'map<string,string>') IS NOT NULL"
+
+
+def _name_array(columns: Iterable[str]) -> str:
+    quoted = ", ".join("'" + name.lower().replace("'", "''") + "'" for name in columns)
+    return f"array({quoted})" if quoted else "CAST(array() AS ARRAY<STRING>)"
+
+
+def schema_expressions(columns: Iterable[str]) -> tuple[str, str]:
+    """The two checks on what Auto Loader rescued, for a table with these columns.
+
+    ``schema_conformance`` holds when no rescued value belongs to a column the table has: a value
+    that did not fit its column. ``new_columns`` holds when no rescued value belongs to a column the
+    table does not have: a column that appeared in the file. A rescued text that is not JSON counts
+    as the first, not the second.
+    """
+
+    known = _name_array(columns)
+    conforms = (
+        f"_rescued_data IS NULL OR ({_RESCUED_PARSES} "
+        f"AND size(array_intersect({_RESCUED_KEYS}, {known})) = 0)"
+    )
+    no_new = (
+        f"_rescued_data IS NULL OR NOT ({_RESCUED_PARSES}) OR "
+        f"size(array_except({_RESCUED_KEYS}, array_union({known}, array('_file_path')))) = 0"
+    )
+    return conforms, no_new
+
+
+def with_columns(rules: list[CompiledRule], columns: Iterable[str]) -> list[CompiledRule]:
+    """The rules, with the two schema checks written for the columns the data really has.
+
+    The columns of a table that declares none are only known once the files are read, so the
+    staging step calls this with the columns of the frame it was given.
+    """
+
+    conforms, no_new = schema_expressions(list(columns))
+    found = {"schema_conformance": conforms, "new_columns": no_new}
+    return [
+        replace(rule, expression=found[rule.name]) if rule.name in found else rule for rule in rules
+    ]
+
+
 def compile_rules(config: PipelineConfig) -> list[CompiledRule]:
     """The declared rules, then the checks the framework adds. The added ones follow the table's
     ``on_fail``: a table set to fail also fails on a missing key or an unreadable value.
+
+    A column that appears in a file is always rescued and only warned about (``new_columns``),
+    whatever ``on_fail`` is: rescuing it is what ``schema_evolution: rescue`` is for. A value
+    that does not fit its column (``schema_conformance``) follows ``on_fail``.
 
     A table with no quarantine (no rules and no quarantine block) loses no row. A new column, or
     a value that does not fit its column, is kept in ``_rescued_data`` and the row loads, with
@@ -232,9 +284,10 @@ def compile_rules(config: PipelineConfig) -> list[CompiledRule]:
         config.load_method in {"autoloader", "volume_files"}
         and config.file_format in RESCUE_FORMATS
     ):
-        rules.append(
-            CompiledRule("schema_conformance", "_rescued_data IS NULL", "schema", schema_action)
-        )
+        conforms, no_new = schema_expressions(column.name for column in config.columns)
+        rules.append(CompiledRule("schema_conformance", conforms, "schema", schema_action))
+        if config.file_format in SCHEMA_EVOLUTION_FORMATS and config.schema_evolution == "rescue":
+            rules.append(CompiledRule("new_columns", no_new, "schema", "warn"))
     return rules
 
 

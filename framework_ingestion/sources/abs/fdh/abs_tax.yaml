@@ -1,0 +1,81 @@
+# yaml-language-server: $schema=../../../../.schemas/table-spec.v1.json
+# ABS GL extract: CSV from the abs gl_source_extract volume to bronze, every column as a string.
+# Not written here, because ../source.yaml and the folder already say it: domain, layer, the raw
+# schema (abs_raw), delivery and job (abs_daily), requested_by and team (fdh). Set one here only
+# to override it.
+
+spec_version: 1
+pipeline_id: abs_tax                  # must start with the source system name: abs_, and be unique
+data_domain: gl_accounting           # identifier: letters, digits, underscore
+description: General ledger extract from the abs gl_source_extract volume, all columns as text.
+delivery: tax_evening                      # abs has two deliveries (daily, evening), so each table names its own
+
+# Who owns and hears about this table. Without these the source owner (sonia.rajeev@...) is used.
+technical_owner: nitinkeshav.bolla@allianz.com.au
+notify:
+  on_failure:                        # default is the technical owner
+    - nitinkeshav.bolla@allianz.com.au
+  # on_success: []
+
+# Sensitivity of this table's data.
+data:
+  classification: internal           # internal | confidential | highly_confidential
+  pii:                               # pii_health | pii_basic | pii_finance | pii_biometric | pii_personal
+    - pii_finance
+
+# The files: /Volumes/<catalog>/abs_raw/<volume>/<raw_path>. The catalog comes from the bundle.
+source:
+  volume: tax_source_extract          # a volume in the abs_raw schema
+  # raw_path: month_end/             # a folder inside the volume; omitted: the files are in the volume itself
+  format: csv                        # csv | delimited | text | json | parquet | avro | excel
+  delimiter: ","                     # required for csv and delimited
+  header: true                       # default true
+  # max_files_per_trigger: 100
+  path_glob: "*.csv"
+  schema_evolution: fail  # rescue|add_new_columns|fail|none
+
+raw_to_bronze:
+  bronze:
+    schema: abs_bronze               # default is <source>_bronze
+    table: gl_tax                   # default is the pipeline_id
+  # How rows are taken: append (append) | scd1 (upsert on primary_keys) | scd2 (keep history)
+  # | full_refresh (database tables). Omitted: append for files.
+  load_type: append
+  # Declaring the columns turns type inference off, so every column lands as the type given here.
+  # A value that cannot be read as that type goes to _rescued_data instead of failing the load.
+  columns:
+    - { name: ride_id, type: string, description: Unique id of the ride }
+    - { name: rideable_type, type: string, description: Kind of bike used }
+    - { name: started_at, type: string, description: When the ride started, as text }
+    - { name: ended_at, type: string, description: When the ride ended, as text }
+    - { name: start_station_name, type: string, description: Name of the station the ride started at }
+    - { name: start_station_id, type: string, description: Id of the station the ride started at }
+    - { name: end_station_name, type: string, description: Name of the station the ride ended at }
+    - { name: end_station_id, type: string, description: Id of the station the ride ended at }
+    - { name: start_lat, type: string, description: Latitude of the start, as text }
+    - { name: start_lng, type: string, description: Longitude of the start, as text }
+    - { name: end_lat, type: string, description: Latitude of the end, as text }
+    - { name: end_lng, type: string, description: Longitude of the end, as text }
+    - { name: member_casual, type: string, description: Whether the rider is a member or casual }
+    - { name: sample_1, type: string, description: Whether the rider is a member or casual }
+    - { name: sample_2, type: string, description: Whether the rider is a member or casual }
+    - { name: sample_column_3, type: string, description: Whether the rider is a member or casual }
+    - { name: sample_column_4, type: string, description: Whether the rider is a member or casual }
+
+  rules:
+    - { name: ride_id_present, expression: "ride_id IS NOT NULL AND length(trim(ride_id)) > 0" }
+    - { name: ride_id_format, expression: "ride_id rlike '^[0-9A-Fa-f]{16}$'" }
+    - { name: rideable_type_present, expression: "rideable_type IS NOT NULL AND length(trim(rideable_type)) > 0" }
+    - { name: rideable_type_known, expression: "rideable_type IN ('classic_bike', 'electric_bike', 'docked_bike')" }
+    - { name: started_at_present, expression: "started_at IS NOT NULL AND length(trim(started_at)) > 0" }
+    - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
+    - { name: member_casual_known, expression: "member_casual IN ('member', 'casual')" }
+    
+  on_fail: fail
+
+# Failed rows go to abs_bronze.gl_abs_qrntn: the bronze schema, the bronze table plus _qrntn.
+# Add a quarantine block only to change that:
+quarantine:
+   schema: abs_quarantine
+   table: gl_tax_rejects
+#   description: Rides that failed a quality rule, with the names of the rules in failed_rules.

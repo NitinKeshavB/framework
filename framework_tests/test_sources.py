@@ -529,7 +529,7 @@ def test_volume_files_read_the_volume_once_into_the_staging_table(tmp_path: Path
         (quarantine, "table", staged),
     ]
     assert "_dq_result = 'pass'" in spark.readStream.wheres  # bronze keeps only passing rows
-    assert pipelines.expectations == ["cast_thing_id", "schema_conformance"]
+    assert pipelines.expectations == ["cast_thing_id", "schema_conformance", "new_columns"]
     assert spark.readStream.format_name == "cloudFiles"
     assert spark.readStream.options["cloudFiles.format"] == "csv"
     assert spark.readStream.options["cloudFiles.schemaHints"] == "`thing_id` string"

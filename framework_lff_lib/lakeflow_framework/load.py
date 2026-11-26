@@ -69,6 +69,11 @@ class AutoLoader(LoadStrategy):
             if config.columns or config.fixed_columns or config.infer_schema == "strings"
             else "true",
             "cloudFiles.allowOverwrites": "false",
+            # A file Auto Loader listed in a run that then stopped (schema drift) is moved to
+            # _failed by the job before the next run reads it. Without this the stream would
+            # fail on the missing file at every run. The framework is the only one moving files
+            # out of the folder, and the ledger records each move.
+            "ignoreMissingFiles": "true",
         }
         # Without file events Auto Loader lists the directory. Turn them on only once the external
         # location behind the path has file events enabled.

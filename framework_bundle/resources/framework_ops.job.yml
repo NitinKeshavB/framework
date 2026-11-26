@@ -111,7 +111,7 @@ resources:
           default: "${var.catalog}.<bronze_schema>.<table>"
         - name: mode # backfill: files | dates | failed | full_refresh. rescue: read files again to put rescued values back
           default: "<files|dates|failed|rescue|full_refresh>"
-        - name: files # full volume paths, comma-separated (modes files and rescue)
+        - name: files # full volume paths, comma-separated (modes files and rescue, and failed to retry only those)
           default: "/Volumes/${var.catalog}/<raw_schema>/<volume>/<folder>/<file>.csv"
         - name: date_from # arrival time, YYYY-MM-DD or YYYY-MM-DD HH:MM (mode dates)
           default: ""

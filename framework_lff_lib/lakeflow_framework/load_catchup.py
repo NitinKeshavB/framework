@@ -39,8 +39,19 @@ _EVENTS = (
 )
 
 
-def catch_up_loads(spark: Any, catalog: str, *, days: int = LOOKBACK_DAYS) -> int:
-    """Record every recent update that has no ledger row. Returns the ledger rows written."""
+def catch_up_loads(
+    spark: Any,
+    catalog: str,
+    *,
+    days: int = LOOKBACK_DAYS,
+    pipeline_ids: list[str] | None = None,
+    keep_kind: bool = False,
+) -> int:
+    """Record every recent update that has no ledger row. Returns the ledger rows written.
+
+    With ``pipeline_ids``, only the jobs that run one of those tables are looked at, so a job can
+    record its own update as soon as it ends; ``keep_kind`` keeps such a row ``regular``.
+    """
 
     meta = f"{require_catalog(catalog)}.framework_meta"
     events = f"{catalog}.{EVENTS_SCHEMA}"
@@ -49,7 +60,9 @@ def catch_up_loads(spark: Any, catalog: str, *, days: int = LOOKBACK_DAYS) -> in
         job = name[: -len(EVENT_LOG_SUFFIX)]
         if not IDENTIFIER.match(job):
             continue
-        written += _catch_up_job(spark, catalog, meta, f"{events}.{name}", job, days)
+        written += _catch_up_job(
+            spark, catalog, meta, f"{events}.{name}", job, days, pipeline_ids, keep_kind
+        )
     log.info("load catch-up: wrote %d ledger row(s)", written)
     return written
 
@@ -63,9 +76,20 @@ def _event_logs(spark: Any, events: str) -> list[str]:
     return sorted(name for name in names if name.endswith(EVENT_LOG_SUFFIX))
 
 
-def _catch_up_job(spark: Any, catalog: str, meta: str, event_log: str, job: str, days: int) -> int:
+def _catch_up_job(
+    spark: Any,
+    catalog: str,
+    meta: str,
+    event_log: str,
+    job: str,
+    days: int,
+    pipeline_ids: list[str] | None = None,
+    keep_kind: bool = False,
+) -> int:
     dataflows = _dataflows(spark, meta, job)
     if not dataflows:
+        return 0
+    if pipeline_ids is not None and not any(flow.pipeline_id in pipeline_ids for flow in dataflows):
         return 0
     missing = _rows(
         spark.sql(
@@ -88,9 +112,50 @@ def _catch_up_job(spark: Any, catalog: str, meta: str, event_log: str, job: str,
             continue
         for row in rows:
             row["batch_id"] = _batch_of(spark, row)
-        written += write_rows(spark, catalog, rows, replay=True)
+        for row in rows:
+            if row.get("_drift_file"):
+                row["_drift_rows"] = count_file_rows(spark, catalog, row)
+        written += write_rows(spark, catalog, rows, replay=True, keep_kind=keep_kind)
         log.info("load catch-up: recorded %s update %s", job, update_id)
     return written
+
+
+def count_file_rows(spark: Any, catalog: str, row: dict[str, Any]) -> int | None:
+    """How many rows the file that stopped the update holds, read with the table's own options.
+
+    Wherever the file is now: still in its folder, or moved to ``_failed`` already. None when it
+    cannot be read, and the ledger then says the count is unknown.
+    """
+
+    from lakeflow_framework.backfill import load_config
+    from lakeflow_framework.failed_files import parked_path
+    from lakeflow_framework.load import SPARK_FORMAT, get_strategy
+
+    path = str(row["_drift_file"])
+    try:
+        config = load_config(spark, catalog, str(row["dataflow"]))
+        options = {
+            key: value
+            for key, value in get_strategy(config.load_method).options(config).items()
+            if not key.startswith("cloudFiles.")
+            and key not in {"pathGlobFilter", "rescuedDataColumn"}
+        }
+        reader = spark.read.format(SPARK_FORMAT[config.file_format]).options(**options)
+    except Exception:
+        log.warning("load catch-up: could not prepare to count the rows of %s", path)
+        return None
+    candidates = [path]
+    try:
+        candidates.append(str(parked_path(config.path, path)))
+    except Exception:
+        log.debug("load catch-up: no parked path for %s", path)
+    for candidate in candidates:
+        try:
+            return int(reader.load(candidate).count())
+        except Exception:
+            log.debug("load catch-up: %s is not readable at %s", path, candidate)
+    log.warning("load catch-up: could not count the rows of %s", path)
+    return None
 
 
 def _fail_rules(rules_json: Any) -> tuple[str, ...]:
@@ -232,7 +297,9 @@ def _batch_of(spark: Any, row: dict[str, Any]) -> str | None:
     start, end = row.get("started_at"), row.get("ended_at")
     if not isinstance(start, datetime) or not isinstance(end, datetime):
         return None
-    for table in (row.get("target_table"), row.get("quarantine_table")):
+    # The row is the recorder's, whose quarantine table is the private ``_quarantine_table``.
+    quarantine = row.get("_quarantine_table") or row.get("quarantine_table")
+    for table in (row.get("target_table"), quarantine):
         if not table:
             continue
         try:

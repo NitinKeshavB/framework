@@ -103,6 +103,31 @@ def description_warnings(systems: list[SourceSystem]) -> list[str]:
     return warnings
 
 
+def schema_warnings(systems: list[SourceSystem]) -> list[str]:
+    """Advice on how a table meets a column that appears in its files. Never stops a deploy."""
+
+    warnings: list[str] = []
+    for system in systems:
+        for table in system.tables:
+            config = table.config
+            where = f"{system.name}/{table.path.name}"
+            if config.schema_evolution != "add_new_columns":
+                continue
+            if config.columns:
+                warnings.append(
+                    f"{where}: schema_evolution add_new_columns adds a new column as text. Declare it "
+                    "under columns: to give it a type"
+                )
+            elif config.infer_schema != "strings":
+                warnings.append(
+                    f"{where}: schema_evolution add_new_columns with inferred types types each new "
+                    "column from its first values, and a later value can fail to fit. Set "
+                    "infer_schema: strings so every new column is added as text, or declare the "
+                    "column under columns:"
+                )
+    return warnings
+
+
 def load_sources(
     bundle: Path, catalog: str | None = None, *, allow_frozen: bool = False
 ) -> list[SourceSystem]:

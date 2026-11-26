@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -74,6 +75,7 @@ class Dataflow:
     build_error: str | None = None  # why the spec could not be registered, when it could not
     file_load: bool = False  # a file source: per-file rows are counted from bronze and quarantine
     expect_file: bool = False  # a file must arrive every run; checked against the volume listing
+    adds_columns: bool = False  # schema_evolution add_new_columns: say which columns were added
     fail_rules: tuple[str, ...] = ()  # rules whose broken rows block their file and fail the load
     blocked_check: str = ""  # the dataset whose failure fails the update when a file was blocked
     files: str = ""  # catalog.schema.table of the per-file counts, for a table with a fail rule
@@ -289,11 +291,24 @@ class UpdateRecorder:
             "_file_load": flow.file_load,
             "_files_table": flow.files,
             "_expect_file": flow.expect_file,
+            "_adds_columns": flow.adds_columns,
             "_fail_rules": flow.fail_rules,
             "_path": flow.path,
             "_path_glob": flow.path_glob,
             "_append": flow.append,
             "_quarantine_table": flow.quarantine or None,
+            # The read itself did not finish: what this run did not count, it did not see.
+            "_read_failed": bool(failed)
+            and (staged is None or staged.status in {"FAILED", "CANCELED", "STOPPED"}),
+            "_new_fields": new_fields(" ".join(text for _name, text in update.errors))
+            if failed
+            else [],
+            "_drift_file": drift_file(" ".join(text for _name, text in update.errors))
+            if failed
+            else None,
+            "_drift_types": drift_types(" ".join(text for _name, text in update.errors))
+            if failed
+            else {},
         }
         flows_counted = (
             counted["staged"]
@@ -347,7 +362,116 @@ class UpdateRecorder:
                 parts.append(text)
         if not parts:
             parts.append(f"pipeline update {update_id} ended {state} and reported no error message")
+        joined = " ".join(parts)
+        gone = missing_file(joined)
+        if gone:
+            return _clip(missing_file_reason(gone))
+        fields = new_fields(joined)
+        if fields:
+            # Auto Loader refused the file because schema_evolution is fail. Say it plainly: the
+            # stream's own text is pages long.
+            return _clip(new_fields_reason(fields, drift_file(joined), drift_types(joined)))
         return _clip("; ".join(parts))
+
+
+_NEW_FIELDS = re.compile(r"UNKNOWN_FIELD_EXCEPTION[.\w]*\]?[^\[]*\[([^\]]*)\]")
+
+
+_MISSING_FILE = re.compile(
+    r"CLOUD_FILE_SOURCE_FILE_NOT_FOUND\]?[^/]*(/Volumes/\S+?)(?:\s+but|\\n|\s|$)"
+)
+
+
+def missing_file(text: str) -> str | None:
+    """The file Auto Loader had listed and then could not find when it read it."""
+
+    found = _MISSING_FILE.search(text or "")
+    return found.group(1).rstrip(".,;") if found else None
+
+
+def missing_file_reason(path: str) -> str:
+    return (
+        f"file not found: {path.rsplit('/', 1)[-1]} was listed by Auto Loader and then moved or "
+        f"deleted before it was read ({path}). Nothing of this run was loaded. A file the job moved "
+        "to _failed or _backfilled is skipped from now on (ignoreMissingFiles); look in those folders"
+    )
+
+
+def new_fields(text: str) -> list[str]:
+    """The columns Auto Loader refused because they are not in the table (``schema_evolution: fail``)."""
+
+    found = _NEW_FIELDS.search(text or "")
+    if not found:
+        return []
+    return [name.strip() for name in found.group(1).split(",") if name.strip()]
+
+
+_DRIFT_FILE = re.compile(r"Unknown fields inside file path:\s*(\S+?)(?:\\n|\s|$)")
+# The start of the file row's message for a file refused for schema drift. ``failed_files`` parks
+# files whose latest row starts with it.
+DRIFT_MESSAGE = "schema drift"
+
+
+def drift_file(text: str) -> str | None:
+    """The file whose new columns stopped the update, as Auto Loader names it."""
+
+    found = _DRIFT_FILE.search(text or "")
+    return found.group(1).rstrip(".,;") if found else None
+
+
+_DRIFT_TYPES = re.compile(r"Rescued file schema:\s*(.+?)\s*(?:SQLSTATE|\\n|\n|$)")
+
+
+def drift_types(text: str) -> dict[str, str]:
+    """Each new column's type as Auto Loader read it from the file, lower case, by name."""
+
+    found = _DRIFT_TYPES.search(text or "")
+    if not found:
+        return {}
+    types: dict[str, str] = {}
+    for part in found.group(1).split(","):
+        name, _, kind = part.strip().partition(" ")
+        if name and kind:
+            types[name.strip("`")] = kind.strip().lower()
+    return types
+
+
+def _spec_lines(fields: list[str], types: dict[str, str]) -> str:
+    return " ".join(f"- {{ name: {name}, type: {types.get(name, '<type>')} }}" for name in fields)
+
+
+def new_fields_reason(
+    fields: list[str], path: str | None = None, types: dict[str, str] | None = None
+) -> str:
+    """The load row's reason for a run stopped because a file has new columns."""
+
+    types = types or {}
+    where = path.rsplit("/", 1)[-1] if path else "a file"
+    listed = ", ".join(f"{name} ({types[name]})" if name in types else name for name in fields)
+    return (
+        f"{DRIFT_MESSAGE}: {where} has new column(s) the table does not have: {listed}. "
+        "schema_evolution is fail, so the update stopped and nothing of this run was loaded. The "
+        "job moves the file to _failed so it is not read again. To fix it, add the column(s) to "
+        "the spec under raw_to_bronze.columns with the data type each should have "
+        f"({_spec_lines(fields, types)}; the type shown is how the file was read), deploy, then "
+        "run framework_backfill with mode failed and the file's path to load it"
+    )
+
+
+def drift_file_message(
+    fields: list[str], types: dict[str, str] | None = None, rows: int | None = None
+) -> str:
+    """The file row's message for a file refused because it has new columns."""
+
+    types = types or {}
+    listed = ", ".join(f"{name} ({types[name]})" if name in types else name for name in fields)
+    held = f"{rows} row(s) in the file, none loaded" if rows is not None else "row count unknown"
+    return (
+        f"{DRIFT_MESSAGE}: new column(s) the table does not have: {listed} (schema_evolution "
+        f"fail). {held}; moved to _failed. Add them under raw_to_bronze.columns with their data "
+        f"type ({_spec_lines(fields, types)}), deploy, and reload this file with framework_backfill "
+        "mode failed"
+    )
 
 
 LEDGER_SCHEMA = ", ".join(
@@ -497,13 +621,21 @@ def read_files_sql(row: dict[str, Any], rescued: bool = False) -> str | None:
         scope += f" AND {INGEST_TIMESTAMP} >= TIMESTAMP '{since}+00:00'"
     none = "CAST(array() AS ARRAY<STRING>)"
     flag = "CASE WHEN _rescued_data IS NOT NULL THEN 1 ELSE 0 END" if rescued else "0"
+    nothing = "CAST(NULL AS ARRAY<STRING>)"
+    keys = (
+        "CASE WHEN _rescued_data IS NOT NULL THEN "
+        "filter(map_keys(from_json(_rescued_data, 'map<string,string>')), "
+        "key -> key <> '_file_path') END"
+        if rescued
+        else nothing
+    )
     parts = [
         f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 1 AS loaded, 0 AS quarantined, "
-        f"{none} AS failed, {flag} AS warned FROM {target} {scope}"
+        f"{none} AS failed, {flag} AS warned, {keys} AS rescued_keys FROM {target} {scope}"
     ]
     if row.get("_quarantine_table"):
         parts.append(
-            f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 0, 1, failed_rules, 0 "
+            f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, 0, 1, failed_rules, 0, {nothing} "
             f"FROM {row['_quarantine_table']} {scope}"
         )
     fail_rules = ", ".join(sql_string(name) for name in row.get("_fail_rules") or ())
@@ -516,6 +648,8 @@ def read_files_sql(row: dict[str, Any], rescued: bool = False) -> str | None:
     return (
         f"SELECT {SRC_FILE_PATH}, {SRC_FILE_NAME}, sum(loaded) AS rows_loaded, "
         f"sum(quarantined) AS rows_quarantined, sum(warned) AS rows_warned, "
+        "array_join(array_sort(array_distinct(flatten(collect_list(rescued_keys)))), ', ') "
+        "AS rescued_keys, "
         f"{blockers} AS blocking_rules, "
         "array_join(array_sort(array_distinct(flatten(collect_list(failed)))), ', ') "
         "AS failed_rules "
@@ -555,6 +689,7 @@ def read_files_table(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
                 "failed_rules": data.get("failed_rules") or "",
                 "blocking_rules": data.get("blocking_rules") or "",
                 "rows_warned": int(data.get("rows_warned") or 0),
+                "rescued_keys": data.get("rescued_keys") or "",
             }
         )
     return files
@@ -606,6 +741,7 @@ def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
                 "failed_rules": data.get("failed_rules") or "",
                 "blocking_rules": blocking,
                 "rows_warned": warned,
+                "rescued_keys": data.get("rescued_keys") or "",
             }
         )
     return files
@@ -614,20 +750,20 @@ def read_files(spark: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
 EMPTY_FILE = "file has no rows"
 # A file that landed a moment before the previous run started still belongs to that run.
 ARRIVAL_SLACK = timedelta(minutes=5)
+# How far the volume's clock and the cluster's may differ about when a file landed.
+ARRIVAL_CLOCK_SKEW = timedelta(seconds=3)
 # A clock that runs a little behind the cluster's must not hide rows of this run.
 LOAD_TIME_SLACK = timedelta(minutes=5)
 
 
-def read_arrivals(
-    spark: Any, catalog: str, row: dict[str, Any], files: list[dict[str, Any]]
-) -> list[dict[str, Any]] | None:
-    """The files that arrived since the previous regular run, or None when no file is expected.
+def arrival_inputs(
+    spark: Any, catalog: str, row: dict[str, Any]
+) -> tuple[list[dict[str, Any]], set[str]] | None:
+    """What the arrivals check needs that does not depend on this run's own files.
 
-    The volume is listed for names, sizes and arrival times only. A file is new when it arrived
-    after the previous regular run started (a backfill, which also writes to the ledger, does not
-    move that). ``has_rows`` is true when this run counted rows from it (``files``);
-    ``recorded_before`` when an earlier load already wrote it to ``ledger_detail``. Nothing here is
-    a pipeline table: it is the listing, ``load_ledger`` and ``ledger_detail``.
+    The files in the volume that arrived since the previous regular run, and the paths the ledger
+    already holds. None when no file is expected. The three lookups (the previous run, the recorded
+    paths, the listing) are independent, so they are asked together.
     """
 
     if not row.get("_expect_file") or not row.get("_path"):
@@ -644,39 +780,151 @@ def read_arrivals(
         if isinstance(this_run, datetime)
         else ""
     )
-    previous = spark.sql(
+    previous_sql = (
         f"SELECT unix_timestamp(max(started_at)) AS since FROM {meta}.{LEDGER} "
         f"WHERE layer = {sql_string(row['layer'])} AND job_name = {sql_string(row['job_name'])} "
         f"AND dataflow = {pid} AND update_id NOT LIKE 'backfill-%'{before}"
-    ).collect()
+    )
+    recorded_sql = (
+        f"SELECT DISTINCT src_file_path FROM {meta}.{LEDGER_DETAIL} "
+        f"WHERE dataflow = {pid} AND src_file_path IS NOT NULL"
+    )
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        previous_future = pool.submit(lambda: spark.sql(previous_sql).collect())
+        recorded_future = pool.submit(lambda: spark.sql(recorded_sql).collect())
+        listing_future = pool.submit(list_volume_files, row["_path"], row.get("_path_glob") or None)
+        previous = previous_future.result()
+        recorded = {str(item["src_file_path"]) for item in recorded_future.result()}
+        listing = listing_future.result()
     since = previous[0]["since"] if previous else None
     cutoff = float(since) - ARRIVAL_SLACK.total_seconds() if since is not None else None
-    recorded = {
-        str(item["src_file_path"])
-        for item in spark.sql(
-            f"SELECT DISTINCT src_file_path FROM {meta}.{LEDGER_DETAIL} "
-            f"WHERE dataflow = {pid} AND src_file_path IS NOT NULL"
-        ).collect()
-    }
-    read = {str(item["src_file_path"]) for item in files}
-    # Nothing that arrived after this run ended belongs to it. In the hook that is every file,
-    # since it runs as the update ends. A replay runs later, so a file that came after is left
-    # for the run it belongs to.
-    ended = row.get("ended_at")
+    # Auto Loader lists the folder once the run's flows start, so a file that landed after that
+    # belongs to the next run. This run did not miss it, and must not call it empty. The few
+    # seconds allow for the volume's clock and the cluster's not agreeing.
+    started = row.get("started_at")
     until = (
-        ended.timestamp() + ARRIVAL_SLACK.total_seconds() if isinstance(ended, datetime) else None
+        started.timestamp() + ARRIVAL_CLOCK_SKEW.total_seconds()
+        if isinstance(started, datetime)
+        else None
     )
+    arrived = [
+        item
+        for item in listing
+        if (cutoff is None or item["arrived_at"].timestamp() > cutoff)
+        and (until is None or item["arrived_at"].timestamp() <= until)
+    ]
+    return arrived, recorded
+
+
+def read_arrivals(
+    spark: Any,
+    catalog: str,
+    row: dict[str, Any],
+    files: list[dict[str, Any]],
+    inputs: tuple[list[dict[str, Any]], set[str]] | None = None,
+) -> list[dict[str, Any]] | None:
+    """The files that arrived since the previous regular run, or None when no file is expected.
+
+    The volume is listed for names, sizes and arrival times only. A file is new when it arrived
+    after the previous regular run started (a backfill, which also writes to the ledger, does not
+    move that). ``has_rows`` is true when this run counted rows from it (``files``);
+    ``recorded_before`` when an earlier load already wrote it to ``ledger_detail``. Nothing here is
+    a pipeline table: it is the listing, ``load_ledger`` and ``ledger_detail``. ``inputs`` are the
+    lookups from ``arrival_inputs``, when the caller already asked for them.
+    """
+
+    found = inputs if inputs is not None else arrival_inputs(spark, catalog, row)
+    if found is None:
+        return None
+    arrived, recorded = found
+    read = {str(item["src_file_path"]) for item in files}
+    # A file this run did not read and the ledger does not know may have been read by an update
+    # whose ledger row was never written. Its rows are in bronze or quarantine then, so it is not
+    # empty, and it is not this run's to report.
+    unknown = [
+        item
+        for item in arrived
+        if item["file_path"] not in read and item["file_path"] not in recorded
+    ]
+    elsewhere = _read_without_a_record(spark, row, unknown) if unknown else set()
     return [
         {
             "src_file_path": item["file_path"],
             "src_file_name": item["file_path"].rsplit("/", 1)[-1],
             "has_rows": item["file_path"] in read,
             "recorded_before": item["file_path"] in recorded,
+            "read_elsewhere": item["file_path"] in elsewhere,
         }
-        for item in list_volume_files(row["_path"], row.get("_path_glob") or None)
-        if (cutoff is None or item["arrived_at"].timestamp() > cutoff)
-        and (until is None or item["arrived_at"].timestamp() <= until)
+        for item in arrived
     ]
+
+
+def _read_without_a_record(
+    spark: Any, row: dict[str, Any], items: list[dict[str, Any]]
+) -> set[str]:
+    """The files among ``items`` that have rows in the table or its quarantine, from any update.
+
+    Only rows loaded since the files arrived are looked at, so the lookup stays narrow.
+    """
+
+    paths = [item["file_path"] for item in items]
+    since = min(item["arrived_at"] for item in items) - ARRIVAL_SLACK
+    listed = ", ".join(sql_string(path) for path in paths)
+    found: set[str] = set()
+    for table in (row.get("target_table"), row.get("_quarantine_table")):
+        if not table:
+            continue
+        rows = spark.sql(
+            f"SELECT DISTINCT {SRC_FILE_PATH} FROM {table} WHERE {SRC_FILE_PATH} IN ({listed}) "
+            f"AND {INGEST_TIMESTAMP} >= TIMESTAMP '{since.astimezone(UTC):%Y-%m-%d %H:%M:%S}+00:00'"
+        ).collect()
+        found.update(str(item[SRC_FILE_PATH]) for item in rows)
+    return found
+
+
+def add_drift_file(row: dict[str, Any]) -> dict[str, Any]:
+    """The file row of the file whose new columns stopped the update, when the error names it."""
+
+    path, fields = row.get("_drift_file"), row.get("_new_fields") or []
+    files = row.setdefault("_files", [])
+    if not path or not fields or any(item.get("src_file_path") == path for item in files):
+        return row
+    held = row.get("_drift_rows")
+    count = int(held) if isinstance(held, int) else 0
+    files.append(
+        {
+            "detail_kind": "file",
+            "src_file_path": path,
+            "src_file_name": str(path).rsplit("/", 1)[-1],
+            "status": "FAILED",
+            # Every row of the file was held back, as with a blocked file: read, kept nowhere.
+            "rows_read": count,
+            "rows_inserted": 0,
+            "rows_quarantined": 0,
+            "rows_dropped": count,
+            "failed_rules": "",
+            "blocking_rules": "",
+            "error_message": drift_file_message(
+                fields, row.get("_drift_types") or {}, held if isinstance(held, int) else None
+            ),
+        }
+    )
+    row["files_read"] = int(row.get("files_read") or 0) + 1
+    row["files_failed"] = int(row.get("files_failed") or 0) + 1
+    row["rows_read"] = int(row.get("rows_read") or 0) + count
+    row["rows_dropped"] = int(row.get("rows_dropped") or 0) + count
+    row["target_status"] = "FAILED"
+    reason = str(row.get("failure_reason") or "")
+    if reason.startswith(DRIFT_MESSAGE):
+        said = (
+            f"the update stopped: none of the file's {held} row(s) were read into the table"
+            if isinstance(held, int)
+            else "the update stopped: no rows were read into the table (the file's row count is unknown)"
+        )
+        row["failure_reason"] = _clip(
+            reason.replace("the update stopped and nothing of this run was loaded", said, 1)
+        )
+    return row
 
 
 def apply_arrivals(row: dict[str, Any], arrivals: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -689,8 +937,26 @@ def apply_arrivals(row: dict[str, Any], arrivals: list[dict[str, Any]] | None) -
     if arrivals is None:
         return row
     files = row.setdefault("_files", [])
+    # The run read rows but no file was counted: the counts could not be found, which says
+    # nothing about whether a file was empty or came at all. Claim neither.
+    unknown = not files and int(row.get("rows_read") or 0) > 0
     # A file an earlier load already recorded is not new, even when it falls in the slack window.
-    new = [item for item in arrivals if item["has_rows"] or not item["recorded_before"]]
+    if row.get("_read_failed") and not files:
+        # The read stopped before it counted any file. Only a file the error names can be said
+        # anything about: the others of the batch were not read, and the next run reads them, so
+        # no row is written for them (a row now would make that run look like a reload).
+        add_drift_file(row)
+        return row
+    elsewhere = [item for item in arrivals if item.get("read_elsewhere")]
+    new = [
+        item
+        for item in arrivals
+        if (item["has_rows"] or not item["recorded_before"]) and not item.get("read_elsewhere")
+    ]
+    if unknown:
+        return row
+    if not new and not files and elsewhere:
+        return row  # a file came, an earlier update read it: nothing here to say about it
     if not new and not files:
         mark_failed(
             row, f"no file arrived in {row.get('_path') or 'the source'} since the previous run"
@@ -742,11 +1008,86 @@ def warning_text(item: dict[str, Any]) -> str | None:
     if not warned or item["status"] == "FAILED":
         return None
     names = item.get("failed_rules") or ""
+    keys = item.get("rescued_keys") or ""
+    listed = [name for name in names.split(", ") if name]
+    # A row can also have broken one of the table's own rules and been kept, because that rule's
+    # action is warn (the table's, or a run's on_fail). Say so: those rows are in the table.
+    rules = [name for name in listed if name not in ("new_columns", "schema_conformance")]
+    if rules:
+        text = f"{warned} row(s) loaded although they broke rule(s): {', '.join(rules)}"
+        if "new_columns" in listed:
+            text += ". New column(s) kept in _rescued_data" + (f": {keys}" if keys else "")
+        elif "schema_conformance" in listed:
+            text += ". A value that did not fit its column is kept in _rescued_data"
+        return text
+    if "new_columns" in listed:
+        # A rescued column has no type and is not a column of the table. Say what to do about it.
+        return (
+            f"{warned} row(s) loaded with new column(s) kept in _rescued_data"
+            + (f": {keys}" if keys else "")
+            + ". To make them columns, set infer_schema: strings (with schema_evolution: "
+            "add_new_columns) or declare them under columns: with their type"
+        )
     return (
         f"{warned} row(s) loaded with a warning"
         + (f": {names}" if names else "")
-        + " (values kept in _rescued_data)"
+        + (
+            f" (values kept in _rescued_data for: {keys})"
+            if keys
+            else " (values kept in _rescued_data)"
+        )
     )
+
+
+def read_added_columns(spark: Any, catalog: str, row: dict[str, Any]) -> list[tuple[str, str]]:
+    """The columns the table has now that the registry does not know yet, as (name, type).
+
+    Only a table whose new columns become columns (``add_new_columns``) is asked. The registry is
+    brought up to date after the update, by the ``infer_columns_refresh`` task, so while the update's
+    own ledger rows are written a column added in this update is not in it yet. A table whose registry
+    holds no column of its own yet is on its first load: nothing there is new.
+    """
+
+    from lakeflow_framework.metadata import metadata_column_names
+
+    target = row.get("target_table")
+    if not row.get("_adds_columns") or not target:
+        return []
+    meta = f"{require_catalog(catalog)}.framework_meta"
+    parent = sql_string(str(target))
+    known = {
+        str(item["full_name"]).removeprefix(f"{target}.").lower()
+        for item in spark.sql(
+            f"SELECT full_name FROM {meta}.asset_registry_current "
+            f"WHERE object_kind = 'column' AND parent_full_name = {parent}"
+        ).collect()
+    }
+    skip = {name.lower() for name in metadata_column_names()} | {"_rescued_data"}
+    if not known - skip:
+        return []
+    return [
+        (field.name, field.dataType.simpleString())
+        for field in spark.table(str(target)).schema.fields
+        if field.name.lower() not in skip and field.name.lower() not in known
+    ]
+
+
+def apply_added_columns(row: dict[str, Any], added: list[tuple[str, str]]) -> dict[str, Any]:
+    """Flag the run's files WARNING, naming each column added to the table and its type."""
+
+    if not added:
+        return row
+    text = "new column(s) added to the table: " + ", ".join(
+        f"{name} {kind}" for name, kind in added
+    )
+    for item in row.get("_files") or []:
+        if item["status"] == "FAILED":
+            continue
+        item["status"] = "WARNING"
+        item["error_message"] = (
+            f"{item['error_message']}; {text}" if item.get("error_message") else text
+        )
+    return row
 
 
 def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, Any]:
@@ -767,6 +1108,19 @@ def apply_files(row: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, A
             if item["status"] == "FAILED"
             else warning_text(item)
         )
+    if len(files) == 1:
+        # One file in the run: the rows read and kept nowhere are its own. The file's count
+        # then agrees with the table's, even when it is read back from bronze and quarantine.
+        only = files[0]
+        held = int(row.get("rows_dropped") or 0)
+        counted = int(only.get("rows_inserted") or 0) + int(only.get("rows_quarantined") or 0)
+        if (
+            held
+            and not only.get("rows_dropped")
+            and counted + held == int(row.get("rows_read") or 0)
+        ):
+            only["rows_dropped"] = held
+            only["rows_read"] = counted + held
     if files:
         row["files_read"] = len(files)
         row["files_failed"] = len(failed)
@@ -823,33 +1177,70 @@ def recorded_dataflows(spark: Any, catalog: str, row: dict[str, Any]) -> set[str
 
 
 def write_rows(
-    spark: Any, catalog: str, rows: list[dict[str, Any]], *, replay: bool = False
+    spark: Any,
+    catalog: str,
+    rows: list[dict[str, Any]],
+    *,
+    replay: bool = False,
+    keep_kind: bool = False,
 ) -> int:
     """Append an update's rows to load_ledger and ledger_detail. Returns how many ledger rows.
 
     A pipeline's ``spark.sql`` accepts only SELECT, SHOW, DESCRIBE, and USE, so the rows are
     written with the DataFrame writer. Rows already recorded for the update are left out.
-    ``replay=True`` (hourly catch-up) stamps ``load_kind=catchup`` when not already backfill.
+    ``replay=True`` (hourly catch-up) stamps ``load_kind=catchup`` when not already backfill;
+    ``keep_kind`` leaves the kind as recorded, for a job recording its own update.
     """
 
     if not rows:
         return 0
     meta = f"{require_catalog(catalog)}.framework_meta"
-    done = recorded_dataflows(spark, catalog, rows[0])
-    fresh = [row for row in rows if row["dataflow"] not in done]
-    if not fresh:
-        return 0
-    for row in fresh:
-        if replay and row.get("load_kind") != "backfill":
-            row["load_kind"] = "catchup"
-        if "_files" not in row:
+    # The pipeline shuts down within seconds of its last flow, so what the write needs is asked for
+    # together, not one answer after another: which dataflows are recorded, each run's files, and
+    # what the arrivals check will look at. Only what depends on the answers waits for them.
+    unread = [row for row in rows if "_files" not in row]
+    workers = min(1 + 2 * len(unread), 12)
+    with ThreadPoolExecutor(max_workers=max(workers, 1)) as pool:
+        done_future = pool.submit(recorded_dataflows, spark, catalog, rows[0])
+        asked: dict[str, tuple[Any, Any]] = {}
+
+        def ask(row: dict[str, Any]) -> None:
+            asked[row["dataflow"]] = (
+                pool.submit(read_files, spark, row),
+                pool.submit(arrival_inputs, spark, catalog, row),
+            )
+
+        if not replay:
+            # The pipeline's own recorder is racing its shutdown, and its rows are almost
+            # always new: ask for everything now.
+            for row in unread:
+                ask(row)
+        done = done_future.result()
+        fresh = [row for row in rows if row["dataflow"] not in done]
+        if not fresh:
+            return 0
+        for row in fresh:
+            if replay and "_files" not in row:
+                ask(row)  # a replay has no deadline, and asks only for what is not recorded
+        for row in fresh:
+            if replay and not keep_kind and row.get("load_kind") != "backfill":
+                row["load_kind"] = "catchup"
+            if "_files" in row:
+                continue
+            files_future, inputs_future = asked[row["dataflow"]]
             try:
-                apply_files(row, read_files(spark, row))
+                apply_files(row, files_future.result())
             except Exception:
                 # A count that cannot be read is 0, not a lost ledger row. The table's own
                 # flows still say what happened.
                 log.exception("load metrics: could not read the file counts of %s", row["dataflow"])
                 apply_files(row, [])
+            try:
+                apply_added_columns(row, read_added_columns(spark, catalog, row))
+            except Exception:
+                log.exception(
+                    "load metrics: could not tell which columns %s gained", row["dataflow"]
+                )
             if row.get("load_kind", "regular") == "regular":
                 try:
                     if reloaded_files(spark, meta, row):
@@ -858,8 +1249,18 @@ def write_rows(
                     log.exception(
                         "load metrics: could not tell if %s reloaded files", row["dataflow"]
                     )
+            add_drift_file(row)
             try:
-                apply_arrivals(row, read_arrivals(spark, catalog, row, row.get("_files") or []))
+                apply_arrivals(
+                    row,
+                    read_arrivals(
+                        spark,
+                        catalog,
+                        row,
+                        row.get("_files") or [],
+                        inputs=inputs_future.result(),
+                    ),
+                )
             except Exception:
                 log.exception("load metrics: could not read the arrivals of %s", row["dataflow"])
     at = _now()
@@ -953,6 +1354,15 @@ def install(
     def record_load_metrics(event: dict[str, Any]) -> None:
         try:
             rows = recorder.handle(event)
+            if rows and any(row.get("_drift_file") for row in rows):
+                # The file has to be read to count its rows, and the pipeline is shutting down.
+                # The job's park_failed_files task records this update right after, with the count.
+                log.info(
+                    "load metrics: %s update %s stopped on schema drift; the job records it",
+                    recorder.job_name,
+                    rows[0]["update_id"],
+                )
+                rows = None
             if rows:
                 written = write(spark, catalog, rows)
                 log.info(
@@ -1000,6 +1410,13 @@ def _count(flow: _Flow | None, metric: str) -> int:
 def _status(flow: _Flow | None, state: str, build_error: str | None) -> str:
     if build_error:
         return "FAILED"
+    if (
+        flow is not None
+        and flow.status in {"SKIPPED", "EXCLUDED"}
+        and state in {"FAILED", "CANCELED"}
+    ):
+        # The table did not run because the update stopped before it: it did not load.
+        return state
     if flow is not None and flow.status in TERMINAL_FLOW:
         return flow.status
     if flow is not None and flow.status == "IDLE":
