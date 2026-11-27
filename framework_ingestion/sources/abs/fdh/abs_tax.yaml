@@ -32,7 +32,7 @@ source:
   header: true                       # default true
   # max_files_per_trigger: 100
   path_glob: "*.csv"
-  schema_evolution: fail  # rescue|add_new_columns|fail|none
+  schema_evolution: rescue  # rescue|add_new_columns|fail|none
 
 raw_to_bronze:
   bronze:
@@ -41,6 +41,7 @@ raw_to_bronze:
   # How rows are taken: append (append) | scd1 (upsert on primary_keys) | scd2 (keep history)
   # | full_refresh (database tables). Omitted: append for files.
   load_type: append
+  infer_schema: strings
   # Declaring the columns turns type inference off, so every column lands as the type given here.
   # A value that cannot be read as that type goes to _rescued_data instead of failing the load.
   columns:
@@ -57,10 +58,7 @@ raw_to_bronze:
     - { name: end_lat, type: string, description: Latitude of the end, as text }
     - { name: end_lng, type: string, description: Longitude of the end, as text }
     - { name: member_casual, type: string, description: Whether the rider is a member or casual }
-    - { name: sample_1, type: string, description: Whether the rider is a member or casual }
-    - { name: sample_2, type: string, description: Whether the rider is a member or casual }
-    - { name: sample_column_3, type: string, description: Whether the rider is a member or casual }
-    - { name: sample_column_4, type: string, description: Whether the rider is a member or casual }
+
 
   rules:
     - { name: ride_id_present, expression: "ride_id IS NOT NULL AND length(trim(ride_id)) > 0" }
@@ -70,7 +68,7 @@ raw_to_bronze:
     - { name: started_at_present, expression: "started_at IS NOT NULL AND length(trim(started_at)) > 0" }
     - { name: start_station_name_present, expression: "start_station_name IS NOT NULL AND length(trim(start_station_name)) > 0" }
     - { name: member_casual_known, expression: "member_casual IN ('member', 'casual')" }
-    
+
   on_fail: fail
 
 # Failed rows go to abs_bronze.gl_abs_qrntn: the bronze schema, the bronze table plus _qrntn.

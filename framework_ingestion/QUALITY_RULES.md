@@ -1,6 +1,6 @@
 # Quality rules for bronze tables
 
-A rule is a SQL condition that every good row must satisfy. By default a row that fails any rule goes to the table's quarantine table instead of bronze. Declaring a rule (or a `quarantine:` block) is what creates that table; a spec with neither has no quarantine, and a row failing the framework's own checks is dropped and counted ([README](README.md#quality-rules-and-quarantine)). Every rule example on this page is in `framework_tests/test_quality_cookbook.py`, which checks that the validator accepts it and that sample values pass and fail as shown. The same samples were also run on Spark.
+A rule is a SQL condition that every good row must satisfy. By default a row that fails any rule goes to the table's quarantine table instead of bronze. Declaring a rule (or a `quarantine:` block) is what creates that table; a spec with neither has no quarantine, and a row failing the framework's own checks loads with a warning, except a row with a null key on a table that keeps rows by key, which is dropped and counted ([README](README.md#quality-rules-and-quarantine)). Every rule example on this page is in `framework_tests/test_quality_cookbook.py`, which checks that the validator accepts it and that sample values pass and fail as shown. The same samples were also run on Spark.
 
 ## What happens to a row that fails a rule
 
@@ -9,8 +9,8 @@ You choose with `on_fail`, set in **one place only**: on `raw_to_bronze` for eve
 | Action | A row that fails | The load | Use it when |
 | --- | --- | --- | --- |
 | `quarantine` (default) | Goes to `<bronze table>_qrntn` with the names of the rules it failed. Good rows load | Continues, `COMPLETED` | You want the good data now and the bad data kept to look at |
-| `drop` | Is discarded and kept nowhere. Only the counts in `expectations` show it | Continues | The bad rows are noise you do not need (it loses data, so use it sparingly) |
-| `warn` | Loads into bronze like any row. The failure is only counted (`expectations`, the pipeline's data quality view) | Continues | A rule you are still tuning, or a soft expectation |
+| `drop` | Is discarded and kept nowhere. Only the counts show it (`rows_dropped` in the ledger, the rule's expectation in the pipeline) | Continues | The bad rows are noise you do not need (it loses data, so use it sparingly) |
+| `warn` | Loads into bronze like any row. The failure is only counted (the rule's expectation, the pipeline's data quality view) and its file shows `WARNING` in `ledger_detail` | Continues | A rule you are still tuning, or a soft expectation |
 | `fail` | **Blocks the whole file.** None of the file's rows reach bronze, the good ones included. Its bad rows go to quarantine | The run is `FAILED`, naming the file and the rule. Every other file still loads | A file with one bad row is not trustworthy, and you would rather stop and fix it |
 
 ```yaml
@@ -29,7 +29,7 @@ raw_to_bronze:
     - { name: end_station_id_length,    expression: "...", on_fail: warn }             # just count
 ```
 
-**Switching a rule off.** Add `enabled: false` to a rule to keep it in the spec without running it. It is still validated and registered, so the registry shows it as inactive, but no row is judged by it and no expectation is counted for it. Remove the line (or set `enabled: true`) to turn it back on. A rule you comment out is different: a YAML comment never reaches the registry, so the rule is not registered at all.
+**Switching a rule off.** Add `enabled: false` to a rule to keep it in the spec without running it. It is still validated and registered, so the registry shows it as inactive, but no row is judged by it, no expectation is counted for it, and `./run.sh check:rules` skips it. Remove the line (or set `enabled: true`) to turn it back on. A rule you comment out is different: a YAML comment never reaches the registry, so the rule is not registered at all.
 
 ```yaml
     - { name: start_lat_in_range, expression: "start_lat rlike '^-?[0-9]+([.][0-9]+)?$'", enabled: false }
@@ -50,7 +50,7 @@ Rules of different actions mix in one table. A row that fails a `quarantine` rul
 - The pipeline update, and so the job, **fails**, with the file names and rules in the error. The run is `FAILED` in `load_ledger` with `files_failed` set, and each blocked file is `FAILED` in `ledger_detail` (`error_message`: `blocked by fail rule(s): <rules>`).
 - **The file is marked as read.** The next run does not pick it up, so it does not fail again. A retry of the same update never succeeds by skipping the file: automatic retry of a failed update is turned off for these pipelines for that reason (`pipelines.numUpdateRetryAttempts` is 0).
 - **The file is moved to `_failed`.** After the run, a job task (`park_failed_files`, which runs even though the refresh failed) moves each blocked file to `<volume>/_failed/`, at the root of its volume (for the volume `gl_source_extract`, that is `gl_source_extract/_failed/`), keeping its path below the volume. Auto Loader skips a folder whose name starts with an underscore, so the pipeline never reads it again, and it does not count as a new arrival. The ledger is the list: a file moves when its latest `ledger_detail` status is `FAILED` for a blocking rule, and running the task again moves nothing more. The task needs write access to the volume.
-- To load a blocked file you fix the data or the rule and run a backfill that **names the file** (`mode=files files=<name>`, below). The backfill finds it in `_failed`, moves it back, loads it through the rules, and moves it into `_failed` again if it is still blocked. `mode=failed` does the same for every file whose latest status is `FAILED`. No other backfill touches `_failed`.
+- To load a blocked file you fix the data or the rule and run a backfill that **names the file** (`mode=files files=<name>`, below). The backfill finds it in `_failed`, moves it back, loads it through the rules, and moves it into `_failed` again if it is still blocked. `mode=failed` does the same for every file whose latest status is `FAILED`, or only for the ones named in `files`. No other backfill touches `_failed`.
 - **A rule change applies from the next run.** What a row's rules mean is decided once, when the file is read, and stored. Files already read are never judged again by a changed rule, unless you backfill them.
 
 Nothing reads `_failed`. Auto Loader and the file listing skip a folder that starts with an underscore. On top of that, validation refuses a spec whose `raw_path` includes `_failed`, and refuses `copy_into`, `ctas` and `autoloader` reading the root of a volume, because those would contain it. Read a folder below the volume root instead.
@@ -126,7 +126,7 @@ backfill in `full_refresh` mode.
 
 One job, `framework_backfill` (in `framework_bundle`), reloads any table. It loads the table's spec from the registry and runs the same staging step as the pipeline, so the same rules, rule actions, audit columns and ledger apply:
 
-Run from the Databricks UI (**Run now with different settings**), the job's `table` and `files` start as patterns: `aal_dev_fdh.<bronze_schema>.<table>` and `/Volumes/aal_dev_fdh/<raw_schema>/<volume>/<folder>/<file>.csv`. Edit the parts in angle brackets, and add more files with a comma between full paths. Left unedited, `table` is refused with a message, and so is `files` in `mode=files`. In `dates`, `failed` and `full_refresh` the `files` pattern is ignored, so only `table` and `mode` need changing. To reload every file of a table, clear `files` and set `confirm` to `true`. `dry_run` starts as `true`, so nothing changes until you set it to `false`.
+Run from the Databricks UI (**Run now with different settings**), the job's `table` and `files` start as patterns: `aal_dev_fdh.<bronze_schema>.<table>` and `/Volumes/aal_dev_fdh/<raw_schema>/<volume>/<folder>/<file>.csv`. Edit the parts in angle brackets, and add more files with a comma between full paths. Left unedited, `table` is refused with a message, and so is `files` in `mode=files` and `mode=rescue`. In `dates`, `failed` and `full_refresh` the `files` pattern is ignored, so only `table` and `mode` need changing. To reload every file of a table, clear `files` and set `confirm` to `true`. `dry_run` starts as `true`, so nothing changes until you set it to `false`.
 
 `table` is the bronze table's **full name** (`catalog.schema.table`). Its pipeline id, such as `abs_gl`, works too, and so does the bare table name when only one table has it. `files` are **full volume paths**: `/Volumes/<catalog>/<schema>/<volume>/<folder>/<file>` is exactly one file, and a path must be inside the table's own folder (another table's file is refused). A bare file name still works and matches that name in any folder of the table. A file that sits in `_failed` can be given by the path it sits at or the path it had before it was moved.
 
@@ -348,7 +348,7 @@ The general shapes: `a IS NULL OR <check>` for an optional column, and `CASE WHE
 | `new_columns` | A CSV, delimited or JSON file, with `schema_evolution: rescue` | The file has a column the table does not have, so its values were rescued into `_rescued_data`. Always a warning, never `fail`, `drop` or `quarantine`: the row loads and the file shows `WARNING` in `ledger_detail`, naming the columns |
 | `cast_<column>` | A column is declared | The value cannot be cast to the declared type. For a `string` column this cannot fail |
 | `not_null_<key>` | `primary_keys` is set | A key is empty |
-| `not_null_<watermark_column>` | `scd1` or `scd2` | The ordering column is empty (a change cannot be ordered without it) |
+| `not_null_<watermark_column>` | `scd1` or `scd2` (or `dedup: true`), when the column is not a key | The ordering column is empty (a change cannot be ordered without it) |
 
 ## What a rule cannot do
 
@@ -381,17 +381,20 @@ Rules apply to files loaded from now on. Rows already in bronze are not re-check
 
 ## Where to see the results
 
-- **The rules:** `framework_meta.asset_registry_current`, the `pipeline` row for the table, `config:rules`. They are also in the spec and in `.build/manifests/<delivery>.json`.
-- **Per run, per rule:** `framework_meta.load_ledger.expectations` (or `v_loads`) has each rule with `passed_records` and `failed_records`.
+- **The rules:** `framework_meta.v_rules` (one row per rule, with `origin`, `action` and `enabled`) and `v_rule_history`. The raw form is the `pipeline` row of `framework_meta.asset_registry_current`, `config_json:rules`. They are also in the spec and in `.build/manifests/<delivery>.json`.
+- **Per run, per table:** `v_loads` has `rows_quarantined` and `rows_dropped`, and `v_ledger_detail` has each file's `failed_rules` and `blocking_rules`.
+- **Per run, per rule:** the pipeline's event log, `framework_events.<job>_event_log`, has each rule's `passed_records` and `failed_records` on the `flow_progress` events of the table's staging dataset (`<pipeline_id>_staged`). The ledger does not keep per-rule counts.
 - **The rows and why:** `<bronze table>_qrntn`, with `failed_rules` listing the rules each row failed.
 - **In the UI:** the pipeline (not the job), the latest update, the data quality view of the table's staging dataset.
 
 ```sql
-SELECT e.name, e.passed_records, e.failed_records
-FROM (SELECT explode(from_json(expectations,
-        'array<struct<name:string,passed_records:bigint,failed_records:bigint>>')) AS e
-      FROM <catalog>.framework_meta.v_loads WHERE dataflow = 'abs_gl')
-WHERE e.failed_records > 0;
+SELECT timestamp, e.name, e.passed_records, e.failed_records
+FROM (SELECT timestamp, explode(from_json(details:flow_progress.data_quality.expectations,
+        'array<struct<name:string,dataset:string,passed_records:bigint,failed_records:bigint>>')) AS e
+      FROM <catalog>.framework_events.abs_daily_event_log
+      WHERE event_type = 'flow_progress' AND origin.flow_name LIKE '%abs_gl_staged')
+WHERE e.failed_records > 0
+ORDER BY timestamp DESC;
 ```
 
 ## Tips

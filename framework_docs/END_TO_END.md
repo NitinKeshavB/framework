@@ -15,9 +15,9 @@ CI runs `./run.sh lint:ci` (Ruff `E,F,I,B,S,UP` plus hygiene and local generate 
 
 For each delivery of each source system, from the specs alone:
 
-- `pipelines/<source_system>_<delivery>.py` calls `build_pipelines([...])` once, with every table in that delivery. The registry is read in one query.
+- `.build/pipelines/<source_system>_<delivery>.py` calls `build_pipelines([...])` once, with every table in that delivery. The specs come from the delivery's manifest; only a pipeline without one reads the registry, in one query.
 - `.build/resources/<source_system>_<delivery>.pipeline.yml` is one serverless Lakeflow pipeline (regenerated on deploy; not committed).
-- `.build/resources/<source_system>_<delivery>.job.yml` is one job. A file source fires on files landing in the raw volume. A scheduled source uses its cron.
+- `.build/resources/<source_system>_<delivery>.job.yml` is one job (see [What a delivery job does](#what-a-delivery-job-does) for its tasks). A delivery with a schedule uses its cron. A file delivery without one fires on files landing in its volume.
 - `.build/manifests/<source_system>_<delivery>.json` is the compiled delivery config the pipeline reads via `lff.manifest`.
 - `SOURCE_MAP.md` shows the same model as a diagram and tables (committed; `generate:check` drifts this only).
 
@@ -34,31 +34,51 @@ Definitions change only when specs change, and specs change only at deploy, so t
 
 If `registry_sync` fails, the deploy command fails.
 
-Every framework job task writes timestamped log lines to its run's output: the arguments it ran with, each step with its start, end, seconds taken, and the error that ended it, and what it decided. `framework_ddl` logs each statement and its time, or that the SQL was already applied. `registry_sync` logs the definitions it found by kind, each new or changed one, each refusal with the owner that holds the name, each retired definition, each Unity Catalog change, and each schema or table not yet created. `framework_runs` logs the read window, the runs read per job, and any registered workflow whose job it cannot see. `framework_optimize` logs the files each `OPTIMIZE` removed and added, and how many hot rows each archive move transferred.
+Every framework job task writes timestamped log lines to its run's output: the arguments it ran with, each step with its start, end, seconds taken, and the error that ended it, and what it decided. `framework_ddl` logs each statement and its time, or that the SQL was already applied. `registry_sync` logs the definitions it found by kind, each new or changed one, each refusal with the owner that holds the name, each retired definition, each Unity Catalog change, and each schema or table not yet created. `framework_runs` logs the read window, the runs read per job, and any registered workflow whose job it cannot see. `framework_optimize` logs the files each `OPTIMIZE` removed and added, and how many hot rows each archive move transferred. `framework_backfill` logs the request and its outcome (a dry run lists the files), with a `WARNING:` line for each problem. The delivery job's own `park_failed_files` and `infer_columns` tasks log plain lines (no timestamps): the ledger rows they wrote, the files each table moved, and what each table's columns did.
 
 ## What a delivery job does
 
-A delivery job has one task, **refresh_pipeline**. The pipeline records its own loads: an event hook inside it writes, once per update, one `load_ledger` row per registered dataflow and one `ledger_detail` row per file (or curated input), from that update's events (AUTO CDC upserts/deletes when `num_output_rows` is absent). A table with no progress, or one whose spec could not be registered, is **FAILED** with the error. Every count is a number: a load that failed or read nothing has 0, never NULL. If the pipeline is shut down before the hook finishes, the hourly `framework_runs` writes the missing update from the event log. All of it is insert-only (no MERGE); `v_loads` / `v_job_runs` keep the latest `recorded_at` per key. Use `v_loads` for recon, `ledger_detail` for what happened to each file, and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint, so **a file that was read is not read again**: to load a blocked file, fix it and run `./run.sh backfill`. The job does not write definitions to the registry.
+A delivery job's main task is **refresh_pipeline**. `generate` adds another task only when a table in the delivery needs it, so a job may have just this one:
+
+| Task | Added when | What it does |
+| --- | --- | --- |
+| `refresh_pipeline` | Always | Runs one update of the delivery's pipeline. |
+| `park_failed_files` | A file table has a `fail` rule, or `schema_evolution: fail` | Runs even when the refresh failed (`run_if: ALL_DONE`). It first writes this update's ledger rows if the event hook was cut off, then moves each blocked or drifted file to `<volume>/_failed/` (see [Blocked and parked files](#blocked-and-parked-files)). |
+| `infer_columns` | A table declares no `columns` | Registers bronze's columns in the registry after the first load, marked `source = inferred`. It never fails the job; a table already registered costs one `SELECT`. |
+| `infer_columns_refresh` | A table declares no `columns` and sets `schema_evolution: add_new_columns` | The same, after every run, so the registry follows the columns bronze gains. |
+| `batch_load` | A frozen `copy_into` or `ctas` table | Runs before the refresh. Validation rejects these methods today. |
+
+The pipeline records its own loads: an event hook inside it writes, once per update, one `load_ledger` row per registered dataflow and one `ledger_detail` row per file (or curated input), from that update's events (AUTO CDC upserts/deletes when `num_output_rows` is absent). A table with no progress, or one whose spec could not be registered, is **FAILED** with the error. Every count is a number: a load that failed or read nothing has 0, never NULL. If the pipeline is shut down before the hook finishes, the job's `park_failed_files` task (when the job has one) or the hourly `framework_runs` writes the missing update from the event log. All of it is insert-only (no MERGE); `v_loads` / `v_job_runs` keep the latest `recorded_at` per key. Use `v_loads` for recon, `ledger_detail` for what happened to each file, and `v_load_failures` for what failed and why. To resume after a failure: fix the cause, then **Repair** the failed Databricks job run (failed tasks only); Auto Loader continues from its checkpoint, so **a file that was read is not read again**: to load a blocked file, fix it and run `./run.sh backfill`. The job writes no definitions to the registry, except the inferred columns of a table whose spec declares none (`infer_columns`, through the same `append_definitions` as `registry_sync`).
 
 The pipeline reads its delivery from the deployed bundle. The generated pipeline sets `lff.manifest` to a compiled JSON under `.build/manifests/` (legacy `lff.specs` still works) and `lff.catalog` to the target catalog; `build_pipelines` validates with `validate_configs`. A pipeline id missing from the delivery is an error. A pipeline without either setting falls back to reading `framework_meta.v_asset_registry_current`.
 
-Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log. The hourly `framework_runs` records them into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row counts for recon are in `v_loads`. Cost needs the optional system views.
+Whether a run succeeded and how long it took come from the Jobs API and the pipeline event log. The hourly `framework_runs` (its schedule is deployed paused in phase 1; see [MAINTAINERS.md](MAINTAINERS.md#deploy)) records them into `job_runs`, `job_task_runs`, and `pipeline_updates`. Read them through `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, and `v_job_status`. Row counts for recon are in `v_loads`. Cost needs the optional system views.
 
 ## How each kind loads
 
-Each table reads its source once, into a private `<pipeline_id>_staged` table that is not published to Unity Catalog. A pipeline cannot send one read to two tables, and a temporary view runs again for every dataset that reads it, so the staging table is what lets bronze and quarantine share one read. It adds `_dq_failed_rules`, the names of the rules the row failed, so each rule is evaluated once per row, and (for files) `_dq_result`, what those failures mean for the row: `fail`, `quarantine`, `drop` or `pass`. Both are stored with the row, so changing a rule affects only files read from then on. Nothing is dropped with `expect_or_drop`.
+Each table reads its source once, into a private `<pipeline_id>_staged` table that is not published to Unity Catalog. A pipeline cannot send one read to two tables, and a temporary view runs again for every dataset that reads it, so the staging table is what lets bronze and quarantine share one read. It adds `_dq_failed_rules`, the names of the rules the row failed, so each rule is evaluated once per row, and (for files) `_dq_result`, what those failures mean for the row: `fail`, `quarantine`, `drop` or `pass`. Both are stored with the row, so changing a rule affects only files read from then on. Nothing is dropped with `expect_or_drop`. A rule with `enabled: false` is registered but not evaluated.
 
-- **Bronze** holds the rows whose result is `pass`, without the two rule columns, and without any row of a file that broke a `fail` rule. An append table reads the staging table directly. With `dedup: true` or a database `merge`, Auto CDC needs a named source, so those tables read the `<pipeline_id>_valid` temporary view, which also casts the sequence column.
-- **Quarantine** holds the rows whose result is `quarantine` or `fail`, with the rule names in `failed_rules`. A blocked file's good rows are not here: they are read and dropped.
-- **`ledger_detail` per file.** The event hook writes one row per file. For a table with no `fail` rule it counts each file's rows from bronze and quarantine (by `_batch_id` and `_src_file_path`), so no extra table is needed; rows a `drop` rule removed are in no file's count, only in the table's `rows_dropped`.
-- **A `fail` rule blocks the whole file.** One row that breaks it keeps every row of that file out of bronze. Its bad rows are in quarantine, the file is `FAILED` in `ledger_detail` with exact counts (80,000 read, 3 quarantined, 79,997 dropped), the table's `load_ledger` row is `FAILED`, and the update and job fail. The other files load and are `PROCESSED`. Two working datasets (`<pipeline_id>_files`, published, and `<pipeline_id>_blocked_check`, private) exist only for a table with a `fail` rule: they hold the file back, give the hook its exact per-file counts, and fail the update after bronze and quarantine finish, so the file is already marked read and is not picked up again. A job task then moves the blocked file to `<volume>/_failed/`, which no table reads.
+- **Bronze** holds the rows whose result is `pass`, without the two rule columns, and without any row of a file that broke a `fail` rule. An append table with no `fail` rule reads the staging table directly. Auto CDC (`dedup: true`, `scd1`, `scd2`, or a database `merge`) needs a named source, and a table with a `fail` rule must leave a blocked file out, so those tables read the `<pipeline_id>_valid` temporary view, which also casts the sequence column.
+- **Quarantine** holds the rows whose result is `quarantine` or `fail`, with the rule names in `failed_rules`. A blocked file's good rows are not here: they are read and dropped. Quarantine is optional: a spec with no `rules` and no `quarantine:` block has no quarantine table, and the framework's own checks then only warn (a row with a null key in an Auto CDC table is dropped). See [QUALITY_RULES.md](../framework_ingestion/QUALITY_RULES.md#what-happens-to-a-row-that-fails-a-rule).
+- **`ledger_detail` per file.** The event hook writes one row per file. For a table with no `fail`, `drop` or `warn` rule of its own it counts each file's rows from bronze and quarantine (by `_batch_id` and `_src_file_path`), so no extra table is needed. A table with any of those rules gets the published `<pipeline_id>_files` dataset (`pipeline.has_file_counts`), one row per file of the run, because a dropped row, a blocked file's good rows, and a row a `warn` rule kept cannot be counted from bronze. A file with rows kept by a `warn` rule, or with values in `_rescued_data`, is `WARNING`.
+- **A `fail` rule blocks the whole file.** One row that breaks it keeps every row of that file out of bronze. Its bad rows are in quarantine, the file is `FAILED` in `ledger_detail` with exact counts (80,000 read, 3 quarantined, 79,997 dropped), the table's `load_ledger` row is `FAILED`, and the update and job fail. The other files load and are `PROCESSED`. `<pipeline_id>_files` holds the file back, and `<pipeline_id>_blocked_check` (private, only for a table with a `fail` rule) fails the update after bronze and quarantine finish, so the file is already marked read and is not picked up again. The `park_failed_files` task then moves the blocked file to `<volume>/_failed/`, which no table reads.
 - When `source.expect_file` is on, the hook also lists the volume and compares it with the run, so a run with no file, or a file with no rows, is recorded `FAILED` in the ledger while the job succeeds.
 
 The cost is one extra Delta write of every row, the staging table's storage, and a small grouped read of this run's rows for the per-file view. It is cheaper than listing and parsing the files, or querying the database, a second time.
 
 Each rule is also a warn expectation on the staging table, `NOT array_contains(_dq_failed_rules, '<rule>')`, so pass and fail counts reach the pipeline event log without evaluating the rule again.
 
-**Reloading files.** The `framework_backfill` job (`./run.sh backfill`) reloads files of one table, chosen by name or arrival date, or refreshes the whole table. It loads the table's spec from the registry and runs the same staging step as the pipeline, so rules, rule actions, audit columns and ledger match a normal load. A reloaded file's earlier rows are removed from bronze and quarantine first, so nothing is duplicated. See [QUALITY_RULES.md](../framework_ingestion/QUALITY_RULES.md#reloading-files-backfill) for the modes and what each records.
+**Reloading files.** The `framework_backfill` job (`./run.sh backfill`) reloads files of one table, or refreshes the whole table. It loads the table's spec from the registry and runs the same staging step as the pipeline (`pipeline.stage_frame`), so rules, rule actions, audit columns and ledger match a normal load. A reloaded file's earlier rows are removed from bronze and quarantine first, so nothing is duplicated. `table` is the bronze table's full name (or its pipeline id). It lists what it would do and changes nothing until `dry_run=false`. The modes:
+
+| Mode | Reads |
+| --- | --- |
+| `files` | The named files, by full volume path or bare name. With no files it reads every file in the table's folder, which needs `confirm=true`. A named file parked in `_failed` or `_backfilled` is moved back first. |
+| `dates` | Files that arrived between `date_from` and `date_to` (UTC). Never looks in `_failed`. |
+| `failed` | Every file whose latest `ledger_detail` status is `FAILED`, or only the named ones. A named file that did not fail refuses the whole run. |
+| `rescue` | The named files again, once the table has gained the columns they had rescued into `_rescued_data`. A column the table still lacks goes back into `_rescued_data`, with a warning. |
+| `full_refresh` | Every file, through a full refresh of that table in its own pipeline. Needs `confirm=true`. Files in `_backfilled` are moved back first. The job waits for the update (up to 6 hours), then parks what it blocked. |
+
+`on_fail` (`quarantine`, `drop`, `warn` or `fail`) judges the reloaded files by that one action instead of the table's own, for this run only; `full_refresh` refuses it. A file still blocked is recorded `FAILED`, parked again, and the run goes on with the next file and ends successfully with a `WARNING:` line. A named file that is not there, a file with no rows, and a date range with no file are recorded `FAILED` the same way. A backfill writes `load_kind = backfill`. Backfill by file needs an append `volume_files` table: a table that keeps history by key, or a database table, takes only `full_refresh`. A backfill does not touch the pipeline's checkpoint, so a file it loaded that the pipeline has not read yet is moved to `<volume>/_backfilled/`, where the next regular run does not see it. The full rules are in [QUALITY_RULES.md](../framework_ingestion/QUALITY_RULES.md#reloading-files-backfill).
 
 | Kind and method | Reads | Quarantine | Bronze |
 | --- | --- | --- | --- |
@@ -73,9 +93,35 @@ The three cloud-files rows are frozen. The code is kept and tested, but validati
 
 Every published table gets a comment, `table_properties` (`quality` and `lakeflow_framework.pipeline_id`), and liquid clustering: `cluster_by_auto`, unless the spec sets `raw_to_bronze.bronze.cluster_by` (up to four columns). An Auto CDC bronze clusters on its first four primary keys by default. Turn on predictive optimization for the catalog once (`ALTER CATALOG <catalog> ENABLE PREDICTIVE OPTIMIZATION`, which needs the catalog owner); it runs `OPTIMIZE` and `VACUUM` on these tables.
 
-Auto Loader on CSV, delimited text, and JSON gets `cloudFiles.schemaHints` from `columns`, so the declared columns land typed and the first run does not sample files to infer them. A value that does not parse lands in `_rescued_data`, so the `schema_conformance` rule sends it to quarantine. Without file events Auto Loader lists the directory; point `raw_path` at the narrowest folder. Once file events are enabled on the external location behind the volume, set `source.file_events: true` to use `cloudFiles.useManagedFileEvents`.
+Auto Loader on CSV, delimited text, and JSON gets `cloudFiles.schemaHints` from `columns`, so the declared columns land typed and the first run does not sample files to infer them. A value that does not parse lands in `_rescued_data`, and the `schema_conformance` check judges the row by `on_fail` (quarantine by default; only a warning for a table with no quarantine). With no `columns`, `source.infer_schema` chooses: `typed` (the default) lets Auto Loader infer types, `strings` keeps every column a string. Without file events Auto Loader lists the directory; point `raw_path` at the narrowest folder. Once file events are enabled on the external location behind the volume, set `source.file_events: true` to use `cloudFiles.useManagedFileEvents`.
 
-Excel works with Auto Loader and CTAS but not `copy_into`. `dedup: true` needs `primary_keys` and `watermark_column`, and uses `stored_as_scd_type` integer `1`: the latest row for each key wins. The watermark must be in `columns` with its type. Files land it as a string, so the valid view casts it before Auto CDC orders on it, and a null or uncastable watermark goes to quarantine. Keys also generate not-null rules when dedup is off.
+Excel works with Auto Loader and CTAS but not `copy_into`. `dedup: true` (or `raw_to_bronze.load_type: scd1` or `scd2`) needs `primary_keys` and `watermark_column`. `scd1` and `dedup` use `stored_as_scd_type` integer `1`: the latest row for each key wins. `scd2` uses `2` and keeps every version. The watermark must be in `columns` with its type. Files land it as a string, so the valid view casts it before Auto CDC orders on it, and a null or uncastable watermark goes to quarantine. Keys also generate not-null rules when dedup is off.
+
+### Blocked and parked files
+
+Two folders at the root of each volume hold files the pipeline must not read: `_failed` (a file a `fail` rule blocked, or a file `schema_evolution: fail` stopped) and `_backfilled` (a file a backfill loaded). A file keeps its path below the volume: `<volume>/invoices/a.csv` is parked as `<volume>/_failed/invoices/a.csv`, and a second file of the same name gets a timestamp suffix. Auto Loader and `volume_listing` skip a folder whose name starts with an underscore, and validation refuses a spec that would read one. The pipeline sets `ignoreMissingFiles`, so a file moved after Auto Loader listed it does not fail the next run.
+
+`park_failed_files` moves a file when its latest `ledger_detail` row is `FAILED` with `blocked by fail rule` or `schema drift` (last 30 days), or when the table's `<pipeline_id>_files` says the latest run blocked it. Running it again moves nothing more. It needs write access to the volume.
+
+To recover a parked file:
+
+1. Find it: `SELECT * FROM framework_meta.v_load_failures` or `v_ledger_detail WHERE status = 'FAILED'`. The `error_message` says which rule blocked it, or which columns were new and what to add to the spec.
+2. Fix the cause: the data (the file where it sits in `_failed`), the rule, or the spec. Deploy if the spec changed.
+3. Run `./run.sh backfill <target> <profile> table=<table> mode=failed dry_run=true` (add `files=<path>` for one file; the path in `_failed` or the one it had before both work). Check the list, then run it again with `dry_run=false`.
+4. To load a blocked file's good rows without fixing the bad ones, add `on_fail=quarantine`: its bad rows go to quarantine, the rest load.
+
+A file that is still blocked is parked again and the job output names it.
+
+### A new column in a file
+
+`source.schema_evolution` (csv, delimited, json) sets what Auto Loader does with a column the table does not have (`cloudFiles.schemaEvolutionMode`):
+
+- `rescue` (the default): its values go to `_rescued_data`, the row loads, and the file is `WARNING` in `ledger_detail`, naming the columns (`new_columns`, a warn-only check whatever `on_fail` says). To make them real columns later, add them to the spec, deploy, run the regular job once, then backfill the files with `mode=rescue`.
+- `add_new_columns`: the table gains the column, and the run's files are `WARNING`, naming each added column and its type. `infer_columns_refresh` registers it. `generate` warns unless the table sets `infer_schema: strings` or declares its columns.
+- `fail`: the update stops and nothing of the run loads. The load is `FAILED` with `schema drift: ...`, which lists the new columns with the types the file was read as. The job parks the file. Add the columns to the spec, deploy, and backfill with `mode=failed`.
+- `none`: the column is ignored.
+
+A value that does not fit a column the table has also goes to `_rescued_data`, and the `schema_conformance` check judges it by `on_fail`. A reload does not fix that: change the type and run `full_refresh`, or keep the column a string. See [QUALITY_RULES.md](../framework_ingestion/QUALITY_RULES.md#a-column-that-appears-in-a-file).
 
 ## Data quality
 
@@ -84,9 +130,10 @@ Rules in the spec become SQL predicates before a cluster starts.
 - A declared rule is the expression you wrote.
 - Each primary key gets `column IS NOT NULL`.
 - Each declared type gets `TRY_CAST(column AS type) IS NOT NULL OR column IS NULL`, so a null is not also a cast failure.
-- Auto Loader on CSV, delimited text, JSON, and text adds `_rescued_data IS NULL`.
+- Auto Loader on CSV, delimited text, JSON, and text adds `schema_conformance`: nothing in `_rescued_data` belongs to a column the table has.
+- With `schema_evolution: rescue` (CSV, delimited text, JSON), `new_columns` adds: nothing in `_rescued_data` is a column the table lacks. It only ever warns.
 
-A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `failed_rules`, the names of every predicate that failed.
+A declared rule takes the action its spec gives (`on_fail` on `raw_to_bronze` or on the rule, `quarantine` by default). The checks the framework adds follow `raw_to_bronze.on_fail`, or only warn when the table has no quarantine. A rule with `enabled: false` is not compiled into the run. A NULL predicate counts as a failure: `COALESCE((predicate), false)`. Quarantine rows carry `failed_rules`, the names of every predicate that failed.
 
 ## The registry
 
@@ -113,6 +160,8 @@ A new version is written when that object's own hash changes. The job name is a 
 Every row has an **owner**: `owner_kind` is `source_system` or `project`, and `owner` is its name. Bronze rows are owned by the source system. `requested_by` is the team that asked for the table and `delivery` is how its source delivers. They are for the maps and do not affect ownership.
 
 `ownership_refusals` holds each refused definition: the refused owner, the holder, `failure_reason`, and `content_hash`. Delivery jobs do not write registry steps.
+
+A table whose spec declares no `columns` registers only the framework's audit columns at deploy. After its first load, the job's `infer_columns` task reads bronze's columns from `information_schema` and registers them with `source = inferred`. The next deploy keeps them (`keep_inferred_columns`), and a spec that starts declaring columns replaces them. Inferred columns are documentation: they never change how Auto Loader reads a file.
 
 ### Ownership
 
@@ -158,8 +207,8 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | Table or view | Built by | What it holds |
 | --- | --- | --- |
 | `<job_name>_event_log` | Each ingestion pipeline (`event_log` on the generated resource) | The pipeline's own event log, published to Unity Catalog |
-| `load_ledger`, `v_loads` | The pipeline's event hook (`pipeline_metrics`), once per update; `framework_backfill`; hourly `framework_runs` for an update whose hook was cut off | Central recon SoR: one row per registered dataflow; `source_kind`, `run_as`, `load_kind` (regular\|backfill\|catchup); counts always numbers (`rows_read`, `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_quarantined`, `rows_dropped`, `files_read`, `files_failed`); FAILED with the error when a table fails, cannot register, has a blocked file, got no file, or got an empty file. `v_loads` unions 90-day hot with forever quarterly archive |
-| `ledger_detail`, `v_ledger_detail` | The same writers | Child unit-of-work (`detail_kind=file` or `input`): status (`PROCESSED`, `WARNING`, `FAILED`), counts, rules, `error_message` (`blocked by fail rule(s): ...`, `file has no rows`, `file not found`), and `load_kind` |
+| `load_ledger`, `v_loads` | The pipeline's event hook (`pipeline_metrics`), once per update; `framework_backfill`; the job's `park_failed_files` task and the hourly `framework_runs` for an update whose hook was cut off | Central recon SoR: one row per registered dataflow; `source_kind`, `run_as`, `load_kind` (regular\|backfill\|catchup); counts always numbers (`rows_read`, `rows_inserted`, `rows_updated`, `rows_deleted`, `rows_quarantined`, `rows_dropped`, `files_read`, `files_failed`); FAILED with the error when a table fails, cannot register, has a blocked file, stopped on a new column, got no file, or got an empty file. `v_loads` reads the hot table (about 90 days); `archive_hot` moves older rows to `load_ledger_archive` |
+| `ledger_detail`, `v_ledger_detail` | The same writers | Child unit-of-work (`detail_kind=file` or `input`): status (`PROCESSED`, `WARNING`, `FAILED`), counts, rules, `error_message` (`blocked by fail rule(s): ...`, `schema drift: ...`, `file has no rows`, `file not found`, or the warning for a file with rescued values or added columns), and `load_kind` |
 | `v_load_failures` | Views over loads + job/task runs | What failed and why (`failure_reason`, task, run page) for repair |
 | `job_runs`, `v_job_runs`, `v_job_status` | The hourly `framework_runs` job | Append-only run events; `v_job_runs` keeps latest per `(job_id, run_id)` |
 | `job_task_runs`, `v_job_task_runs` | Hourly `framework_runs` | Append-only task events; view keeps latest per `(job_run_id, task_run_id)` |
@@ -167,7 +216,7 @@ Pipeline event logs give row and rule counts and pipeline update states, the Job
 | `v_job_costs`, `v_pipeline_costs` | `framework_system_views`, only when `system_views` is `true` | DBUs and list cost per job run and per pipeline update, from `system.billing.usage` and `list_prices` |
 | `v_observed_lineage` | `framework_system_views`, only when `system_views` is `true` | What `system.access.table_lineage` saw each bronze and quarantine table read, next to the declared raw source: `declared`, `undeclared`, or `not_observed`. The registry's link and flow rows stay the declared intent. |
 
-Quality rules are checked on the private staging table; expectation counts on the ledger come from that update's `flow_progress` when present. Recon SoR is `load_ledger` / `v_loads`, written by the pipeline itself.
+Quality rules are checked on the private staging table. Pass and fail counts per rule are in the pipeline's event log (`flow_progress`), not in the ledger; the ledger has the row counts per action. Recon SoR is `load_ledger` / `v_loads`, written by the pipeline itself.
 
 **Reading the ledger when a job is green.** A job can succeed and its load still be `FAILED`: a table that expects a file got none, or got one with no rows (`source.expect_file`, on by default in a scheduled delivery), and a backfill that hit a blocked, missing or empty file. A job fails only when a file breaks a `fail` rule, or when something is really broken. Watch `v_load_failures` (or `v_loads WHERE target_status = 'FAILED'`), not only the job status. The pipelines run with their own restart of a failed update turned off (`pipelines.numUpdateRetryAttempts = 0`), because a restart would find a blocked file already read and finish, hiding the failure.
 
@@ -180,13 +229,13 @@ Deployed job and pipeline names carry a prefix (`[dev <user>] ` in dev, `[fdh] `
 ```sql
 -- rows read and loaded for any layer (append-only ledger, not a table scan)
 SELECT job_name, layer, target_table, quarantine_table, load_kind, started_at,
-       rows_read, rows_inserted, rows_updated, rows_quarantined, rows_dropped, expectations
+       rows_read, rows_inserted, rows_updated, rows_quarantined, rows_dropped, failure_reason
 FROM framework_meta.v_loads
 WHERE target_table ILIKE '%finance_abs'
 ORDER BY started_at DESC;
 ```
 
-A delivery run does not touch the registry, so the number of jobs running at once is limited only by the workspace's pipeline quota.
+A delivery's pipeline does not touch the registry, so the number of jobs running at once is limited only by the workspace's pipeline quota. Its follow-up tasks (`park_failed_files`, `infer_columns`) read the table's spec from the registry, and `infer_columns` writes column rows for a table that declares none.
 
 ### Cost and observed lineage, optional
 
@@ -211,7 +260,7 @@ The tables use liquid clustering:
 
 Each table clusters on at most three keys.
 
-All set `delta.autoOptimize.optimizeWrite`, and the registry tables also set `autoCompact`: they are written once per deploy, so compacting after that commit is cheap. Predictive optimization, once the catalog owner enables it, also compacts these tables in the background. A daily job runs `OPTIMIZE` as well, which skips files that are already a good size. `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
+All set `delta.autoOptimize.optimizeWrite`, and the registry tables also set `autoCompact`: they are written once per deploy, so compacting after that commit is cheap. Predictive optimization, once the catalog owner enables it, also compacts these tables in the background. A daily job, `framework_optimize`, runs `OPTIMIZE` as well, which skips files that are already a good size (its schedule is deployed paused in phase 1). `VACUUM` is not scheduled, so process history is never removed. Bloom-filter indexes are not created; liquid clustering is the prune path, and a bloom filter on every small commit is a second write.
 
 `v_asset_registry_history` reads `valid_from` and `valid_to` from `asset_registry`, so a filter on `owner` or on the dates prunes files directly. `asset_registry_current` keeps one row per `object_kind` and `full_name`, so a pipeline id resolves to one document even when the caller does not pass the owner.
 
@@ -243,21 +292,24 @@ A schema or table that does not exist yet, because its pipeline has not run, is 
 
 ## Checked on a real workspace
 
-None of the following has run on Databricks. The code assumes them:
+Run on the development workspace, with the `abs` CSV tables (append `volume_files` loads on a schedule):
 
-- `from pyspark import pipelines` in a Lakeflow pipeline, including `create_auto_cdc_flow`, `create_auto_cdc_from_snapshot_flow`, and `expect`.
-- `stored_as_scd_type=1` as an integer.
+- `from pyspark import pipelines` in a serverless Lakeflow pipeline, with `expect`, the private staging table, and the event hook (`on_event_hook`) reading `flow_progress`. A pipeline's `spark.sql` accepts only `SELECT`, `DESCRIBE`, `SHOW` and `USE`, so the hook writes with the DataFrame writer.
+- Auto Loader on a volume path with `_metadata.file_path`, the manifest read from `${workspace.file_path}` through `lff.manifest`, and the wheel as a dependency of the pipeline and of job tasks on serverless `environment_version` 4.
+- Regular loads and backfills of CSV files, a file blocked by a `fail` rule, the backfill job with a quarantine rule, and `schema_evolution` with a rescue backfill.
+
+None of the following has run on Databricks yet. The code assumes them:
+
+- `create_auto_cdc_flow` and `create_auto_cdc_from_snapshot_flow`, and `stored_as_scd_type` as an integer.
 - A streaming view read by name from a downstream streaming table.
-- Auto Loader with `_metadata.file_path` on a volume path.
-- A file-arrival trigger on a Unity Catalog volume path, and `${workspace.file_path}` spec paths on serverless.
-- Serverless `environment_version` 4 with the wheel as a dependency, and `performance_target: STANDARD` on generated jobs (override per source with `PERFORMANCE_OPTIMIZED` when cold starts matter).
+- A file-arrival trigger on a Unity Catalog volume path.
+- `performance_target: STANDARD` on generated and framework jobs. Every job runs `PERFORMANCE_OPTIMIZED` until go-live.
 - Federated tables as a pipeline source, and `merge` as a snapshot flow.
 - COPY INTO as a job statement before the pipeline.
 - Excel `headerRows` and `dataAddress` without `schemaLocation`.
 - `DESCRIBE DETAIL` `numRecords` on streaming tables and materialized views.
-- Reading `${workspace.file_path}` manifests from a serverless pipeline, and `spark.conf.get` of `lff.manifest` inside it.
 - Workspace concurrency if many pipelines run together.
-- `event_log` on a serverless pipeline resource, a streaming read of an event log table, and the `flow_progress` field names the pipeline's event hook and `v_loads` read.
+- A streaming read of an event log table.
 - `databricks-sdk` on serverless environment version 4 without listing it as a dependency, `WorkspaceClient()` with the job's own credentials, and `jobs.list` returning `settings.tags` without `expand_tasks`.
 - The Jobs API run fields `framework_runs` reads: `state.life_cycle_state` and `result_state`, `status.termination_details.code`, `setup_duration`, `queue_duration`, `execution_duration`, and `run_duration`.
 - `details:update_progress.state` on the published event log, and `dlt_update_id` in `usage_metadata` for the optional cost view.

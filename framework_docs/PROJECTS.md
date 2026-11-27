@@ -1,6 +1,6 @@
 # Curation: silver, gold, and data products
 
-The built structure is described in [framework_curation/README.md](../framework_curation/README.md) and the `project.yaml` contract in [README.md](../README.md#projectyaml). This page records the design behind it and the part that is not built.
+The built structure is described in [framework_curation/README.md](../framework_curation/README.md) and the `project.yaml` contract in [README.md](README.md#projectyaml). This page records the design behind it and the part that is not built.
 
 ## Model
 
@@ -27,7 +27,7 @@ A table is registered once. Two requests for the same file share one bronze tabl
 ## What is built
 
 - `project.yaml` with silver, gold, and `products`, `triggered_by`, `reads`, and deadlines
-- Reference checks against the ingestion bundle and the other projects
+- Reference checks against the bronze tables of an ingestion bundle and the other projects. `./run.sh projects:generate` and `projects:check` check against the example sources in `framework_examples/ingestion`, not `framework_ingestion`.
 - The lower-layers-only rule, unique table names across projects, and no loops between projects
 - `PROJECT_MAP.md` per project and `PROJECTS_INDEX.md`
 - `new-project` and the generated per-project `databricks.yml` with targets
@@ -51,7 +51,7 @@ A table is registered once. Two requests for the same file share one bronze tabl
 | Gold across several projects | Same rule, across projects. |
 | A table is read but should not wait | List it under `reads`. |
 | An upstream is late | A deadline, with `alert` or `run_stale`. Fan-in without a deadline is flagged on the map. |
-| Bronze fails | Nothing downstream fires, because no table updated. |
+| Bronze fails | Nothing downstream fires, because no table updated. A file blocked by a `fail` rule fails the job, but the run's other files still load, so bronze may have updated and a `table_update` trigger would fire. |
 | Backfill or rerun | Downstream triggers fire again, so silver and gold must be idempotent. |
 | A project reads another project's table | A three-part reference. The graph between projects must have no loops. |
 | Streaming sources | Out of scope. |

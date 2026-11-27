@@ -7,9 +7,15 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 | Writer | When | What | Lag |
 | --- | --- | --- | --- |
-| The pipeline's event hook (`pipeline_metrics`) | Once per update, when every flow has finished | `load_ledger`, `ledger_detail` → `v_loads` / `v_load_failures` | **Near real time** (inside the pipeline; no task after it) |
-| `framework_backfill` | When someone runs it | `load_ledger` + `ledger_detail`, `load_kind = 'backfill'` | Immediate |
-| Hourly `framework_runs` | Cron `0 15 * * * ?` | `job_runs` / `job_task_runs` / `pipeline_updates` from `system.lakeflow` or the Jobs API and event logs, and the `load_ledger` row of an update whose hook was cut off at shutdown | Up to ~1h |
+| `registry_sync` (`framework_ingestion`) | Every deploy | `asset_registry`, `asset_registry_current`, `ownership_refusals`; column comments in Unity Catalog | Immediate |
+| `framework_ddl` (`apply_ddl`) | Every `framework_bundle` deploy | Tables, views, the `ref_*` seed rows, and `ddl_applied` (skips SQL already applied) | Immediate |
+| The pipeline's event hook (`pipeline_metrics`) | Once per update, when every flow has finished | `load_ledger`, `ledger_detail` → `v_loads` / `v_load_failures` | **Near real time** (inside the pipeline) |
+| A generated job's `park_failed_files` task | After `refresh_pipeline`, even when it failed (only for tables with a `fail` rule or `schema_evolution: fail`) | The `load_ledger` / `ledger_detail` rows of its own update when the hook wrote none (always for a schema-drift stop), kept `regular`; moves blocked files to `<volume>/_failed/` | Minutes |
+| A generated job's `infer_columns` / `infer_columns_refresh` task | After `refresh_pipeline` (only for tables whose spec declares no columns) | Column rows in `asset_registry` / `asset_registry_current`, `source = inferred`; once, or after every run with `schema_evolution: add_new_columns` | Minutes |
+| `framework_backfill` | When someone runs it | `load_ledger` + `ledger_detail`, `load_kind = 'backfill'`; moves files to and from `_failed` / `_backfilled`; a `full_refresh` starts the table's own pipeline | Immediate |
+| Hourly `framework_runs` | Cron `0 15 * * * ?` (paused in `framework_ops.job.yml` until requested) | `job_runs` / `job_task_runs` / `pipeline_updates` from `system.lakeflow` or the Jobs API and event logs, and the `load_ledger` row of an update whose hook was cut off at shutdown (`load_kind = 'catchup'`, last 7 days) | Up to ~1h |
+| Daily `framework_optimize` | Cron `0 0 3 * * ?` (paused until requested) | `OPTIMIZE` of the hot tables and archives, then `archive_hot` moves rows older than 90 days to `*_archive` | Daily |
+| `silver_reader.read_new` | After a curated reader's target write commits | `flow_checkpoint` | Immediate |
 
 **Recon for delivery jobs does not wait on the hourly job.** Query `v_loads` after the run. Job run status (`v_job_status`) is as fresh as the last `framework_runs`. The recording tasks `record_load_metrics` and `record_this_run` no longer exist.
 
@@ -22,10 +28,10 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 | `v_run_current` | Passthrough of `run_current`. Use `v_ownership_refusals` / `v_job_status`. |
 | `v_bronze_loads` | Alias of `v_loads WHERE layer = 'bronze'`. |
 | `v_bronze_tables` | Redundant discovery view; use `v_tables WHERE layer = 'bronze'`. |
-| `v_loads_90d` | Folded into `v_loads` (hot ∪ archive). |
+| `v_loads_90d` | Folded into `v_loads`, which reads the ~90-day hot `load_ledger`. Older rows: query `load_ledger_archive`. |
 | `load_metric` | Long-shape dual-write of ledger counts; retired. Wide `load_ledger` is enough. |
 | `file_ledger` | Renamed to `ledger_detail` (`detail_kind=file|input`). |
-| `load_daily_rollup` | Never written; dashboards use `v_loads` (hot ∪ archive). |
+| `load_daily_rollup` | Never written; dashboards use `v_loads` (hot only) and `load_ledger_archive`. |
 | Ops path for `flow_events` / `table_load_metrics` | Already retired; not created by `framework_meta.sql`. Prefer `load_ledger` / `v_loads`. |
 
 ## Kept on purpose (not “duplicate waste”)
@@ -46,11 +52,11 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 ## Parallel load: ~1000 delivery jobs at once
 
-**`asset_registry` / `asset_registry_current` are not on the run path** — only `registry_sync` at deploy writes them. Parallel runs do not contend there.
+**`asset_registry` / `asset_registry_current` are barely on the run path** — `registry_sync` writes them at deploy, and an `infer_columns` task writes column rows only for a table whose spec declares no columns (once, or after every run with `schema_evolution: add_new_columns`). Parallel runs of declared-column tables do not touch them.
 
 | Writer at run time | Pattern | Under 1000 parallel jobs |
 | --- | --- | --- |
-| The event hook → `load_ledger`, `ledger_detail` | Append-only writes, three at once | Designed for fan-out. Concurrent Delta appends scale; expect more small files until daily `OPTIMIZE` / auto-optimize. `ledger_detail` adds one row per file, so a run of many files writes many rows in one append. |
+| The event hook → `load_ledger`, `ledger_detail` | Append-only writes, both at once | Designed for fan-out. Concurrent Delta appends scale; expect more small files until daily `OPTIMIZE` / auto-optimize. `ledger_detail` adds one row per file, so a run of many files writes many rows in one append. |
 | `job_runs`, `job_task_runs` | Append-only INSERT by `framework_runs` | One writer, hourly; views keep the latest row per key. |
 | `<job>_event_log` | One table per delivery | Isolated — no cross-job write contention. |
 | Hourly `framework_runs` | Catch-up | Off the load path; a burst may make catch-up take longer. |
@@ -63,17 +69,17 @@ Until go-live, recreate the schema on deploy so DDL changes apply (`DROP SCHEMA 
 
 **Definitions:** `v_asset_registry_current`, `v_asset_registry_history`, `v_source_systems`, `v_schemas`, `v_workflows`, `v_pipelines`, `v_dataflows`, `v_flows`, `v_tables`, `v_columns`, `v_column_history`, `v_rules`, `v_rule_history`, `v_lineage`, `v_ownership_conflicts`, `v_ownership_refusals`, `v_metadata_drift`
 
-**Runs / recon:** `v_job_status`, `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, `v_loads`, `v_ledger_detail`, `v_load_failures`
+**Runs / recon:** `v_job_status`, `v_job_runs`, `v_job_task_runs`, `v_pipeline_updates`, `v_loads`, `v_ledger_detail`, `v_load_failures`, `v_flow_checkpoint`
 
 **Optional (system grants):** `v_job_costs`, `v_pipeline_costs`, `v_observed_lineage`
 
-**Physical tables still written:** `asset_registry`, `asset_registry_current` (with stable `asset_id`), `ownership_refusals`, `job_runs`, `job_task_runs`, `pipeline_updates`, `load_ledger` (lean recon: `dataflow` = spec id, `update_pipeline_uuid` = Lakeflow UUID; `source_kind`, `run_as`, `load_kind`, `load_date`, counts, `batch_id`; owner/quarantine/expectations enriched in `v_loads`), `ledger_detail` (`detail_kind=file|input`), `flow_checkpoint` (append-only flow watermark; `v_flow_checkpoint` = latest SUCCEEDED; replaces `curated_progress` / `silver_progress`), matching `*_archive` (`PARTITIONED BY archive_quarter`), `ref_*` enum tables, `ddl_applied`, plus per-job `*_event_log` under `framework_events`. Retired: `load_metric`, `file_ledger` (renamed to `ledger_detail`), `silver_progress` / `curated_progress` (renamed to `flow_checkpoint`), `v_loads_90d`, `v_bronze_tables`, `table_health`, `run_ledger`, `run_current`. Append-only facts use views for latest-per-key.
+**Physical tables still written:** `asset_registry`, `asset_registry_current` (with stable `asset_id`), `ownership_refusals`, `job_runs`, `job_task_runs`, `pipeline_updates`, `load_ledger` (lean recon: `dataflow` = spec id, `update_pipeline_uuid` = Lakeflow UUID; `source_kind`, `run_as`, `load_kind` (`regular`, `backfill`, `catchup`), `load_date`, counts, `batch_id`; owner, quarantine table, `pipeline_name`, and `duration_seconds` added in `v_loads`), `ledger_detail` (`detail_kind=file|input`), `flow_checkpoint` (append-only flow watermark; `v_flow_checkpoint` = latest SUCCEEDED; replaces `curated_progress` / `silver_progress`), matching `*_archive` (`PARTITIONED BY archive_quarter`; no view reads them), `ref_*` enum tables, `ddl_applied`, the `backfill_state` volume, plus per-job `*_event_log` under `framework_events`. Each file table with a `fail`, `drop`, or `warn` rule also publishes its pipeline's `<pipeline_id>_files` materialized view here. Retired: `load_metric`, `file_ledger` (renamed to `ledger_detail`), `silver_progress` / `curated_progress` (renamed to `flow_checkpoint`), `v_loads_90d`, `v_bronze_tables`, `table_health`, `run_ledger`, `run_current`. Append-only facts use views for latest-per-key.
 
 ## Ops: failure and repair
 
 1. Query `v_load_failures` and/or `v_job_status`. A job can be green while its load is `FAILED` (no file, or an empty one): query `v_loads` for `target_status = 'FAILED'`, and `ledger_detail` for the file.
 2. Fix the cause.
-3. A failed run: Jobs UI **Repair and run failed tasks**. A file that was read is not read again, so a blocked or empty file is reloaded with `./run.sh backfill` (`mode=files` or `mode=failed`).
+3. A failed run: Jobs UI **Repair and run failed tasks**. A file that was read is not read again, so a blocked or empty file is reloaded with `./run.sh backfill` (`mode=files` or `mode=failed`). A file parked for schema drift is loaded with `mode=failed` after the new columns are in the spec; `mode=rescue` reads files again once the table has the column they rescued.
 4. Confirm a new `v_loads` row and SUCCEEDED status.
 
 ## Deploy note

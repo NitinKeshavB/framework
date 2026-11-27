@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(wsl -d Ubuntu-26.04 --cd /home/znkb/framework/framework -- bash -lc \"git show f70d77a:framework_lff_lib/lakeflow_framework/pipeline_metrics.py | grep -n 'replay\\\\|read_files' | head; grep -rn 'catch.up\\\\|catchup\\\\|replay' framework_tests/test_ledger_accuracy.py | head -20\")"
+    ]
+  }
+}

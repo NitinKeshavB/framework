@@ -28,16 +28,16 @@ flowchart LR
   runs --> jobViews["v_job_status · v_job_runs"]
 ```
 
-Config → generate (`.build/` + `lff.manifest`) → deploy (DDL / `registry_sync`) → run (`refresh_pipeline` + event-hook ledgers) → hourly `framework_runs` / daily archive. Editable diagrams: [Lucidchart](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit).
+Config → generate (`.build/` + `lff.manifest`) → deploy (DDL / `registry_sync`) → run (`refresh_pipeline` + event-hook ledgers) → hourly `framework_runs` / daily archive (both schedules are paused until requested). Editable diagrams: [Lucidchart](https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit).
 
 
 | Folder | Role | Owner |
 | --- | --- | --- |
-| `framework_lff_lib` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipeline`, `validate_configs`, and `LoadMethod`. | Platform team |
+| `framework_lff_lib` | The wheel: config validation, pipeline graph, generators, registry rows. Public names are `build_pipelines`, `build_pipeline`, `validate_configs`, `PipelineConfig`, `ConfigValidationError`, `MetadataNotFound`, and `LoadMethod`. | Platform team |
 | `framework_bundle` | The deployed framework: the wheel, frozen `framework_meta` DDL, hourly `framework_runs`, daily `OPTIMIZE` / archive, and the `framework_backfill` job (reload files of any table, or refresh it) | Platform team |
 | `framework_ingestion` | Source to bronze. Specs, and the pipelines and jobs generated from them. | Domain, per source system |
 | `framework_curation` | One bundle per project for silver, gold, and data products, with ownership checks and maps | One project each |
-| `framework_examples/ingestion` | Specs for each ingestion kind: a raw volume, SharePoint, a database, and cloud files | None |
+| `framework_examples/ingestion` | Specs for each MVP ingestion kind: SFTP files in a raw volume, SharePoint, and a database. There is no cloud files example, because validation rejects its methods | None |
 | `framework_examples/consumer` | The original single-bundle example. Reference only. | None |
 | `framework_tests` | Package tests. They do not start Spark. | Platform team |
 | `framework_docs` | Contract, end-to-end path, architecture, maintainers, roadmap | Platform team |
@@ -50,7 +50,7 @@ Config → generate (`.build/` + `lff.manifest`) → deploy (DDL / `registry_syn
 | `database` | Tables in PostgreSQL, Azure SQL, SQL Server, or DB2 | None. A foreign catalog exposes the database | Each table loads into bronze: `snapshot` or `merge` |
 | `cloud_files` | Files on ADLS or S3 | A raw table | Auto Loader, COPY INTO, or CTAS, then bronze. Not in the MVP: validation rejects these methods |
 
-Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePoint files into the raw volume is not built; it is the first phase 1 item ([ROADMAP](framework_docs/ROADMAP.md)).
+Rows that fail a quality rule go to a quarantine table, unless the rule's `on_fail` says to drop them, only warn, or fail the load ([quality rules](framework_docs/README.md#quality-rules)). A table with no rules and no `quarantine` block has no quarantine table. Getting SFTP and SharePoint files into the raw volume is not built; it is the first phase 1 item ([ROADMAP](framework_docs/ROADMAP.md)).
 
 ## Who owns what
 
@@ -62,14 +62,14 @@ Rows that fail a quality rule go to a quarantine table. Getting SFTP and SharePo
 
 ```bash
 ./run.sh new-source finance erp erp.owner@jll.com database nightly   # new source system only
-./run.sh new-table finance erp customers billing                      # the project is last; omit it to put the spec next to source.yaml
+./run.sh new-table finance erp customers billing                      # 4th: the requesting project (omit it to put the spec next to source.yaml); 5th: the delivery, when the source has several
 # edit sources/erp/billing/erp_customers.yaml and replace every TODO
 ./run.sh generate
 ```
 
 `generate` validates every source and spec, then writes committed `SOURCE_MAP.md` and gitignored `.build/` artifacts (pipelines, jobs, delivery manifests). Details are in [framework_ingestion/README.md](framework_ingestion/README.md).
 
-The generated pipeline file is one line (`build_pipelines([...])`), because the datasets are built when the pipeline runs. To read what a table's pipeline builds, run `./run.sh expand <spec.yaml> <catalog>`. It writes `<pipeline_id>_pipeline.py` and `.sql` to `framework_ingestion/.build/expanded/`, for review only (they are not deployed). It handles append tables read from a volume; a table that keeps history by key (Auto CDC) is refused.
+The generated pipeline file is one line (`build_pipelines([...])`), because the datasets are built when the pipeline runs. To read what a table's pipeline builds, run `./run.sh expand <spec.yaml> <catalog> [out-folder]`. It writes `<pipeline_id>_pipeline.py` and `<pipeline_id>_pipeline.sql` to `framework_ingestion/.build/expanded/` by default, for review only (they are not deployed). It handles append tables read from a volume that have a quarantine table. It refuses a table that keeps history by key (Auto CDC), a table with a `fail` rule, and a table with no quarantine.
 
 ## Add a project, silver, gold, or data product
 
@@ -85,7 +85,7 @@ The generated pipeline file is one line (`build_pipelines([...])`), because the 
 
 - The catalog exists, and you can create objects in it.
 - The schemas the specs name exist, for every source system: its raw, bronze, and quarantine schemas.
-- For `sftp_files` and `sharepoint_files`, the raw volume exists. The file-arrival trigger needs it when the job is created.
+- For `sftp_files` and `sharepoint_files`, every raw volume the specs read exists. The file-arrival trigger needs it when the job is created.
 - For `database`, the foreign catalog exists and can read the source tables.
 - Something delivers the files into the raw volume.
 - You are logged in: `databricks auth login --host <host> --profile <name>`.
@@ -93,10 +93,10 @@ The generated pipeline file is one line (`build_pipelines([...])`), because the 
 ## Deploy order
 
 1. `./run.sh bundle:deploy framework_bundle <target> <profile>`. After the upload it runs `framework_ddl`, so the registry tables and views exist when the command returns. It then runs `framework_system_views`, which does nothing unless the target sets `system_views` to `true`; see [cost and observed lineage](framework_docs/END_TO_END.md#cost-and-observed-lineage-optional). Nothing else needs system table grants.
-2. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry and applies the specs' tags and column comments in Unity Catalog. It is the only writer of definitions.
+2. `./run.sh bundle:deploy framework_ingestion <target> <profile>`. After the upload it runs `registry_sync`, which writes every deployed spec into the registry and applies the specs' column comments in Unity Catalog (tags are not applied yet). It is the only writer of definitions, apart from the inferred columns a job's `infer_columns` task adds.
 3. `./run.sh bundle:deploy framework_curation/<domain>/<project> <target> <profile>`, once projects have silver and gold resources.
 
-`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job refreshes its pipeline, which records its own load metrics: the pipeline reads its delivery from `lff.manifest`, and a run does not write the registry.
+`bundle:validate` and `bundle:deploy` regenerate the maps and resources first, so an invalid spec stops the run before Databricks is contacted. Both bundles use the same catalog per target, because ingestion reads the registry in the platform bundle's catalog. A delivery job refreshes its pipeline (`refresh_pipeline`), which records its own load metrics: the pipeline reads its delivery from `lff.manifest`. A job may add two tasks after it. `infer_columns` (or `infer_columns_refresh`) registers the columns of a table that declares none. `park_failed_files` runs even when the refresh failed, for a table with a `fail` rule or `schema_evolution: fail`: it records the run in the ledger if the event hook did not, and moves each blocked file to `<volume>/_failed/`. The pipeline itself does not write the registry.
 
 ## `framework_meta` data model
 
@@ -271,17 +271,31 @@ source venv/bin/activate        # or set PYTHON to a venv's python
 ./run.sh test:quick             # package tests; no Spark
 ./run.sh lint                   # pre-commit: Ruff, mypy, hygiene, generate checks
 ./run.sh check:rules <profile> <warehouse-id> [catalog]   # run every quality rule on a warehouse before deploying
-./run.sh backfill <target> <profile> table=<catalog.schema.table> mode=files|dates|failed|full_refresh [files=/Volumes/<catalog>/<schema>/<volume>/<folder>/a.csv,...] [date_from=.. date_to=..] [dry_run=false] [confirm=true]
+./run.sh backfill <target> <profile> table=<catalog.schema.table> mode=files|dates|failed|rescue|full_refresh [files=/Volumes/<catalog>/<schema>/<volume>/<folder>/a.csv,...] [date_from=.. date_to=..] [on_fail=quarantine|drop|warn|fail] [dry_run=false] [confirm=true]
                                 # reload files of one table, or refresh it, through its own rules; a dry run unless dry_run=false
+./run.sh expand <spec.yaml> <catalog> [out-folder]   # write out the Python and SQL a table's pipeline builds, for review
 ./run.sh generate:check         # also a local pre-commit hook when ingestion paths change
 ./run.sh projects:check         # also a local pre-commit hook when curation/example paths change
 ./run.sh clean                  # remove wheels, build output, and caches
 ./run.sh help                   # every task
 ```
 
+`backfill` runs the `framework_backfill` job. `table` is the bronze table's full name, or its pipeline id. A file is a full volume path, or a bare file name that matches that name in any folder of the table.
+
+| Mode | Reloads |
+| --- | --- |
+| `files` | The named files. With none named, every file of the table, which needs `confirm=true`. |
+| `dates` | Files that arrived between `date_from` and `date_to` (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`). |
+| `failed` | Files whose latest `ledger_detail` status is `FAILED`, or only the named ones. A parked file is moved back from `_failed` first, and parked again if it is still blocked. |
+| `rescue` | The named files (required), read again once the table has gained the columns they rescued, to put those values back. |
+| `full_refresh` | Every file, by a full refresh of the table's own pipeline. Needs `confirm=true`. |
+
+A file's earlier rows are removed from bronze and quarantine before it loads again, so a reload never duplicates. `on_fail` judges the reloaded files by that action for this run only; it is refused with `full_refresh`, which runs the table's own pipeline. A file still blocked by a `fail` rule is recorded `FAILED` and the run goes on; it ends with a warning, not a failure. A file a backfill loads before the pipeline has read it is moved to `<volume>/_backfilled/`, so the next regular run does not read it again.
+
 ## Read next
 
-- [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, `project.yaml` (and [query views by usage](#query-views-by-usage))
+- [framework_docs/README.md](framework_docs/README.md) for every YAML contract: `source.yaml`, table specs, quality rules, `project.yaml` (and [query views by usage](#query-views-by-usage))
+- [framework_ingestion/QUALITY_RULES.md](framework_ingestion/QUALITY_RULES.md) for writing rules, rule actions, and reloading files
 - [framework_docs/END_TO_END.md](framework_docs/END_TO_END.md) for the run path, quality rules, and the registry
 - [framework_docs/ARCHITECTURE.md](framework_docs/ARCHITECTURE.md) for the flows, the data model of every table the framework writes, the module boundaries, and the design choices
 - [framework_docs/META_MODEL_REVIEW.md](framework_docs/META_MODEL_REVIEW.md) for the frozen `framework_meta` schema, who writes what and when, and removed objects

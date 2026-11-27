@@ -59,6 +59,7 @@ framework_ingestion/
     manifests/<delivery>.json
     pipelines/<delivery>.py
     resources/<delivery>.pipeline.yml and .job.yml
+    expanded/                              ./run.sh expand output, to read (not deployed)
   resources/                               hand-written only (e.g. registry_sync)
 ```
 
@@ -92,8 +93,8 @@ The spec's `raw_to_bronze` section holds the bronze table, keys, columns, and qu
 | `load_type` | What bronze holds | Needs | Notes |
 | --- | --- | --- | --- |
 | `append` | Every row, appended. The default for files | Nothing | A file read twice is not read twice: Auto Loader remembers it |
-| `scd1` | The latest row per key (an upsert) | `primary_keys` and `watermark_column`; `dedup: true` means the same | `delete_when` keeps a deleted row and flags it (below) |
-| `scd2` | Every version of a row: `__START_AT`, `__END_AT`, and the current row has `__END_AT` empty | `primary_keys` and `watermark_column` | A new version opens only when the data changes, never because a load stamped it again |
+| `scd1` | The latest row per key (an upsert) | `primary_keys` and `watermark_column`, declared in `columns` with its type; `dedup: true` means the same | `delete_when` keeps a deleted row and flags it (below) |
+| `scd2` | Every version of a row: `__START_AT`, `__END_AT`, and the current row has `__END_AT` empty | `primary_keys` and `watermark_column`, declared in `columns` with its type | A new version opens only when the data changes, never because a load stamped it again |
 | `full_refresh` | A database table, which follows `source.mode` | The foreign table | With `primary_keys`, a row the source dropped stays, closed (its last version has `__END_AT` set), instead of being deleted. Without keys the table is replaced each run |
 
 ```yaml
@@ -141,9 +142,11 @@ raw_to_bronze:
     - { name: ended_after_start, expression: "try_cast(ended_at AS timestamp) >= try_cast(started_at AS timestamp)" }
 ```
 
-What happens to a failing row is a choice: `on_fail` is `quarantine` (the default), `drop`, `warn` or `fail`, set in one place only, either on `raw_to_bronze` for every rule or on each rule, never both. `fail` blocks the whole **file** that holds a bad row: none of its rows reach bronze, its bad rows go to quarantine, the run and job end `FAILED` naming the file, and the file is not picked up again. `framework_backfill` reloads files by name or arrival date, or refreshes a table, through the same rules. A table in a scheduled delivery also expects a file with rows each run: none, or an empty one, is recorded `FAILED` in the ledger while the job still succeeds (`source.expect_file`; see QUALITY_RULES.md). `abs_gl.yaml` shows every option of a spec, commented, at the bottom.
+What happens to a failing row is a choice: `on_fail` is `quarantine` (the default), `drop`, `warn` or `fail`, set in one place only, either on `raw_to_bronze` for every rule or on each rule, never both. `fail` blocks the whole **file** that holds a bad row: none of its rows reach bronze, its bad rows go to quarantine, the run and job end `FAILED` naming the file, and the file is not picked up again: the job's `park_failed_files` task moves it to `<volume>/_failed/`. `framework_backfill` (`./run.sh backfill`) reloads files by name, by arrival date or because they failed, reads files again to put rescued values back, or refreshes a table, through the same rules. A table in a scheduled delivery also expects a file with rows each run: none, or an empty one, is recorded `FAILED` in the ledger while the job still succeeds (`source.expect_file`; see QUALITY_RULES.md). `abs_gl.yaml` shows every option of a spec, commented, at the bottom.
 
-`rlike` matches anywhere in the value, so anchor a pattern with `^` and `$`, and write `[0-9]` instead of `\d`: a single backslash is dropped silently. `./run.sh generate` reads a rule as text. It catches an unknown column, an unapproved function, an unclosed bracket or a half-written condition, but not a regex that does not compile or a function with the wrong arguments, which would fail the whole update at load time. Run **`./run.sh check:rules <profile> <warehouse-id> [catalog]`** before a deploy that changes a rule: it evaluates every rule on a warehouse, and with a catalog also counts the rows each would quarantine. **[QUALITY_RULES.md](QUALITY_RULES.md)** has the regex guide, a copyable pattern list, every kind of check you can add (presence, length, allowed values, numbers, dates, across columns, conditional), the approved functions, the checks that are on by default, what a rule cannot do, how to test a rule against existing data before deploying, and where the results show up. `abs_gl.yaml` has a full example with two rules per column.
+`rlike` matches anywhere in the value, so anchor a pattern with `^` and `$`, and write `[0-9]` instead of `\d`: a single backslash is dropped silently. `./run.sh generate` reads a rule as text. It catches an unknown column, an unapproved function, an unclosed bracket or a half-written condition, but not a regex that does not compile or a function with the wrong arguments, which would fail the whole update at load time. Run **`./run.sh check:rules <profile> <warehouse-id> [catalog]`** before a deploy that changes a rule: it evaluates every rule on a warehouse, and with a catalog also counts the rows each would quarantine. **[QUALITY_RULES.md](QUALITY_RULES.md)** has the regex guide, a copyable pattern list, every kind of check you can add (presence, length, allowed values, numbers, dates, across columns, conditional), the approved functions, the checks that are on by default, what a rule cannot do, how to test a rule against existing data before deploying, and where the results show up. `abs_gl.yaml` has a full example with two rules per column, most of them commented out. A rule with `enabled: false` stays in the spec and the registry but is not run.
+
+A file that brings a column the table does not have is handled by `source.schema_evolution` (csv, delimited, json): `rescue` (the default) keeps its values in `_rescued_data` and the file shows `WARNING`, `add_new_columns` makes it a column, `fail` stops the update and parks the file in `_failed`, and `none` ignores it. For a spec that declares no columns, `source.infer_schema` is `typed` (the default) or `strings`, which keeps every column a string. See [QUALITY_RULES.md](QUALITY_RULES.md#a-column-that-appears-in-a-file).
 
 ## Audit columns
 
@@ -194,7 +197,7 @@ If the source is rebuilt (a full refresh, a replace, a restore), the change feed
 
 `description:` on a spec describes the bronze table and `quarantine.description` the reject table. A `description:` on each declared column describes that column. They are stored in `framework_meta.v_tables.description` and `v_columns.description`. The table description is the table comment in Unity Catalog, and `registry_sync` sets each column's description as its column comment at every deploy (tags stay parked). A comment lives on the table, so after a full refresh run `databricks bundle run registry_sync` to put the comments back. The audit columns have standard descriptions. Descriptions of columns are only kept for columns the spec declares under `columns:`; a table that declares none lets Auto Loader infer its types (`source.infer_schema: strings` keeps every column a string), and only its audit columns are registered at deploy. After its first load, the job's `infer_columns` task registers bronze's own columns (no descriptions) and `registry_sync` keeps them; declaring `columns` later replaces them.
 
-`./run.sh generate` prints a warning for every table with no description, every declared column with none, and every table that declares no columns. It never stops a deploy. `./run.sh new-table` writes `TODO` placeholders, and `generate` refuses a file until they are replaced.
+`./run.sh generate` prints a warning for every table with no description, every declared column with none, every table that declares no columns, and every `schema_evolution: add_new_columns` table that leaves the type of a new column open. It never stops a deploy. `./run.sh new-table` writes `TODO` placeholders, and `generate` refuses a file until they are replaced.
 
 ## How a load is recorded
 
@@ -221,7 +224,14 @@ flowchart LR
 
 Counts are always numbers. A run with no new files records zeros. In a failed run, the counts of a step that did not finish are zero, and the error text is kept. A table whose spec cannot register is recorded `FAILED` with that error, and the other tables in the delivery still load. Child file/input rows land in `ledger_detail` (`v_ledger_detail`).
 
-The job has one task, the pipeline refresh. Job runs themselves are recorded hourly by `framework_runs` (it also catches runs that never reached the pipeline). The pipeline cannot see which job run started it, so `job_run_id` is empty in the ledger; `v_load_failures` joins to the run by time.
+The job's first task, `refresh_pipeline`, refreshes the pipeline. Two tasks follow it only when a table needs them:
+
+| Task | Added when | Does |
+| --- | --- | --- |
+| `infer_columns` | A table declares no `columns` | Registers bronze's own columns after the first load. With `schema_evolution: add_new_columns` the task is `infer_columns_refresh` and registers them again after every run. It never fails the job |
+| `park_failed_files` | A table has a `fail` rule or `schema_evolution: fail` | Runs even when the refresh failed. Writes the run's ledger row if the event hook did not, then moves each blocked file to `<volume>/_failed/` |
+
+Job runs themselves are recorded hourly by `framework_runs` (it also catches runs that never reached the pipeline). The pipeline cannot see which job run started it, so `job_run_id` is empty in the ledger; `v_load_failures` joins to the run by time.
 
 ```sql
 SELECT dataflow, target_table, load_kind, rows_read, rows_inserted, rows_quarantined, target_status, failure_reason
@@ -230,14 +240,14 @@ FROM <catalog>.framework_meta.v_loads WHERE job_name = 'abs_daily' ORDER BY star
 
 ## One delivery, one pipeline, one job
 
-A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline; the pipeline reads one compiled `lff.manifest` JSON for the delivery (legacy `lff.specs` still works). Deploy writes the source, its schemas, and the specs into the registry and applies their Unity Catalog tags and column comments; a run does neither. The pipeline publishes its event log as `framework_events.<job>_event_log`, and records its own counts, status, and errors in `load_ledger` / `v_loads` once per update (an event hook; the job has no recording task). The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
+A delivery is how a source's data arrives: a schedule, or for file kinds a file-arrival trigger on the raw volume. Every table in a delivery, whichever team asked for it, loads in the same Lakeflow pipeline and the same job. The job refreshes the pipeline; the pipeline reads one compiled `lff.manifest` JSON for the delivery (legacy `lff.specs` still works). Deploy writes the source, its schemas, and the specs into the registry and applies their column comments in Unity Catalog (tags are parked); a run does neither. The pipeline publishes its event log as `framework_events.<job>_event_log`, and records its own counts, status, and errors in `load_ledger` / `v_loads` once per update (an event hook; no job task records load counts). The flows are drawn in [ARCHITECTURE.md](../framework_docs/ARCHITECTURE.md#flows). Different cadences from one source are separate deliveries.
 
-A delivery on a file-arrival trigger watches one volume, so its tables must read the same volume. A delivery on a schedule has no such limit: its tables may read different volumes. Several tables can share one spec file with a `tables:` list (shared settings at the top, each entry overrides them), so give each entry its own `bronze.table` or they will collide on one target. Tables in one delivery load together, and one table that fails to register is skipped and recorded while the others still load.
+A delivery on a file-arrival trigger watches one volume, so its tables must read the same volume. A delivery on a schedule has no such limit: its tables may read different volumes. Several tables can share one spec file with a `tables:` list (shared settings at the top, each entry overrides them). Each entry's `name` is its bronze table and, prefixed with the source system, its pipeline id, unless the entry sets `raw_to_bronze.bronze.table` or `pipeline_id`; two entries that name the same target are refused. Tables in one delivery load together, and one table that fails to register is skipped and recorded while the others still load.
 
 ## Add a table to a source system
 
 1. New source system only: `./run.sh new-source <domain> <source_system> <owner-email> [kind] [delivery]`. It creates `source.yaml` for that kind.
-2. `./run.sh new-table <domain> <source_system> <table> <requested-by> [delivery]`. It creates the spec from a template for that kind. The `delivery` argument is only needed when the source has several.
+2. `./run.sh new-table <domain> <source_system> <table> [requested-by] [delivery]`. It creates the spec from a template for that kind. Leave out `requested-by` to put the spec next to `source.yaml`. The `delivery` argument is only needed when the source has several.
 3. Edit the new file and replace every `TODO`. `generate` refuses files that still have one.
 4. Run `./run.sh generate`.
 
@@ -249,6 +259,10 @@ That is all. The generator validates every source and spec, then rewrites the ma
 
 `./run.sh bundle:validate` and `bundle:deploy` run `generate` first, so the map and the resources are rewritten before the bundle is checked. They do not look at `framework_curation`, which is a separate bundle with its own `./run.sh projects:generate`. An invalid spec stops the run before Databricks is contacted. `./run.sh generate:check` changes nothing and fails if the generated files are out of date, for CI.
 
+## See what a pipeline builds
+
+The generated pipeline file is one line, because the datasets are built when the pipeline runs. To read them, `./run.sh expand <spec.yaml> <catalog> [out-folder]` writes `<pipeline_id>_pipeline.py` and `<pipeline_id>_pipeline.sql` into `.build/expanded/`, from the same functions the pipeline uses. They are for review and are not deployed. It expands an `append` table read from a volume that has a quarantine table and no `fail` rule, and refuses any other.
+
 ## Deploy
 
 ```bash
@@ -258,7 +272,7 @@ That is all. The generator validates every source and spec, then rewrites the ma
 
 Run it in the project's virtual environment (`source venv/bin/activate`): the bundle builds the wheel with `python -m pip wheel`, so `python` must be on the path. Every change to the library needs a new `PACKAGE_VERSION` (and the same in `pyproject.toml`), or serverless can reuse the wheel it cached. `.build/` is gitignored, and a bundle upload skips ignored files, so `databricks.yml` lists `.build/pipelines/*.py` and `.build/manifests/*.json` under `sync.include`. Without that the pipeline file never reaches the workspace.
 
-Deploy uploads the bundle, then runs `registry_sync`; the deploy fails if it fails. That job writes every source system, schema, job, and spec into `framework_meta` under the target catalog as SCD Type 2 versions, retires anything removed from the bundle, then sets the schema, table, and column tags and the column comments in Unity Catalog. A schema or table whose pipeline has not run yet is tagged on the next deploy. This bundle must be the only one that registers source systems in its catalog, because a deploy retires every source system object it does not define. The framework bundle must already be deployed, because that deploy creates the registry.
+Deploy uploads the bundle, then runs `registry_sync`; the deploy fails if it fails. That job writes every source system, schema, job, and spec into `framework_meta` under the target catalog as SCD Type 2 versions, retires anything removed from the bundle, then sets the column comments in Unity Catalog. Tags are parked for now: they are kept in the registry and shown by `v_metadata_drift`, not set on the tables. A table whose pipeline has not run yet gets its comments on the next deploy. This bundle must be the only one that registers source systems in its catalog, because a deploy retires every source system object it does not define. The framework bundle must already be deployed, because that deploy creates the registry.
 
 ## Prerequisites
 
@@ -274,7 +288,7 @@ The framework does not create these. The domain makes sure they exist before a d
 
 Bronze is owned by the **source system**. The registry stores `owner_kind = source_system` and `owner = <source system>` on every row, with `requested_by` (the team that asked for the table) and `delivery` beside it. A table has one owner, and `registry_sync` refuses a second owner's registration and records a failed `ownership_check` step. The team that asked for a table never owns it.
 
-Deploy registers each delivery's workflow, one pipeline and dataflow per table, the layer flows, securables, links, and columns. Query run status with `v_job_status`, definitions with `v_workflows` / `v_pipelines` / `v_dataflows` / `v_flows`, and filter by `owner`. The full view list is in the [root README](../README.md#see-what-is-running).
+Deploy registers each delivery's workflow, one pipeline and dataflow per table, the layer flows, securables, links, and columns. Query run status with `v_job_status`, definitions with `v_workflows` / `v_pipelines` / `v_dataflows` / `v_flows`, and filter by `owner`. The full view list is in the [root README](../README.md#query-views-by-usage).
 
 `requested_by` is the project folder. Omit it only when the spec sits next to `source.yaml`. A spec that says `project:` instead of `requested_by:` is rejected.
 
@@ -286,7 +300,7 @@ This bundle reads from the raw volume. It does not copy files from SFTP or Share
 
 - Run on a real workspace: file loads from a volume with Auto Loader on a schedule, the manifest and pipeline upload, the per-update ledger (a load, and a run with no new files), the audit columns, the change feed on `append` bronze, the silver reader in both modes, and registry descriptions.
 - Not yet run on a workspace: the file-arrival trigger, a database source (no foreign catalog yet, so database soft deletes are tested only with unit tests and a stand-in table), `scd1`, `scd2` and `delete_when` on files, and the ledger row for a run that fails.
-- Rebuilding a bronze table (a full refresh) resets its change feed, so every silver table that reads it must rebuild too (see "Silver reads only what is new").
+- Rebuilding a bronze table (a full refresh) resets its change feed, so every silver table that reads it must rebuild too (see [Curated readers](#curated-readers-only-what-is-new)).
 - `fixed_width` and `yaml` files are not supported from a raw volume yet.
 - A delivery's tables share one pipeline, so one bad spec can fail the others. Splitting a busy delivery is not built.
-- The sample specs are for illustration. `framework_examples/consumer` registers `billing_invoices` too, so do not deploy both to the same catalog.
+- The specs in `framework_examples` are for illustration. `framework_examples/consumer` and the `billing` example in `framework_examples/ingestion` both register `billing_invoices`, so do not deploy both to the same catalog.

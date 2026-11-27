@@ -28,8 +28,8 @@ Team process (new-project → generate → deploy): [Lucid · Team process](http
 ## Ownership
 
 - A silver, gold, or product table belongs to one project. Another project may read it and may not create a table with the same layer and name. The check fails the build and names the owner.
-- A project reads bronze by `<source_system>.<table>`. The table must exist in the ingestion bundle.
-- To read another project's table, write `<project>.silver.<name>` or `<project>.product.<name>`. Projects must not depend on each other in a loop.
+- A project reads bronze by `<source_system>.<table>`, where `<table>` is the bronze table's name. The table must exist in the ingestion folder `projects:generate` reads. For now `./run.sh projects:generate` reads the example sources in [framework_examples/ingestion](../framework_examples/ingestion/README.md), not `framework_ingestion`.
+- A project's own tables are `silver.<name>`, `gold.<name>`, and `product.<name>`. To read another project's table, write `<project>.silver.<name>`, `<project>.gold.<name>`, or `<project>.product.<name>`. Projects must not depend on each other in a loop.
 - A table may only depend on lower layers: bronze, then silver, then gold, then a data product.
 
 ## project.yaml
@@ -65,7 +65,7 @@ products:
 | A gold table | Add it under `gold:` in your `project.yaml` |
 | A data product | Add it under `products:` in your `project.yaml` |
 | Data that is not in bronze yet | Ask for it in the ingestion bundle: `./run.sh new-table ...`. Then read it as `<source_system>.<table>`. |
-| A table another project already makes | Read it as `<project>.silver.<name>`. Do not create it again. |
+| A table another project already makes | Read it as `<project>.<layer>.<name>`. Do not create it again. |
 
 Then run `./run.sh projects:generate`. It checks every reference and rewrites the maps. `bundle:validate` and `bundle:deploy` do this first. `projects:check` fails if a map is out of date, for CI.
 

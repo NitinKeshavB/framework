@@ -120,23 +120,29 @@
   </main>
 
   <footer>
-    Generated for the Lakeflow framework bundle. Relationships in Lucid are logical join keys (Delta tables do not declare primary keys).
+    Generated for the Lakeflow framework bundle. Relationships in Lucid are logical join keys. The ref_* tables, asset_registry, and asset_registry_current declare informational (not enforced) primary keys; the enumeration columns have enforced CHECK constraints.
   </footer>
 
   <script>
     const LUCID = "https://lucid.app/lucidchart/4713f75e-9ce7-407b-a31c-5444a17b9ec9/edit";
     const objects = [
       {
+        kind: "table", name: "ref_object_kind · ref_owner_kind · ref_relation · ref_layer",
+        writtenBy: "framework_ddl (seed INSERTs in framework_meta.sql)", grain: "One allowed value of an enumeration",
+        purpose: "The allowed object kinds, owner kinds, relations, and layers. The CHECK constraints on the other tables enforce the same lists.",
+        columns: ["object_kind", "owner_kind", "relation", "layer"]
+      },
+      {
         kind: "table", name: "asset_registry",
-        writtenBy: "registry_sync", grain: "One SCD Type 2 version of one definition",
+        writtenBy: "registry_sync · a job's infer_columns task (column rows, source = inferred)", grain: "One SCD Type 2 version of one definition",
         purpose: "What we intend to own and publish (sources, pipelines, tables) over time — deploy history.",
-        columns: ["object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "config", "valid_from", "valid_to", "is_current", "is_deleted", "recorded_at"]
+        columns: ["asset_id", "object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "source", "bundle_id", "recorded_at", "config", "valid_from", "valid_to", "is_current", "is_deleted"]
       },
       {
         kind: "table", name: "asset_registry_current",
-        writtenBy: "registry_sync", grain: "One row per (object_kind, full_name)",
+        writtenBy: "registry_sync · a job's infer_columns task", grain: "One row per (object_kind, full_name)",
         purpose: "Current intended ownership and definitions — “who owns this?” and what should exist.",
-        columns: ["object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "config", "recorded_at"]
+        columns: ["asset_id", "object_kind", "full_name", "owner_kind", "owner", "requested_by", "delivery", "parent_full_name", "relation", "config_json", "content_hash", "source", "bundle_id", "recorded_at", "config"]
       },
       {
         kind: "table", name: "ownership_refusals",
@@ -148,42 +154,42 @@
         kind: "table", name: "job_runs",
         writtenBy: "framework_runs (hourly)", grain: "One Jobs API run of a framework job",
         purpose: "Did each delivery job run, succeed, or fail — and under which identity.",
-        columns: ["job_name", "deployed_name", "job_id", "run_id", "started_at", "ended_at", "status", "result_state", "termination_code", "failure_reason", "trigger_type", "run_as", "run_seconds", "run_page_url", "recorded_at"]
+        columns: ["job_name", "deployed_name", "workspace_id", "job_id", "run_id", "started_at", "ended_at", "status", "life_cycle_state", "result_state", "termination_code", "failure_reason", "trigger_type", "run_as", "setup_seconds", "queue_seconds", "execution_seconds", "run_seconds", "run_page_url", "recorded_at"]
       },
       {
         kind: "table", name: "job_task_runs",
         writtenBy: "framework_runs (hourly)", grain: "One task within a job run",
         purpose: "Which task inside the job failed (e.g. refresh_pipeline) so ops can pin the step.",
-        columns: ["job_name", "job_id", "job_run_id", "task_run_id", "task_key", "started_at", "ended_at", "status", "result_state", "failure_reason", "recorded_at"]
+        columns: ["job_name", "workspace_id", "job_id", "job_run_id", "task_run_id", "task_key", "started_at", "ended_at", "status", "life_cycle_state", "result_state", "termination_code", "failure_reason", "recorded_at"]
       },
       {
         kind: "table", name: "pipeline_updates",
         writtenBy: "framework_runs (hourly)", grain: "One Lakeflow pipeline update",
-        purpose: "When each pipeline update started and ended, and whether it completed — links job timing to loads.",
+        purpose: "When each pipeline update started and ended, and whether it completed — links job timing to loads. run_as comes from the source system in the registry.",
         columns: ["job_name", "pipeline_id", "pipeline_name", "update_id", "started_at", "ended_at", "state", "status", "run_as", "recorded_at"]
       },
       {
         kind: "table", name: "load_ledger",
-        writtenBy: "the pipeline's event hook · framework_backfill · framework_runs (catch-up)", grain: "One load of one table in one update",
-        purpose: "Did each table load succeed this run — row counts, status, and why it failed. Ops recon for dashboards and repair.",
+        writtenBy: "the pipeline's event hook · framework_backfill · framework_runs (catch-up) · a job's park_failed_files task (its own update, when the hook wrote none)", grain: "One load of one table in one update",
+        purpose: "Did each table load succeed this run — row counts, status, and why it failed. Ops recon for dashboards and repair. load_kind is regular, backfill, or catchup.",
         columns: ["layer", "job_name", "started_at", "update_id", "dataflow", "load_kind", "target_status", "load_date", "ended_at", "recorded_at", "batch_id", "job_run_id", "update_pipeline_uuid", "source_kind", "run_as", "target_table", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined", "rows_dropped", "files_read", "files_failed", "failure_reason"]
       },
       {
         kind: "table", name: "ledger_detail",
-        writtenBy: "the pipeline's event hook · framework_backfill · framework_runs", grain: "One file or curated input in one load",
-        purpose: "Which files or upstream inputs were processed, warned, or blocked in that load — drill from a failed load.",
+        writtenBy: "the same writers as load_ledger", grain: "One file or curated input in one load",
+        purpose: "Which files or upstream inputs were processed, warned, or blocked in that load — drill from a failed load. status is PROCESSED, WARNING, or FAILED; detail_kind is file or input.",
         columns: ["update_id", "dataflow", "recorded_at", "detail_kind", "status", "load_date", "job_name", "layer", "load_kind", "target_table", "src_object", "src_file_path", "src_file_name", "rows_read", "rows_inserted", "rows_quarantined", "rows_dropped", "failed_rules", "blocking_rules", "error_message"]
       },
       {
         kind: "table", name: "load_ledger_archive",
         writtenBy: "framework_optimize · archive_hot", grain: "Same as load_ledger after move",
-        purpose: "Older load history kept for audit after ~90 days — prefer v_loads for recent ops.",
+        purpose: "Older load history kept for audit after ~90 days. No view reads it: v_loads is hot only, so query this table for older loads.",
         columns: ["(same as load_ledger)", "archived_at", "archive_quarter"]
       },
       {
         kind: "table", name: "ledger_detail_archive",
         writtenBy: "framework_optimize · archive_hot", grain: "Same as ledger_detail after move",
-        purpose: "Older file/input history kept for audit — prefer v_ledger_detail for recent ops.",
+        purpose: "Older file/input history kept for audit. No view reads it: v_ledger_detail is hot only.",
         columns: ["(same as ledger_detail)", "archived_at", "archive_quarter"]
       },
       {
@@ -191,6 +197,24 @@
         writtenBy: "framework_optimize · archive_hot", grain: "Same as job_runs after move",
         purpose: "Older job-run history kept for audit after ~90 days.",
         columns: ["(same as job_runs)", "archived_at", "archive_quarter"]
+      },
+      {
+        kind: "table", name: "job_task_runs_archive",
+        writtenBy: "framework_optimize · archive_hot", grain: "Same as job_task_runs after move",
+        purpose: "Older task-run history kept for audit after ~90 days.",
+        columns: ["(same as job_task_runs)", "archived_at", "archive_quarter"]
+      },
+      {
+        kind: "table", name: "pipeline_updates_archive",
+        writtenBy: "framework_optimize · archive_hot", grain: "Same as pipeline_updates after move",
+        purpose: "Older pipeline-update history kept for audit after ~90 days.",
+        columns: ["(same as pipeline_updates)", "archived_at", "archive_quarter"]
+      },
+      {
+        kind: "table", name: "backfill_state (volume)",
+        writtenBy: "framework_backfill", grain: "One folder per backfill run: <pipeline_id>/<update_id>/schema and /checkpoint",
+        purpose: "The Auto Loader schema and checkpoint of a backfill run. A finished run's folder can be deleted.",
+        columns: []
       },
       {
         kind: "table", name: "ddl_applied",
@@ -205,16 +229,22 @@
         columns: ["reader_table", "source_table", "recorded_at", "status", "load_kind", "progress_kind", "watermark_column", "watermark_ts", "watermark_id", "job_name", "pipeline_id", "update_id", "batch_id"]
       },
       {
-        {
         kind: "view", name: "v_flow_checkpoint",
         writtenBy: "framework_meta.sql", grain: "One current mark per (reader_table, source_table)",
-        purpose: "Current safe read position per reader and source — “where are we up to?”",
+        purpose: "Current safe read position per reader and source (latest SUCCEEDED) — “where are we up to?”",
         columns: ["reader_table", "source_table", "recorded_at", "status", "load_kind", "progress_kind", "watermark_column", "watermark_ts", "watermark_id", "job_name", "pipeline_id", "update_id", "batch_id"]
       },
-      kind: "mv", name: "<job>_event_log",
-        writtenBy: "each ingestion pipeline", grain: "One pipeline event",
-        purpose: "Raw pipeline events for a delivery — used to rebuild load facts if a run was cut off.",
-        columns: ["id", "timestamp", "event_type", "details", "origin.pipeline_id", "origin.update_id", "origin.flow_name"]
+      {
+        kind: "mv", name: "<job>_event_log",
+        writtenBy: "each ingestion pipeline (schema framework_events, not framework_meta)", grain: "One pipeline event",
+        purpose: "Raw pipeline events for a delivery — pipeline_updates is read from it, and the catch-up rebuilds a cut-off update's ledger rows from it.",
+        columns: ["id", "timestamp", "event_type", "level", "message", "details", "error", "origin.pipeline_id", "origin.update_id", "origin.flow_name"]
+      },
+      {
+        kind: "mv", name: "<pipeline_id>_files",
+        writtenBy: "the table's ingestion pipeline (file tables with a fail, drop, or warn rule)", grain: "One file of the latest run",
+        purpose: "Exact per-file counts the event hook copies to ledger_detail, including rows read and kept nowhere (dropped, or held back from a blocked file). A table with a fail rule also uses it to keep a blocked file out of bronze; park_failed_files reads it to park blocked files.",
+        columns: ["_src_file_path", "_src_file_name", "_batch_id", "rows_read", "rows_loaded", "rows_quarantined", "rows_dropped", "rows_blocked", "rows_warned", "rescued_keys", "file_status", "blocking_rules", "failed_rules"]
       },
       {
         kind: "view", name: "v_asset_registry_current",
@@ -284,15 +314,15 @@
       },
       {
         kind: "view", name: "v_rules",
-        writtenBy: "framework_meta.sql", grain: "One current data quality rule of one table",
-        purpose: "The rules (expectations) that apply to each table now: name, origin, action, and the SQL expression.",
-        columns: ["job_name", "pipeline", "rule_name", "origin", "action", "expression", "enabled"]
+        writtenBy: "framework_meta.sql", grain: "One rule of one table, in its latest state",
+        purpose: "Every rule (expectation) a table has had: name, origin, action, and the SQL expression. enabled is true only for a rule that runs now; a rule removed from the spec or switched off stays with enabled = false.",
+        columns: ["job_name", "pipeline", "owner_kind", "owner", "rule_name", "origin", "action", "expression", "enabled"]
       },
       {
         kind: "view", name: "v_rule_history",
         writtenBy: "framework_meta.sql", grain: "One stretch of versions that carry the same rule",
         purpose: "Every rule with the dates it applied. A rule that did not change is one row, not one per version.",
-        columns: ["job_name", "pipeline", "rule_name", "origin", "action", "expression", "enabled", "valid_from", "valid_to", "is_current", "is_active"]
+        columns: ["job_name", "pipeline", "owner_kind", "owner", "rule_name", "origin", "action", "expression", "enabled", "valid_from", "valid_to", "is_current", "is_active"]
       },
       {
         kind: "view", name: "v_lineage",
@@ -300,7 +330,7 @@
         purpose: "Declared pipeline→table write/reject edges from asset_registry_current link rows.",
         columns: ["full_name", "parent_full_name", "relation", "config"]
       },
-            {
+      {
         kind: "view", name: "v_ownership_refusals",
         writtenBy: "framework_meta.sql", grain: "One ownership_refusals row",
         purpose: "Definitions registry_sync refused because another owner holds the name.",
@@ -315,13 +345,13 @@
       {
         kind: "view", name: "v_metadata_drift",
         writtenBy: "framework_meta.sql", grain: "One drifted tag or comment",
-        purpose: "Declared vs Unity Catalog schema/table/column tags and comments. Empty when APPLY_TAGS is on and in sync; phase 1 parks tag assignment.",
-        columns: ["securable", "table_name", "column_name", "item", "declared", "applied"]
+        purpose: "Declared vs Unity Catalog schema/table/column tags and comments. Phase 1 parks tag assignment, and the view returns no rows until its drift_enabled flag is switched on.",
+        columns: ["securable", "table_name", "column_name", "owner_kind", "owner", "item", "declared", "applied"]
       },
       {
         kind: "view", name: "v_job_runs",
         writtenBy: "framework_meta.sql", grain: "One job run with workflow owner",
-        purpose: "Latest job run status for each delivery.",
+        purpose: "Each job run of a registered workflow, at its latest recorded state (hot job_runs only).",
         columns: ["job_name", "owner", "run_id", "status", "started_at", "run_seconds", "run_page_url"]
       },
       {
@@ -344,19 +374,13 @@
       },
       {
         kind: "view", name: "v_loads",
-        writtenBy: "framework_meta.sql", grain: "Latest ledger row per job, layer, update, dataflow (hot ∪ archive)",
-        purpose: "Latest outcome per table load for dashboards — “what failed last night?”",
-        columns: ["job_name", "layer", "job_run_id", "pipeline_id", "update_id", "dataflow", "source_kind", "run_as", "load_kind", "target_table", "quarantine_table", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined", "rows_dropped", "target_status", "failure_reason", "started_at", "batch_id", "files_read", "files_failed", "recorded_at"]
-      },
-      {
-        kind: "view", name: "v_loads",
-        writtenBy: "framework_meta.sql", grain: "Latest load across hot + archive",
-        purpose: "Dashboard window: unions 90-day hot load_ledger with forever load_ledger_archive, then latest per key.",
-        columns: ["job_name", "layer", "job_run_id", "target_table", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "failure_reason", "recorded_at"]
+        writtenBy: "framework_meta.sql", grain: "Latest ledger row per job, layer, update, dataflow (hot load_ledger only)",
+        purpose: "Latest outcome per table load for dashboards — “what failed last night?” Adds the owner, the quarantine table, the duration, and the pipeline's deployed name. Older loads are in load_ledger_archive.",
+        columns: ["layer", "job_name", "started_at", "update_id", "dataflow", "load_kind", "target_status", "load_date", "ended_at", "recorded_at", "batch_id", "job_run_id", "update_pipeline_uuid", "source_kind", "run_as", "target_table", "rows_read", "rows_inserted", "rows_updated", "rows_deleted", "rows_quarantined", "rows_dropped", "files_read", "files_failed", "failure_reason", "duration_seconds", "owner_kind", "owner", "quarantine_table", "pipeline_name"]
       },
       {
         kind: "view", name: "v_ledger_detail",
-        writtenBy: "framework_meta.sql", grain: "Latest child file/input row (hot ∪ archive)",
+        writtenBy: "framework_meta.sql", grain: "Latest child file/input row (hot ledger_detail only)",
         purpose: "Latest file/input outcomes — open from a failed load to see which file blocked.",
         columns: ["job_name", "layer", "update_id", "dataflow", "detail_kind", "src_object", "src_file_path", "status", "rows_read", "rows_inserted", "rows_quarantined", "rows_dropped", "load_kind", "recorded_at"]
       },
@@ -382,13 +406,15 @@
         kind: "view", name: "v_observed_lineage",
         writtenBy: "system_views.sql (optional)", grain: "One observed vs declared lineage row",
         purpose: "Compares system.access.table_lineage to declared raw sources when system_views=true.",
-        columns: ["table_name", "declared_source", "observed_source", "status"]
+        columns: ["dataflow", "layer", "target_table", "declared_source", "observed_source", "source_type", "last_seen", "events", "status"]
       }
     ];
 
     const cards = document.getElementById("cards");
     const q = document.getElementById("q");
     let activeFilter = "all";
+    // Names such as <job>_event_log must show as text, not be parsed as tags.
+    const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
     function render() {
       const term = q.value.trim().toLowerCase();
@@ -402,17 +428,17 @@
         art.dataset.kind = obj.kind;
         art.innerHTML = `
           <div class="top">
-            <div class="name">${obj.name}</div>
+            <div class="name">${esc(obj.name)}</div>
             <span class="kind ${obj.kind}">${obj.kind === "mv" ? "pipeline object" : obj.kind}</span>
           </div>
-          <p class="purpose">${obj.purpose}</p>
+          <p class="purpose">${esc(obj.purpose)}</p>
           <div class="meta">
-            <div><strong>Written by:</strong> ${obj.writtenBy}</div>
-            <div><strong>Grain:</strong> ${obj.grain}</div>
+            <div><strong>Written by:</strong> ${esc(obj.writtenBy)}</div>
+            <div><strong>Grain:</strong> ${esc(obj.grain)}</div>
           </div>
           <details>
             <summary>Key columns</summary>
-            <ul class="cols">${(obj.columns || []).map(c => `<li>${c}</li>`).join("")}</ul>
+            <ul class="cols">${(obj.columns || []).map(c => `<li>${esc(c)}</li>`).join("")}</ul>
           </details>`;
         cards.appendChild(art);
       }

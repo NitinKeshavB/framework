@@ -28,7 +28,16 @@ ingestion/sources/
     source.yaml
     claims_db_codes.yaml        no project, snapshot
     actuarial/claims_db_claims.yaml
+  billing/                      sftp_files. Read by the sample projects
+    billing/billing_invoices.yaml
+  erp/                          database. Read by the sample projects
+    erp/erp_customers.yaml
+    billing/erp_orders.yaml
+  hr_docs/                      sharepoint_files. Read by the sample projects
+    hr/hr_docs_headcount.yaml
 ```
+
+`billing`, `erp`, and `hr_docs` are the bronze tables the sample projects in [framework_curation](../../framework_curation/README.md) read. `./run.sh projects:generate` checks project references against this folder, not `framework_ingestion`.
 
 There is no `cloud_files` example: its methods (`autoloader`, `copy_into`, `ctas`) are not in the MVP, and validation rejects them.
 
@@ -38,4 +47,4 @@ There is no `cloud_files` example: its methods (`autoloader`, `copy_into`, `ctas
 venv/bin/python -m lakeflow_framework.cli generate framework_examples/ingestion --check
 ```
 
-`--check` changes nothing. Drop `--check` only if you want the generated pipelines and jobs written into this folder.
+`--check` changes nothing. It validates every spec and prints any error, then ends with `out of date: SOURCE_MAP.md` and exit code 1, because this folder keeps no generated map; that last line is expected. `./run.sh projects:generate` also validates these specs, since it reads them as the projects' bronze. Drop `--check` only if you want the generated pipelines and jobs written into this folder.
